@@ -1,0 +1,13 @@
+[Applet Factory]
+Id=TaskwarriorAppletFactory
+InProcess=false
+Location=@APPLET_EXEC@
+Name=Taskwarrior Task Manager Applet Factory
+Description=Factory for Taskwarrior Task Manager Applet
+
+[TaskwarriorApplet]
+Name=Taskwarrior Task Manager Plus
+Name[zh_TW]=Taskwarrior 任務管理 Plus
+Description=Event-driven Taskwarrior pending task badge, quick actions, and task creator for MATE Panel
+Description[zh_TW]=即時同步 ~/.task 待辦任務數量與最高緊急度任務，點選可一鍵完成、計時、編輯或新增任務
+Icon=view-tasks
