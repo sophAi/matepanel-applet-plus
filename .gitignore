@@ -1,0 +1,54 @@
+# Build directories
+build/
+_build/
+builddir/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+Makefile.in
+meson-logs/
+meson-private/
+meson-info/
+compile_commands.json
+.ninja_deps
+.ninja_log
+build.ninja
+
+# Autotools
+aclocal.m4
+autom4te.cache/
+config.h
+config.h.in
+config.log
+config.status
+configure
+depcomp
+install-sh
+libtool
+ltmain.sh
+missing
+stamp-h1
+
+# Compiled files & libraries
+*.o
+*.lo
+*.la
+*.a
+*.so
+*.so.*
+*.gmo
+*.mo
+*.pyc
+__pycache__/
+
+# Generated MATE Applet / DBus files
+*.mate-panel-applet
+org.mate.panel.applet.*.service
+
+# Editor / IDE temporary files
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
