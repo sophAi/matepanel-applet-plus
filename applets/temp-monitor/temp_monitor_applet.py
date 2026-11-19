@@ -665,7 +665,7 @@ class TempMonitorWidget(Gtk.EventBox):
 
         if mode == "badge":
             n_badges = self._get_badge_count()
-            width_factor = 1.28 if (layout == "compact" and (show_util or show_mem)) else 1.18
+            width_factor = 1.28 if layout == "compact" else 1.18
             badge_w = max(32 if layout == "compact" else 30, int(h * width_factor))
             gap = 4
             total_w = badge_w * n_badges + gap * (n_badges - 1) + 4
@@ -789,24 +789,24 @@ class TempMonitorWidget(Gtk.EventBox):
 
         if has_left:
             l_pct, l_rgb = side_bars["left"]
-            lx = x + 2.2
-            ctx.set_source_rgba(0.08, 0.10, 0.12, 0.65)
+            lx = x + 2.5
+            ctx.set_source_rgba(0.15, 0.18, 0.22, 0.72)
             ctx.rectangle(lx, bar_y, bar_w, bar_h)
             ctx.fill()
             if l_pct is not None and l_pct > 0:
-                fill_h = max(1.2, min(bar_h, bar_h * (l_pct / 100.0)))
+                fill_h = max(1.5, min(bar_h, bar_h * (l_pct / 100.0)))
                 ctx.set_source_rgba(l_rgb[0], l_rgb[1], l_rgb[2], 0.98)
                 ctx.rectangle(lx, bar_y + bar_h - fill_h, bar_w, fill_h)
                 ctx.fill()
 
         if has_right:
             r_pct, r_rgb = side_bars["right"]
-            rx = x + bw - 2.2 - bar_w
-            ctx.set_source_rgba(0.08, 0.10, 0.12, 0.65)
+            rx = x + bw - 2.5 - bar_w
+            ctx.set_source_rgba(0.15, 0.18, 0.22, 0.72)
             ctx.rectangle(rx, bar_y, bar_w, bar_h)
             ctx.fill()
             if r_pct is not None and r_pct > 0:
-                fill_h = max(1.2, min(bar_h, bar_h * (r_pct / 100.0)))
+                fill_h = max(1.5, min(bar_h, bar_h * (r_pct / 100.0)))
                 ctx.set_source_rgba(r_rgb[0], r_rgb[1], r_rgb[2], 0.98)
                 ctx.rectangle(rx, bar_y + bar_h - fill_h, bar_w, fill_h)
                 ctx.fill()
@@ -864,15 +864,15 @@ class TempMonitorWidget(Gtk.EventBox):
         gpu_val_str = "OFF" if not enabled else ("--°" if gpu_avg is None else f"{int(round(gpu_avg))}°")
         side_bars = None
         if layout == "compact":
-            side_bars = {}
-            if show_util:
-                _, u_border, _, _, u_lvl = self._get_pct_colors(gpu_util, enabled, base_hue="cyan")
-                u_bar_rgb = self._resolve_panel_text_rgb(u_lvl, u_border)
-                side_bars["left"] = (gpu_util if enabled else 0.0, u_bar_rgb)
-            if show_mem:
-                _, m_border, _, _, m_lvl = self._get_pct_colors(mem_pct, enabled, base_hue="purple")
-                m_bar_rgb = self._resolve_panel_text_rgb(m_lvl, m_border)
-                side_bars["right"] = (mem_pct if enabled else 0.0, m_bar_rgb)
+            # In compact 2-in-1 layout, always embed left (GPU-Util) and right (Memory-Usage) vertical bars
+            _, u_border, _, _, u_lvl = self._get_pct_colors(gpu_util, enabled, base_hue="cyan")
+            u_bar_rgb = self._resolve_panel_text_rgb(u_lvl, u_border)
+            _, m_border, _, _, m_lvl = self._get_pct_colors(mem_pct, enabled, base_hue="purple")
+            m_bar_rgb = self._resolve_panel_text_rgb(m_lvl, m_border)
+            side_bars = {
+                "left": (gpu_util if enabled else 0.0, u_bar_rgb),
+                "right": (mem_pct if enabled else 0.0, m_bar_rgb),
+            }
         badges.append(("GPU", gpu_val_str, self._get_temp_colors(gpu_avg, enabled), side_bars))
 
         if layout == "separate":
