@@ -1562,7 +1562,7 @@ class TaskwarriorWidget(Gtk.EventBox):
         show_task, show_pomo = self._which_badges_to_draw()
 
         task_bw = max(32, int(h * 1.22))
-        pomo_bw = max(44, int(h * 1.62))  # slightly wider to fit '24:59' cleanly
+        pomo_bw = max(50, int(h * 1.78))  # wide enough for large bold '24:59' countdown digits
 
         badges_w = 0
         if show_task and show_pomo:
@@ -1572,7 +1572,8 @@ class TaskwarriorWidget(Gtk.EventBox):
         else:
             badges_w = task_bw
 
-        if mode == "badge":
+        # When showing ONLY the Pomodoro badge, hide extra task title text so only the large countdown is shown
+        if mode == "badge" or (show_pomo and not show_task):
             total_w = badges_w + 4
         else:
             top_txt = self._get_top_task_summary_text()
@@ -1707,6 +1708,10 @@ class TaskwarriorWidget(Gtk.EventBox):
         self._draw_styled_text(ctx, vx, vy, count_str, val_rgb)
 
     def _draw_pomo_badge(self, ctx, x, y, bw, bh):
+        """
+        Draw the Pomodoro badge with ONLY the enlarged countdown time (`MM:SS`)
+        centered in the badge (no tiny header text or cycle numbers), plus bottom progress bar.
+        """
         colors = pomo_phase_to_colors(self.pomo_phase, self.pomo_running)
         bg_rgb, border_rgb, text_rgb, _, sev_lvl = colors
         bg_style = self.config.get("badge_bg_style", "dark")
@@ -1723,16 +1728,17 @@ class TaskwarriorWidget(Gtk.EventBox):
             ctx.fill_preserve()
 
         ctx.set_source_rgba(border_rgb[0], border_rgb[1], border_rgb[2], 0.95)
-        ctx.set_line_width(1.2)
+        ctx.set_line_width(1.3)
         ctx.stroke()
 
         # Bottom mini progress bar showing countdown progress
-        if self.pomo_phase != "idle" and self.pomo_total_sec > 0:
+        has_bar = self.pomo_phase != "idle" and self.pomo_total_sec > 0
+        if has_bar:
             pct = max(0.0, min(1.0, float(self.pomo_remaining_sec) / float(self.pomo_total_sec)))
             bar_x = x + 3.0
             bar_w = max(8.0, bw - 6.0)
-            bar_h = 2.2
-            bar_y = y + bh - 3.2
+            bar_h = 2.4
+            bar_y = y + bh - 3.4
             ctx.set_source_rgba(0.08, 0.10, 0.12, 0.70)
             ctx.rectangle(bar_x, bar_y, bar_w, bar_h)
             ctx.fill()
@@ -1742,37 +1748,25 @@ class TaskwarriorWidget(Gtk.EventBox):
             ctx.fill()
 
         if self.config.get("font_color_mode", "dynamic") == "custom":
-            stage_rgb = self._resolve_panel_text_rgb(sev_lvl, text_rgb)
-            title_rgb = stage_rgb
-            val_rgb = stage_rgb
+            val_rgb = self._resolve_panel_text_rgb(sev_lvl, text_rgb)
         else:
-            title_rgb = border_rgb
             val_rgb = (bg_rgb[0] * 0.85, bg_rgb[1] * 0.85, bg_rgb[2] * 0.85) if bg_style == "light" else text_rgb
 
-        max_c = max(1, int(self.config.get("pomo_cycles", 4)))
-        if self.pomo_phase == "idle":
-            title = "POMO"
-        elif not self.pomo_running:
-            title = f"PAUS {self.pomo_current_cycle}/{max_c}"
-        elif self.pomo_phase == "work":
-            title = f"WORK {self.pomo_current_cycle}/{max_c}"
-        else:
-            title = f"REST {self.pomo_current_cycle}/{max_c}"
-
-        ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-        header_size = max(6.0, bh * 0.23)
-        ctx.set_font_size(header_size)
-        ext = ctx.text_extents(title)
-        tx = x + (bw - ext.width) / 2.0 - ext.x_bearing
-        ty = y + header_size + 1.2
-        self._draw_styled_text(ctx, tx, ty, title, title_rgb)
-
         mmss = self.format_pomo_mmss()
-        val_size = max(8.5, bh * 0.36)
+        ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        # Enlarge countdown font size to fill the badge height and auto-fit width
+        val_size = max(11.5, bh * 0.56)
         ctx.set_font_size(val_size)
         v_ext = ctx.text_extents(mmss)
+        max_text_w = bw - 6.0
+        if v_ext.width > max_text_w and v_ext.width > 0:
+            val_size = val_size * (max_text_w / v_ext.width)
+            ctx.set_font_size(val_size)
+            v_ext = ctx.text_extents(mmss)
+
+        usable_h = (bh - 3.0) if has_bar else bh
         vx = x + (bw - v_ext.width) / 2.0 - v_ext.x_bearing
-        vy = y + bh - (5.2 if self.pomo_phase != "idle" else 3.0)
+        vy = y + (usable_h + v_ext.height) / 2.0
         self._draw_styled_text(ctx, vx, vy, mmss, val_rgb)
 
     def _on_draw(self, widget, ctx):
@@ -1784,7 +1778,7 @@ class TaskwarriorWidget(Gtk.EventBox):
         pad_y = 1.0
         bh = max(20.0, h - pad_y * 2)
         task_bw = max(30.0, h * 1.22)
-        pomo_bw = max(42.0, h * 1.62)
+        pomo_bw = max(48.0, h * 1.78)
 
         cur_x = 1.0
         if show_task:
@@ -1797,16 +1791,14 @@ class TaskwarriorWidget(Gtk.EventBox):
             self._draw_pomo_badge(ctx, cur_x, pad_y, bw, bh)
             cur_x += bw + 4.0
 
-        if mode == "badge_text":
+        # Only draw top task text when Task badge is shown (hide task text when switched to Pomodoro icon)
+        if mode == "badge_text" and show_task:
             top_txt = self._get_top_task_summary_text()
             font_sz = min(12.5, max(9.5, h * 0.42))
             ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
             ctx.set_font_size(font_sz)
             t_ext = ctx.text_extents(top_txt)
-            if self.pomo_phase != "idle":
-                _, border_rgb, _, _, sev_lvl = pomo_phase_to_colors(self.pomo_phase, self.pomo_running)
-            else:
-                _, border_rgb, _, _, sev_lvl = level_to_colors(self.summary_level)
+            _, border_rgb, _, _, sev_lvl = level_to_colors(self.summary_level)
             summary_rgb = self._resolve_panel_text_rgb(sev_lvl, border_rgb)
             self._draw_styled_text(
                 ctx,
