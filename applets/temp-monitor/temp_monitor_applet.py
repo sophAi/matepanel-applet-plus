@@ -14,13 +14,11 @@ Features:
      - 'separate': Separate badges [CPU 39°] [GPU 41°] [UTL 34%] [MEM 26% / 1.1G]
      - 'compact' : Compact 2-badge view [CPU 39°] [GPU 41° with embedded Util & Mem mini progress bars]
   2. 'icon_text' : Compact chip icons + text ([C] 39°C  [G] 41°C · 34% · 26% / 1.1G)
-- Left-click popup menu on the applet showing:
-  - Detailed readings of all CPU cores/packages
-  - Detailed GPU temperature, Volatile GPU-Util progress bar, Memory-Usage progress bar (MiB / Total MiB),
-    Fan speed (%), and Power draw (W)
-  - Optional auxiliary sensors (NVMe SSD, ACPI, CPU fans)
-  - Quick controls for monitoring toggle, refresh interval, and display styles
-- Right-click MATE Panel native context menu + full Preferences window.
+- Customizable Panel Font Color & Badge Background Style to adapt to light/dark/transparent MATE panels:
+  - Font color mode: 'dynamic' (auto status color) or 'custom' (user-selected color via Gtk.ColorButton + presets)
+  - Optional text outline/shadow for crisp readability on any panel background
+  - Optional badge background transparency / light-dark adaptation
+- Left-click popup menu on the applet + Right-click MATE Panel native context menu + Preferences window.
 """
 
 import ctypes
@@ -55,6 +53,10 @@ DEFAULT_CONFIG = {
     "show_panel_gpu_util": True,      # 在面板顯示 Volatile GPU-Util
     "show_panel_gpu_mem": True,       # 在面板顯示 GPU Memory-Usage
     "gpu_mem_panel_unit": "percent",  # "percent" (26%) or "gib" (1.1G)
+    "font_color_mode": "dynamic",     # "dynamic" (隨溫度/負載自動變色) or "custom" (自訂固定字形顏色)
+    "custom_font_color": "#ffffff",   # 自訂面板字形顏色 (Hex, 如 #ffffff 白色 或 #1a1a1a 深色)
+    "badge_bg_style": "dark",         # "dark" (深色半透明底), "light" (淺色半透明底), "transparent" (透明無底色，僅邊框與文字)
+    "text_shadow": False,             # 為面板字形加上對比描邊陰影，適應複雜或透明桌布面板
     "show_other_sensors": True,       # 在選單中顯示 NVMe / 主機板 / 風扇等其他感測器
     "cpu_avg_cores_only": True,       # True: 僅平均實體核心 Core 0..N; False: 包含 Package id
     "warn_temp_c": 55.0,              # 中度負載溫度閾值 (°C)
@@ -109,25 +111,6 @@ class NVMLReader:
         self.initialized = False
 
     def read_gpus(self):
-        """
-        Return a list of dicts with comprehensive NVIDIA GPU metrics:
-        [
-          {
-            'chip': 'nvml',
-            'label': 'NVIDIA GeForce GTX 1650',
-            'temp': 41.0,
-            'high': 83.0,
-            'crit': 93.0,
-            'gpu_util': 34.0,       # Volatile GPU-Util (%)
-            'mem_ctrl_util': 25.0,  # Memory controller utilization (%)
-            'mem_used_mib': 1072.0, # VRAM Used (MiB)
-            'mem_total_mib': 4096.0,# VRAM Total (MiB)
-            'mem_pct': 26.2,        # VRAM Usage (%)
-            'fan_pct': 64.0,        # Fan speed (%) or None
-            'power_w': 18.5,        # Power draw (W) or None
-          }
-        ]
-        """
         if not self.initialized and not self._init_nvml():
             return []
 
@@ -160,7 +143,6 @@ class NVMLReader:
                 if temp_val is None:
                     continue
 
-                # Volatile GPU-Util & Memory Controller Util
                 gpu_util = None
                 mem_ctrl_util = None
                 util_st = _NvmlUtilization()
@@ -168,7 +150,6 @@ class NVMLReader:
                     gpu_util = float(util_st.gpu)
                     mem_ctrl_util = float(util_st.memory)
 
-                # Memory-Usage (VRAM Used / Total)
                 mem_used_mib = None
                 mem_total_mib = None
                 mem_pct = None
@@ -178,13 +159,11 @@ class NVMLReader:
                     mem_total_mib = mem_st.total / (1024.0 * 1024.0)
                     mem_pct = (mem_st.used * 100.0) / mem_st.total
 
-                # Fan Speed (%)
                 fan_pct = None
                 fan_val = ctypes.c_uint()
                 if self.lib.nvmlDeviceGetFanSpeed(handle, ctypes.byref(fan_val)) == 0:
                     fan_pct = float(fan_val.value)
 
-                # Power Usage (mW -> W)
                 power_w = None
                 power_mw = ctypes.c_uint()
                 if self.lib.nvmlDeviceGetPowerUsage(handle, ctypes.byref(power_mw)) == 0:
@@ -243,7 +222,6 @@ class HardwareSensorManager:
             return None
 
     def _read_sysfs_drm_gpu_metrics(self, hwmon_dir):
-        """Fallback reader for AMD/Intel DRM sysfs busy percent & VRAM usage."""
         dev_dir = os.path.realpath(os.path.join(hwmon_dir, "device"))
         gpu_util = self._read_file_float(os.path.join(dev_dir, "gpu_busy_percent"), 1.0)
         vram_used = self._read_file_float(os.path.join(dev_dir, "mem_info_vram_used"), 1.0 / (1024.0 * 1024.0))
@@ -263,7 +241,7 @@ class HardwareSensorManager:
 
             temp_inputs = sorted(glob.glob(os.path.join(hdir, "temp*_input")))
             for t_in in temp_inputs:
-                prefix = t_in[:-6]  # strip '_input'
+                prefix = t_in[:-6]
                 temp_val = self._read_file_float(t_in, 0.001)
                 if temp_val is None or temp_val <= -100.0 or temp_val >= 200.0:
                     continue
@@ -329,7 +307,6 @@ class HardwareSensorManager:
                     }
                 )
 
-        # Poll NVIDIA GPUs via NVML
         nv_gpus = self.nvml.read_gpus()
         gpu_sensors.extend(nv_gpus)
 
@@ -381,6 +358,28 @@ class HardwareSensorManager:
         }
 
 
+def hex_to_rgb(hex_str, default=(1.0, 1.0, 1.0)):
+    """Convert '#rrggbb' hex string to normalized (r, g, b) floats in 0.0..1.0."""
+    if not hex_str or not isinstance(hex_str, str):
+        return default
+    s = hex_str.strip().lstrip("#")
+    if len(s) == 3:
+        s = "".join(c * 2 for c in s)
+    if len(s) != 6:
+        return default
+    try:
+        r = int(s[0:2], 16) / 255.0
+        g = int(s[2:4], 16) / 255.0
+        b = int(s[4:6], 16) / 255.0
+        return (r, g, b)
+    except ValueError:
+        return default
+
+
+def rgb_luminance(rgb):
+    return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+
+
 def temp_to_colors(temp, enabled=True, warn_c=55.0, crit_c=75.0):
     """Return (bg_rgb, border_rgb, text_rgb, accent_hex) for a given temperature in Celsius."""
     if not enabled or temp is None:
@@ -419,7 +418,6 @@ def temp_to_colors(temp, enabled=True, warn_c=55.0, crit_c=75.0):
 def pct_to_colors(pct, enabled=True, base_hue="cyan"):
     """
     Return (bg_rgb, border_rgb, text_rgb, accent_hex) for percentage metrics (0..100%).
-    base_hue: 'cyan' (for GPU-Util) or 'purple' (for Memory-Usage) when below warning threshold.
     """
     if not enabled or pct is None:
         return (
@@ -481,6 +479,15 @@ class TempMonitorWidget(Gtk.EventBox):
     """
 
     INTERVAL_PRESETS = [1, 2, 3, 5, 10, 30]
+    FONT_COLOR_PRESETS = [
+        ("純白 (適合深色面板)", "#ffffff"),
+        ("亮灰白 (柔和深色面板)", "#e5e7eb"),
+        ("炭黑 (適合淺色/白色面板)", "#111827"),
+        ("深石板灰 (適合淺灰面板)", "#334155"),
+        ("螢光綠 (高對比終端風)", "#4ade80"),
+        ("科技青 (高對比冷色風)", "#38bdf8"),
+        ("琥珀金 (高對比暖色風)", "#fbbf24"),
+    ]
 
     def __init__(self, applet=None):
         super().__init__()
@@ -554,6 +561,33 @@ class TempMonitorWidget(Gtk.EventBox):
             warn_c=float(self.config.get("warn_temp_c", 55.0)),
             crit_c=float(self.config.get("crit_temp_c", 75.0)),
         )
+
+    def _resolve_panel_text_rgb(self, default_rgb):
+        """
+        Return the actual (r, g, b) to use for panel text based on font_color_mode.
+        If 'custom', returns the user's custom_font_color; if 'dynamic', returns default_rgb.
+        """
+        if self.config.get("font_color_mode", "dynamic") == "custom":
+            return hex_to_rgb(self.config.get("custom_font_color", "#ffffff"), default=default_rgb)
+        return default_rgb
+
+    def _draw_styled_text(self, ctx, x, y, text, rgb):
+        """Draw text with optional contrast shadow/outline so it stays legible on any panel background."""
+        if self.config.get("text_shadow", False):
+            lum = rgb_luminance(rgb)
+            # Dark shadow for bright text, light halo for dark text
+            if lum > 0.45:
+                s_rgb = (0.0, 0.0, 0.0, 0.82)
+            else:
+                s_rgb = (1.0, 1.0, 1.0, 0.82)
+            ctx.set_source_rgba(*s_rgb)
+            for dx, dy in ((-0.8, 0.0), (0.8, 0.0), (0.0, -0.8), (0.0, 0.8)):
+                ctx.move_to(x + dx, y + dy)
+                ctx.show_text(text)
+
+        ctx.set_source_rgba(rgb[0], rgb[1], rgb[2], 1.0)
+        ctx.move_to(x, y)
+        ctx.show_text(text)
 
     def _format_mem_short(self, enabled=True):
         if not enabled:
@@ -684,38 +718,59 @@ class TempMonitorWidget(Gtk.EventBox):
     ):
         """
         Draw a single rounded badge with a title, value text, and optional bottom mini progress bars.
-        mini_bars: list of (pct_float_0_100, (r, g, b))
+        Respects `badge_bg_style` ('dark', 'light', 'transparent') and `font_color_mode` ('dynamic', 'custom').
         """
         bg_rgb, border_rgb, text_rgb, _ = colors
+        bg_style = self.config.get("badge_bg_style", "dark")
 
         draw_rounded_rect(ctx, x + 0.5, y + 0.5, bw - 1.0, bh - 1.0, 4.5)
-        ctx.set_source_rgba(bg_rgb[0], bg_rgb[1], bg_rgb[2], 0.92)
-        ctx.fill_preserve()
+        if bg_style == "dark":
+            ctx.set_source_rgba(bg_rgb[0], bg_rgb[1], bg_rgb[2], 0.92)
+            ctx.fill_preserve()
+        elif bg_style == "light":
+            # Soft tinted light background for light panels
+            l_r = 0.88 + bg_rgb[0] * 0.22
+            l_g = 0.88 + bg_rgb[1] * 0.22
+            l_b = 0.88 + bg_rgb[2] * 0.22
+            ctx.set_source_rgba(min(1.0, l_r), min(1.0, l_g), min(1.0, l_b), 0.92)
+            ctx.fill_preserve()
+        # If bg_style == "transparent", do not fill background so panel shows through
+
         ctx.set_source_rgba(border_rgb[0], border_rgb[1], border_rgb[2], 0.95)
         ctx.set_line_width(1.2)
         ctx.stroke()
+
+        # Resolve title & value font colors
+        if self.config.get("font_color_mode", "dynamic") == "custom":
+            custom_rgb = hex_to_rgb(self.config.get("custom_font_color", "#ffffff"), default=text_rgb)
+            title_rgb = custom_rgb
+            val_rgb = custom_rgb
+        else:
+            title_rgb = border_rgb
+            if bg_style == "light":
+                # Use darker high-contrast status color when on light badge background
+                val_rgb = (bg_rgb[0] * 0.85, bg_rgb[1] * 0.85, bg_rgb[2] * 0.85)
+            else:
+                val_rgb = text_rgb
 
         has_bars = bool(mini_bars)
         ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
         header_size = max(6.5, bh * (0.24 if has_bars else 0.27))
         ctx.set_font_size(header_size)
         ext = ctx.text_extents(title)
-        ctx.set_source_rgba(border_rgb[0], border_rgb[1], border_rgb[2], 1.0)
-        ctx.move_to(x + (bw - ext.width) / 2.0 - ext.x_bearing, y + header_size + 1.2)
-        ctx.show_text(title)
+        tx = x + (bw - ext.width) / 2.0 - ext.x_bearing
+        ty = y + header_size + 1.2
+        self._draw_styled_text(ctx, tx, ty, title, title_rgb)
 
         val_size = max(8.5, bh * (0.35 if has_bars else 0.41))
         if len(val_str) >= 4:
             val_size *= 0.88
         ctx.set_font_size(val_size)
         v_ext = ctx.text_extents(val_str)
-        ctx.set_source_rgba(text_rgb[0], text_rgb[1], text_rgb[2], 1.0)
         bottom_offset = (3.5 + len(mini_bars) * 2.8) if has_bars else 3.0
-        ctx.move_to(
-            x + (bw - v_ext.width) / 2.0 - v_ext.x_bearing,
-            y + bh - bottom_offset,
-        )
-        ctx.show_text(val_str)
+        vx = x + (bw - v_ext.width) / 2.0 - v_ext.x_bearing
+        vy = y + bh - bottom_offset
+        self._draw_styled_text(ctx, vx, vy, val_str, val_rgb)
 
         # Draw embedded mini bars at bottom of badge (for compact mode)
         if has_bars:
@@ -724,11 +779,9 @@ class TempMonitorWidget(Gtk.EventBox):
             bar_h = 2.0
             cur_y = y + bh - 2.6 - (len(mini_bars) - 1) * 2.8
             for pct, bar_rgb in mini_bars:
-                # Track background
-                ctx.set_source_rgba(0.08, 0.10, 0.12, 0.85)
+                ctx.set_source_rgba(0.08, 0.10, 0.12, 0.65)
                 ctx.rectangle(bar_x, cur_y, bar_w, bar_h)
                 ctx.fill()
-                # Active fill
                 if pct is not None and pct > 0:
                     fill_w = max(1.0, min(bar_w, bar_w * (pct / 100.0)))
                     ctx.set_source_rgba(bar_rgb[0], bar_rgb[1], bar_rgb[2], 0.98)
@@ -748,11 +801,9 @@ class TempMonitorWidget(Gtk.EventBox):
 
         badges = []
 
-        # 1. CPU Temp Badge
         cpu_val_str = "OFF" if not enabled else ("--°" if cpu_avg is None else f"{int(round(cpu_avg))}°")
         badges.append(("CPU", cpu_val_str, self._get_temp_colors(cpu_avg, enabled), None))
 
-        # 2. GPU Temp Badge (with optional embedded mini bars in compact layout)
         gpu_val_str = "OFF" if not enabled else ("--°" if gpu_avg is None else f"{int(round(gpu_avg))}°")
         mini_bars = None
         if layout == "compact":
@@ -765,7 +816,6 @@ class TempMonitorWidget(Gtk.EventBox):
                 mini_bars.append((mem_pct if enabled else 0.0, m_border))
         badges.append(("GPU", gpu_val_str, self._get_temp_colors(gpu_avg, enabled), mini_bars))
 
-        # 3 & 4. Separate UTL and MEM badges when layout == "separate"
         if layout == "separate":
             if show_util:
                 util_str = "OFF" if not enabled else ("--%" if gpu_util is None else f"{int(round(gpu_util))}%")
@@ -841,9 +891,8 @@ class TempMonitorWidget(Gtk.EventBox):
 
         c_str = "OFF" if not enabled else ("--°C" if cpu_avg is None else f"{cpu_avg:.0f}°C")
         c_ext = ctx.text_extents(c_str)
-        ctx.set_source_rgba(c_border[0], c_border[1], c_border[2], 1.0)
-        ctx.move_to(cur_x, (h + c_ext.height) / 2.0)
-        ctx.show_text(c_str)
+        c_text_rgb = self._resolve_panel_text_rgb(c_border)
+        self._draw_styled_text(ctx, cur_x, (h + c_ext.height) / 2.0, c_str, c_text_rgb)
         cur_x += c_ext.width + 10.0
 
         # 2. Draw GPU Icon + Temp
@@ -853,9 +902,8 @@ class TempMonitorWidget(Gtk.EventBox):
 
         g_str = "OFF" if not enabled else ("--°C" if gpu_avg is None else f"{gpu_avg:.0f}°C")
         g_ext = ctx.text_extents(g_str)
-        ctx.set_source_rgba(g_border[0], g_border[1], g_border[2], 1.0)
-        ctx.move_to(cur_x, (h + g_ext.height) / 2.0)
-        ctx.show_text(g_str)
+        g_text_rgb = self._resolve_panel_text_rgb(g_border)
+        self._draw_styled_text(ctx, cur_x, (h + g_ext.height) / 2.0, g_str, g_text_rgb)
         cur_x += g_ext.width + 6.0
 
         # 3. Optional GPU-Util text
@@ -863,9 +911,8 @@ class TempMonitorWidget(Gtk.EventBox):
             _, u_border, _, _ = pct_to_colors(gpu_util, enabled, base_hue="cyan")
             u_str = "--%" if gpu_util is None else f"{gpu_util:.0f}%"
             u_ext = ctx.text_extents(u_str)
-            ctx.set_source_rgba(u_border[0], u_border[1], u_border[2], 1.0)
-            ctx.move_to(cur_x, (h + u_ext.height) / 2.0)
-            ctx.show_text(u_str)
+            u_text_rgb = self._resolve_panel_text_rgb(u_border)
+            self._draw_styled_text(ctx, cur_x, (h + u_ext.height) / 2.0, u_str, u_text_rgb)
             cur_x += u_ext.width + 6.0
 
         # 4. Optional GPU Memory-Usage text
@@ -873,12 +920,10 @@ class TempMonitorWidget(Gtk.EventBox):
             _, m_border, _, _ = pct_to_colors(mem_pct, enabled, base_hue="purple")
             m_str = self._format_mem_short(enabled)
             m_ext = ctx.text_extents(m_str)
-            ctx.set_source_rgba(m_border[0], m_border[1], m_border[2], 1.0)
-            ctx.move_to(cur_x, (h + m_ext.height) / 2.0)
-            ctx.show_text(m_str)
+            m_text_rgb = self._resolve_panel_text_rgb(m_border)
+            self._draw_styled_text(ctx, cur_x, (h + m_ext.height) / 2.0, m_str, m_text_rgb)
 
     def handle_applet_button_press(self, widget, event):
-        """Handler bound directly to MatePanelApplet button-press-event."""
         if event.button == 1:
             GObject.signal_stop_emission_by_name(widget, "button-press-event")
             self.popup_sensor_menu(event)
@@ -894,7 +939,6 @@ class TempMonitorWidget(Gtk.EventBox):
         return False
 
     def popup_sensor_menu(self, event=None):
-        """Build and pop up the detailed sensor readings & quick control menu."""
         self.refresh_readings(force_poll=self.config.get("enabled", True))
         self.active_menu = self._build_popup_menu()
         if event is not None:
@@ -966,7 +1010,7 @@ class TempMonitorWidget(Gtk.EventBox):
 
         menu.append(Gtk.SeparatorMenuItem())
 
-        # 3. GPU Sensor Units Section (Temperature + Volatile GPU-Util + Memory-Usage + Fan + Power)
+        # 3. GPU Sensor Units Section
         gpu_title = self._create_markup_menu_item(
             f"<b>🎮 GPU 監控單元 (平均溫度: {gpu_avg_txt})</b>", sensitive=False
         )
@@ -988,7 +1032,6 @@ class TempMonitorWidget(Gtk.EventBox):
                     )
                 )
 
-                # Volatile GPU-Util row
                 g_u = s.get("gpu_util")
                 if g_u is not None:
                     _, _, _, u_col = pct_to_colors(g_u, True, base_hue="cyan")
@@ -1003,7 +1046,6 @@ class TempMonitorWidget(Gtk.EventBox):
                         )
                     )
 
-                # Memory-Usage row
                 m_used = s.get("mem_used_mib")
                 m_tot = s.get("mem_total_mib")
                 m_p = s.get("mem_pct")
@@ -1018,7 +1060,6 @@ class TempMonitorWidget(Gtk.EventBox):
                         )
                     )
 
-                # Fan Speed & Power Draw row
                 fan_p = s.get("fan_pct")
                 pwr_w = s.get("power_w")
                 if fan_p is not None or pwr_w is not None:
@@ -1031,7 +1072,7 @@ class TempMonitorWidget(Gtk.EventBox):
                         )
                     )
 
-        # 4. Optional Auxiliary Hardware Sensors (NVMe, ACPI, Fans)
+        # 4. Optional Auxiliary Hardware Sensors
         if self.config.get("show_other_sensors", True):
             other_sensors = self.latest_data.get("other_sensors", [])
             if other_sensors:
@@ -1055,7 +1096,7 @@ class TempMonitorWidget(Gtk.EventBox):
 
         menu.append(Gtk.SeparatorMenuItem())
 
-        # 5. Control Options: Enable/Disable Monitoring
+        # 5. Control Options
         toggle_mon = Gtk.CheckMenuItem(label="啟用自動監控 (關閉時停止背景輪詢)")
         toggle_mon.set_active(enabled)
         toggle_mon.connect("toggled", self._on_toggle_monitoring)
@@ -1155,21 +1196,70 @@ class TempMonitorWidget(Gtk.EventBox):
         style_sub.append(unit_pct)
         style_sub.append(unit_gib)
 
-        style_sub.append(Gtk.SeparatorMenuItem())
-        show_other_chk = Gtk.CheckMenuItem(label="在選單中顯示其他感測器 (NVMe / 風扇)")
-        show_other_chk.set_active(self.config.get("show_other_sensors", True))
-        show_other_chk.connect("toggled", self._on_toggle_other_sensors)
-        style_sub.append(show_other_chk)
-
-        cores_only_chk = Gtk.CheckMenuItem(label="CPU 平均溫度僅計算實體核心 (Core 0..N)")
-        cores_only_chk.set_active(self.config.get("cpu_avg_cores_only", True))
-        cores_only_chk.connect("toggled", self._on_toggle_cores_only)
-        style_sub.append(cores_only_chk)
-
         style_item.set_submenu(style_sub)
         menu.append(style_item)
 
-        # 8. Direct Preferences Dialog Item
+        # 8. Submenu: Font Color & Panel Background Adaptation
+        color_item = Gtk.MenuItem(label="🖌 面板字形顏色與底色適應")
+        color_sub = Gtk.Menu()
+
+        f_mode = self.config.get("font_color_mode", "dynamic")
+        rm_dyn = Gtk.RadioMenuItem.new_with_label_from_widget(
+            None, "自動動態字形顏色 (隨溫度/負載警戒色階變色)"
+        )
+        rm_cus = Gtk.RadioMenuItem.new_with_label_from_widget(
+            rm_dyn, f"自訂固定字形顏色 (目前: {self.config.get('custom_font_color', '#ffffff')})"
+        )
+        if f_mode == "dynamic":
+            rm_dyn.set_active(True)
+        else:
+            rm_cus.set_active(True)
+        rm_dyn.connect("toggled", self._on_font_color_mode_toggled, "dynamic")
+        rm_cus.connect("toggled", self._on_font_color_mode_toggled, "custom")
+        color_sub.append(rm_dyn)
+        color_sub.append(rm_cus)
+
+        color_sub.append(Gtk.SeparatorMenuItem())
+        for label_txt, hex_val in self.FONT_COLOR_PRESETS:
+            p_item = self._create_markup_menu_item(
+                f"套用字形色：<span foreground='{hex_val}'><b>■</b></span> {label_txt} (<tt>{hex_val}</tt>)",
+                sensitive=True,
+                callback=lambda _w, hx=hex_val: self._apply_preset_font_color(hx),
+            )
+            color_sub.append(p_item)
+
+        color_sub.append(Gtk.SeparatorMenuItem())
+        bg_style = self.config.get("badge_bg_style", "dark")
+        bg_dark = Gtk.RadioMenuItem.new_with_label_from_widget(None, "方塊底色：深色半透明底 (預設)")
+        bg_light = Gtk.RadioMenuItem.new_with_label_from_widget(bg_dark, "方塊底色：淺色半透明底 (適合淺色面板)")
+        bg_trans = Gtk.RadioMenuItem.new_with_label_from_widget(bg_dark, "方塊底色：完全透明無底色 (僅保留邊框與文字)")
+        if bg_style == "dark":
+            bg_dark.set_active(True)
+        elif bg_style == "light":
+            bg_light.set_active(True)
+        else:
+            bg_trans.set_active(True)
+        bg_dark.connect("toggled", self._on_badge_bg_toggled, "dark")
+        bg_light.connect("toggled", self._on_badge_bg_toggled, "light")
+        bg_trans.connect("toggled", self._on_badge_bg_toggled, "transparent")
+        color_sub.append(bg_dark)
+        color_sub.append(bg_light)
+        color_sub.append(bg_trans)
+
+        color_sub.append(Gtk.SeparatorMenuItem())
+        chk_shadow = Gtk.CheckMenuItem(label="啟用文字高對比描邊陰影 (透明面板推薦)")
+        chk_shadow.set_active(self.config.get("text_shadow", False))
+        chk_shadow.connect("toggled", self._on_toggle_text_shadow)
+        color_sub.append(chk_shadow)
+
+        pick_color_item = Gtk.MenuItem(label="🎨 開啟調色盤自訂任意字形顏色...")
+        pick_color_item.connect("activate", lambda *_: self.show_preferences_dialog())
+        color_sub.append(pick_color_item)
+
+        color_item.set_submenu(color_sub)
+        menu.append(color_item)
+
+        # 9. Direct Preferences Dialog Item
         menu.append(Gtk.SeparatorMenuItem())
         prefs_item = Gtk.MenuItem(label="⚙️ 偏好設定 (Preferences)...")
         prefs_item.connect("activate", lambda *_: self.show_preferences_dialog())
@@ -1185,7 +1275,7 @@ class TempMonitorWidget(Gtk.EventBox):
             return
 
         win = Gtk.Window(title="CPU/GPU 溫度與負載監控 Plus — 偏好設定")
-        win.set_default_size(460, 520)
+        win.set_default_size(480, 640)
         win.set_position(Gtk.WindowPosition.CENTER)
         win.set_resizable(False)
         self.prefs_win = win
@@ -1195,9 +1285,9 @@ class TempMonitorWidget(Gtk.EventBox):
 
         win.connect("destroy", on_win_destroy)
 
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        outer.set_margin_top(16)
-        outer.set_margin_bottom(16)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        outer.set_margin_top(14)
+        outer.set_margin_bottom(14)
         outer.set_margin_start(18)
         outer.set_margin_end(18)
 
@@ -1292,10 +1382,67 @@ class TempMonitorWidget(Gtk.EventBox):
 
         outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
-        # Section 4: Calculation & Color Thresholds
-        sec3_lbl = Gtk.Label(xalign=0.0)
-        sec3_lbl.set_markup("<b>4. 感測器計算與溫度警戒色階</b>")
-        outer.pack_start(sec3_lbl, False, False, 0)
+        # Section 4: Panel Font Color & Background Adaptation
+        sec_col_lbl = Gtk.Label(xalign=0.0)
+        sec_col_lbl.set_markup("<b>4. 面板字形顏色與底色適應 (適應深色/淺色/透明 MATE 面板)</b>")
+        outer.pack_start(sec_col_lbl, False, False, 0)
+
+        rb_font_dyn = Gtk.RadioButton.new_with_label_from_widget(
+            None, "自動動態字形顏色 (隨溫度與負載色階自動變換)"
+        )
+        rb_font_cus = Gtk.RadioButton.new_with_label_from_widget(
+            rb_font_dyn, "自訂固定字形顏色 (使用右側調色盤或快速色票)："
+        )
+        if self.config.get("font_color_mode", "dynamic") == "dynamic":
+            rb_font_dyn.set_active(True)
+        else:
+            rb_font_cus.set_active(True)
+        outer.pack_start(rb_font_dyn, False, False, 0)
+
+        color_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        color_button = Gtk.ColorButton()
+        color_button.set_title("選擇面板字形顏色")
+        init_rgba = Gdk.RGBA()
+        if not init_rgba.parse(self.config.get("custom_font_color", "#ffffff")):
+            init_rgba.parse("#ffffff")
+        color_button.set_rgba(init_rgba)
+
+        btn_white = Gtk.Button(label="純白 (深色面板)")
+        btn_black = Gtk.Button(label="炭黑 (淺色面板)")
+        color_row.pack_start(rb_font_cus, False, False, 0)
+        color_row.pack_start(color_button, False, False, 0)
+        color_row.pack_start(btn_white, False, False, 0)
+        color_row.pack_start(btn_black, False, False, 0)
+        outer.pack_start(color_row, False, False, 0)
+
+        bg_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        bg_lbl = Gtk.Label(label="方塊背景底色：", xalign=0.0)
+        rb_bg_dark = Gtk.RadioButton.new_with_label_from_widget(None, "深色底")
+        rb_bg_light = Gtk.RadioButton.new_with_label_from_widget(rb_bg_dark, "淺色底")
+        rb_bg_trans = Gtk.RadioButton.new_with_label_from_widget(rb_bg_dark, "完全透明 (無底色)")
+        cur_bg = self.config.get("badge_bg_style", "dark")
+        if cur_bg == "dark":
+            rb_bg_dark.set_active(True)
+        elif cur_bg == "light":
+            rb_bg_light.set_active(True)
+        else:
+            rb_bg_trans.set_active(True)
+        bg_box.pack_start(bg_lbl, False, False, 0)
+        bg_box.pack_start(rb_bg_dark, False, False, 0)
+        bg_box.pack_start(rb_bg_light, False, False, 0)
+        bg_box.pack_start(rb_bg_trans, False, False, 0)
+        outer.pack_start(bg_box, False, False, 0)
+
+        chk_shadow = Gtk.CheckButton(label="啟用文字高對比描邊陰影 (透明或花紋面板底色時保持清晰可讀)")
+        chk_shadow.set_active(self.config.get("text_shadow", False))
+        outer.pack_start(chk_shadow, False, False, 0)
+
+        outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+
+        # Section 5: Calculation & Color Thresholds
+        sec5_lbl = Gtk.Label(xalign=0.0)
+        sec5_lbl.set_markup("<b>5. 感測器計算與溫度警戒色階</b>")
+        outer.pack_start(sec5_lbl, False, False, 0)
 
         chk_cores_only = Gtk.CheckButton(label="CPU 平均溫度僅計算實體核心 (Core 0..N，不含 Package)")
         chk_cores_only.set_active(self.config.get("cpu_avg_cores_only", True))
@@ -1305,7 +1452,7 @@ class TempMonitorWidget(Gtk.EventBox):
         chk_other.set_active(self.config.get("show_other_sensors", True))
         outer.pack_start(chk_other, False, False, 0)
 
-        grid = Gtk.Grid(column_spacing=12, row_spacing=8)
+        grid = Gtk.Grid(column_spacing=12, row_spacing=6)
         lbl_warn = Gtk.Label(label="中度負載變色閾值 (琥珀橘 °C)：", xalign=0.0)
         adj_warn = Gtk.Adjustment(
             value=float(self.config.get("warn_temp_c", 55.0)),
@@ -1335,6 +1482,12 @@ class TempMonitorWidget(Gtk.EventBox):
         outer.pack_start(grid, False, False, 0)
 
         # Live apply bindings
+        def rgba_to_hex(rgba):
+            r = max(0, min(255, int(round(rgba.red * 255))))
+            g = max(0, min(255, int(round(rgba.green * 255))))
+            b = max(0, min(255, int(round(rgba.blue * 255))))
+            return f"#{r:02x}{g:02x}{b:02x}"
+
         def apply_changes(*_):
             self.config["enabled"] = chk_enable.get_active()
             self.config["interval_sec"] = max(1, int(spin_freq.get_value_as_int()))
@@ -1343,6 +1496,15 @@ class TempMonitorWidget(Gtk.EventBox):
             self.config["show_panel_gpu_mem"] = chk_gpu_mem.get_active()
             self.config["gpu_badge_layout"] = "separate" if rb_layout_sep.get_active() else "compact"
             self.config["gpu_mem_panel_unit"] = "percent" if rb_unit_pct.get_active() else "gib"
+            self.config["font_color_mode"] = "dynamic" if rb_font_dyn.get_active() else "custom"
+            self.config["custom_font_color"] = rgba_to_hex(color_button.get_rgba())
+            if rb_bg_dark.get_active():
+                self.config["badge_bg_style"] = "dark"
+            elif rb_bg_light.get_active():
+                self.config["badge_bg_style"] = "light"
+            else:
+                self.config["badge_bg_style"] = "transparent"
+            self.config["text_shadow"] = chk_shadow.get_active()
             self.config["cpu_avg_cores_only"] = chk_cores_only.get_active()
             self.config["show_other_sensors"] = chk_other.get_active()
             self.config["warn_temp_c"] = float(spin_warn.get_value())
@@ -1352,6 +1514,21 @@ class TempMonitorWidget(Gtk.EventBox):
             self._save_config()
             self._sync_timer()
             self.refresh_readings(force_poll=self.config["enabled"])
+
+        def on_color_picked(_btn):
+            rb_font_cus.set_active(True)
+            apply_changes()
+
+        def set_quick_color(hex_code):
+            c = Gdk.RGBA()
+            c.parse(hex_code)
+            color_button.set_rgba(c)
+            rb_font_cus.set_active(True)
+            apply_changes()
+
+        color_button.connect("color-set", on_color_picked)
+        btn_white.connect("clicked", lambda *_: set_quick_color("#ffffff"))
+        btn_black.connect("clicked", lambda *_: set_quick_color("#111827"))
 
         for w_ctrl in (
             chk_enable,
@@ -1363,6 +1540,12 @@ class TempMonitorWidget(Gtk.EventBox):
             rb_layout_comp,
             rb_unit_pct,
             rb_unit_gib,
+            rb_font_dyn,
+            rb_font_cus,
+            rb_bg_dark,
+            rb_bg_light,
+            rb_bg_trans,
+            chk_shadow,
             chk_cores_only,
             chk_other,
         ):
@@ -1386,10 +1569,10 @@ class TempMonitorWidget(Gtk.EventBox):
     def show_about_dialog(self, *_args):
         dlg = Gtk.AboutDialog()
         dlg.set_program_name("CPU/GPU 溫度與負載監控 Plus")
-        dlg.set_version("1.2.0")
+        dlg.set_version("1.3.0")
         dlg.set_comments(
             "零外部子行程開銷的 MATE 面板 CPU/GPU 溫度與負載監控 Applet。\n"
-            "直讀 /sys/class/hwmon 與 NVIDIA NVML (Temperature, Volatile GPU-Util, Memory-Usage, Fan, Power)。"
+            "直讀 /sys/class/hwmon 與 NVIDIA NVML，支援自訂面板字形顏色與深淺底色適應。"
         )
         dlg.set_website("https://github.com/sophAi/matepanel-applet-plus")
         dlg.run()
@@ -1446,6 +1629,31 @@ class TempMonitorWidget(Gtk.EventBox):
         self._save_config()
         self._update_canvas_size()
 
+    def _on_font_color_mode_toggled(self, radio_item, mode):
+        if not radio_item.get_active():
+            return
+        self.config["font_color_mode"] = mode
+        self._save_config()
+        self.canvas.queue_draw()
+
+    def _apply_preset_font_color(self, hex_val):
+        self.config["font_color_mode"] = "custom"
+        self.config["custom_font_color"] = hex_val
+        self._save_config()
+        self.canvas.queue_draw()
+
+    def _on_badge_bg_toggled(self, radio_item, bg_style):
+        if not radio_item.get_active():
+            return
+        self.config["badge_bg_style"] = bg_style
+        self._save_config()
+        self.canvas.queue_draw()
+
+    def _on_toggle_text_shadow(self, check_item):
+        self.config["text_shadow"] = check_item.get_active()
+        self._save_config()
+        self.canvas.queue_draw()
+
     def _on_toggle_other_sensors(self, check_item):
         self.config["show_other_sensors"] = check_item.get_active()
         self._save_config()
@@ -1475,7 +1683,7 @@ def setup_applet_context_menu(applet, widget):
                 Gtk.STOCK_PREFERENCES,
                 "偏好設定 (_Preferences)...",
                 None,
-                "設定監控頻率、GPU-Util/顯存顯示樣式與警戒溫度",
+                "設定監控頻率、字形顏色、GPU-Util/顯存顯示樣式與警戒溫度",
                 widget.show_preferences_dialog,
             ),
             (
@@ -1551,7 +1759,7 @@ def applet_factory(applet, iid, _data):
 def run_standalone_window():
     """Run the applet inside a standalone GTK test window for preview & debugging."""
     win = Gtk.Window(title="MATE CPU/GPU Temp & Load Applet - 預覽測試視窗")
-    win.set_default_size(520, 145)
+    win.set_default_size(540, 160)
     win.set_position(Gtk.WindowPosition.CENTER)
     win.connect("destroy", Gtk.main_quit)
 
@@ -1564,29 +1772,30 @@ def run_standalone_window():
     info_lbl = Gtk.Label(xalign=0.0)
     info_lbl.set_markup(
         "<b>MATE Panel 模擬預覽列</b>\n"
-        "<small>• <b>左鍵點選</b>下方圖示：檢視 CPU 各核心溫度、GPU 溫度、<b>Volatile GPU-Util</b>、<b>Memory-Usage</b>、風扇與功耗\n"
-        "• 點選「⚙️ 偏好設定」：自由切換<b>獨立四方塊 ([CPU][GPU][UTL][MEM])</b> 或 <b>緊湊雙進度條方塊</b></small>"
+        "<small>• <b>左鍵點選</b>下方圖示：開啟監控清單、快速切換<b>字形顏色與底色適應</b>\n"
+        "• 點選「⚙️ 偏好設定」：使用 GTK 調色盤自訂任意字形顏色、切換深色/淺色/透明底色與文字描邊</small>"
     )
     vbox.pack_start(info_lbl, False, False, 0)
 
     panel_frame = Gtk.EventBox()
     css_provider = Gtk.CssProvider()
     css_provider.load_from_data(
-        b".simulated-panel { background-color: #1e2229; border-radius: 6px; padding: 6px; }"
+        b".simulated-panel-dark { background-color: #1e2229; border-radius: 6px; padding: 6px; }"
+        b".simulated-panel-light { background-color: #e5e7eb; border-radius: 6px; padding: 6px; }"
     )
     panel_frame.get_style_context().add_provider(
         css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
     )
-    panel_frame.get_style_context().add_class("simulated-panel")
+    panel_frame.get_style_context().add_class("simulated-panel-dark")
 
-    hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+    hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
     hbox.set_margin_top(4)
     hbox.set_margin_bottom(4)
     hbox.set_margin_start(10)
     hbox.set_margin_end(10)
 
     panel_lbl = Gtk.Label()
-    panel_lbl.set_markup("<span foreground='#9aa0a6'><small>模擬 MATE 面板 (32px) 👉</small></span>")
+    panel_lbl.set_markup("<span foreground='#9aa0a6'><small>模擬面板 👉</small></span>")
     hbox.pack_start(panel_lbl, False, False, 0)
 
     widget = TempMonitorWidget(applet=None)
@@ -1596,6 +1805,26 @@ def run_standalone_window():
     btn_prefs = Gtk.Button(label="⚙️ 偏好設定")
     btn_prefs.connect("clicked", widget.show_preferences_dialog)
     hbox.pack_end(btn_prefs, False, False, 0)
+
+    # Toggle button in preview window to test light vs dark panel background
+    is_dark = [True]
+
+    def toggle_sim_bg(_btn):
+        ctx_style = panel_frame.get_style_context()
+        if is_dark[0]:
+            ctx_style.remove_class("simulated-panel-dark")
+            ctx_style.add_class("simulated-panel-light")
+            panel_lbl.set_markup("<span foreground='#374151'><small>模擬淺色面板 👉</small></span>")
+            is_dark[0] = False
+        else:
+            ctx_style.remove_class("simulated-panel-light")
+            ctx_style.add_class("simulated-panel-dark")
+            panel_lbl.set_markup("<span foreground='#9aa0a6'><small>模擬深色面板 👉</small></span>")
+            is_dark[0] = True
+
+    btn_bg = Gtk.Button(label="🌓 切換深/淺模擬面板")
+    btn_bg.connect("clicked", toggle_sim_bg)
+    hbox.pack_end(btn_bg, False, False, 0)
 
     panel_frame.add(hbox)
     vbox.pack_start(panel_frame, False, False, 0)
