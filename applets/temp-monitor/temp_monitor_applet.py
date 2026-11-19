@@ -661,10 +661,12 @@ class TempMonitorWidget(Gtk.EventBox):
         mode = self.config.get("display_mode", "badge")
         show_util = self.config.get("show_panel_gpu_util", True)
         show_mem = self.config.get("show_panel_gpu_mem", True)
+        layout = self.config.get("gpu_badge_layout", "separate")
 
         if mode == "badge":
             n_badges = self._get_badge_count()
-            badge_w = max(30, int(h * 1.18))
+            width_factor = 1.28 if (layout == "compact" and (show_util or show_mem)) else 1.18
+            badge_w = max(32 if layout == "compact" else 30, int(h * width_factor))
             gap = 4
             total_w = badge_w * n_badges + gap * (n_badges - 1) + 4
         else:
@@ -751,11 +753,13 @@ class TempMonitorWidget(Gtk.EventBox):
         title,
         val_str,
         colors,
-        mini_bars=None,
+        side_bars=None,
     ):
         """
-        Draw a single rounded badge with a title, value text, and optional bottom mini progress bars.
+        Draw a single rounded badge with a title, value text, and optional vertical side progress bars.
         colors: (bg_rgb, border_rgb, text_rgb, accent_hex, level)
+        side_bars: dict with optional 'left' and 'right' keys:
+          {'left': (pct_float_0_100, (r, g, b)), 'right': (pct_float_0_100, (r, g, b))}
         """
         bg_rgb, border_rgb, text_rgb, _, level = colors
         bg_style = self.config.get("badge_bg_style", "dark")
@@ -775,6 +779,38 @@ class TempMonitorWidget(Gtk.EventBox):
         ctx.set_line_width(1.2)
         ctx.stroke()
 
+        # Draw vertical side progress bars inside left and right edges (bottom-up fill)
+        has_left = bool(side_bars and side_bars.get("left") is not None)
+        has_right = bool(side_bars and side_bars.get("right") is not None)
+        bar_w = max(2.4, min(3.4, bw * 0.095))
+        bar_pad_y = 3.2
+        bar_h = max(6.0, bh - bar_pad_y * 2.0)
+        bar_y = y + bar_pad_y
+
+        if has_left:
+            l_pct, l_rgb = side_bars["left"]
+            lx = x + 2.2
+            ctx.set_source_rgba(0.08, 0.10, 0.12, 0.65)
+            ctx.rectangle(lx, bar_y, bar_w, bar_h)
+            ctx.fill()
+            if l_pct is not None and l_pct > 0:
+                fill_h = max(1.2, min(bar_h, bar_h * (l_pct / 100.0)))
+                ctx.set_source_rgba(l_rgb[0], l_rgb[1], l_rgb[2], 0.98)
+                ctx.rectangle(lx, bar_y + bar_h - fill_h, bar_w, fill_h)
+                ctx.fill()
+
+        if has_right:
+            r_pct, r_rgb = side_bars["right"]
+            rx = x + bw - 2.2 - bar_w
+            ctx.set_source_rgba(0.08, 0.10, 0.12, 0.65)
+            ctx.rectangle(rx, bar_y, bar_w, bar_h)
+            ctx.fill()
+            if r_pct is not None and r_pct > 0:
+                fill_h = max(1.2, min(bar_h, bar_h * (r_pct / 100.0)))
+                ctx.set_source_rgba(r_rgb[0], r_rgb[1], r_rgb[2], 0.98)
+                ctx.rectangle(rx, bar_y + bar_h - fill_h, bar_w, fill_h)
+                ctx.fill()
+
         # Resolve title & value font colors according to 3-stage severity level ('normal', 'warn', 'crit')
         if self.config.get("font_color_mode", "dynamic") == "custom":
             stage_rgb = self._resolve_panel_text_rgb(level, text_rgb)
@@ -787,40 +823,28 @@ class TempMonitorWidget(Gtk.EventBox):
             else:
                 val_rgb = text_rgb
 
-        has_bars = bool(mini_bars)
+        has_sides = has_left or has_right
+        # Center text within the inner area between left and right vertical bars
+        inner_left = x + (bar_w + 3.0 if has_left else 0.0)
+        inner_right = x + bw - (bar_w + 3.0 if has_right else 0.0)
+        inner_w = max(10.0, inner_right - inner_left)
+
         ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-        header_size = max(6.5, bh * (0.24 if has_bars else 0.27))
+        header_size = max(6.5, bh * (0.24 if has_sides else 0.27))
         ctx.set_font_size(header_size)
         ext = ctx.text_extents(title)
-        tx = x + (bw - ext.width) / 2.0 - ext.x_bearing
-        ty = y + header_size + 1.2
+        tx = inner_left + (inner_w - ext.width) / 2.0 - ext.x_bearing
+        ty = y + header_size + 1.5
         self._draw_styled_text(ctx, tx, ty, title, title_rgb)
 
-        val_size = max(8.5, bh * (0.35 if has_bars else 0.41))
+        val_size = max(8.5, bh * (0.37 if has_sides else 0.41))
         if len(val_str) >= 4:
             val_size *= 0.88
         ctx.set_font_size(val_size)
         v_ext = ctx.text_extents(val_str)
-        bottom_offset = (3.5 + len(mini_bars) * 2.8) if has_bars else 3.0
-        vx = x + (bw - v_ext.width) / 2.0 - v_ext.x_bearing
-        vy = y + bh - bottom_offset
+        vx = inner_left + (inner_w - v_ext.width) / 2.0 - v_ext.x_bearing
+        vy = y + bh - 3.0
         self._draw_styled_text(ctx, vx, vy, val_str, val_rgb)
-
-        if has_bars:
-            bar_x = x + 3.0
-            bar_w = max(6.0, bw - 6.0)
-            bar_h = 2.0
-            cur_y = y + bh - 2.6 - (len(mini_bars) - 1) * 2.8
-            for pct, bar_rgb in mini_bars:
-                ctx.set_source_rgba(0.08, 0.10, 0.12, 0.65)
-                ctx.rectangle(bar_x, cur_y, bar_w, bar_h)
-                ctx.fill()
-                if pct is not None and pct > 0:
-                    fill_w = max(1.0, min(bar_w, bar_w * (pct / 100.0)))
-                    ctx.set_source_rgba(bar_rgb[0], bar_rgb[1], bar_rgb[2], 0.98)
-                    ctx.rectangle(bar_x, cur_y, fill_w, bar_h)
-                    ctx.fill()
-                cur_y += 2.8
 
     def _draw_badge_mode(self, ctx, w, h, enabled):
         cpu_avg = self.latest_data.get("cpu_avg") if enabled else None
@@ -838,18 +862,18 @@ class TempMonitorWidget(Gtk.EventBox):
         badges.append(("CPU", cpu_val_str, self._get_temp_colors(cpu_avg, enabled), None))
 
         gpu_val_str = "OFF" if not enabled else ("--°" if gpu_avg is None else f"{int(round(gpu_avg))}°")
-        mini_bars = None
+        side_bars = None
         if layout == "compact":
-            mini_bars = []
+            side_bars = {}
             if show_util:
                 _, u_border, _, _, u_lvl = self._get_pct_colors(gpu_util, enabled, base_hue="cyan")
                 u_bar_rgb = self._resolve_panel_text_rgb(u_lvl, u_border)
-                mini_bars.append((gpu_util if enabled else 0.0, u_bar_rgb))
+                side_bars["left"] = (gpu_util if enabled else 0.0, u_bar_rgb)
             if show_mem:
                 _, m_border, _, _, m_lvl = self._get_pct_colors(mem_pct, enabled, base_hue="purple")
                 m_bar_rgb = self._resolve_panel_text_rgb(m_lvl, m_border)
-                mini_bars.append((mem_pct if enabled else 0.0, m_bar_rgb))
-        badges.append(("GPU", gpu_val_str, self._get_temp_colors(gpu_avg, enabled), mini_bars))
+                side_bars["right"] = (mem_pct if enabled else 0.0, m_bar_rgb)
+        badges.append(("GPU", gpu_val_str, self._get_temp_colors(gpu_avg, enabled), side_bars))
 
         if layout == "separate":
             if show_util:
@@ -866,8 +890,8 @@ class TempMonitorWidget(Gtk.EventBox):
         bw = (w - gap * (n - 1) - 2.0) / float(n)
 
         cur_x = 1.0
-        for title, val_str, colors, mbars in badges:
-            self._draw_generic_badge(ctx, cur_x, pad_y, bw, bh, title, val_str, colors, mini_bars=mbars)
+        for title, val_str, colors, sbars in badges:
+            self._draw_generic_badge(ctx, cur_x, pad_y, bw, bh, title, val_str, colors, side_bars=sbars)
             cur_x += bw + gap
 
     def _draw_mini_chip_icon(self, ctx, x, y, size, label_char, border_rgb, bg_rgb):
@@ -1192,7 +1216,7 @@ class TempMonitorWidget(Gtk.EventBox):
             None, "方塊佈局 1：獨立方塊 ([CPU] [GPU] [UTL] [MEM])"
         )
         layout_comp = Gtk.RadioMenuItem.new_with_label_from_widget(
-            layout_sep, "方塊佈局 2：緊湊二合一 ([CPU] [GPU 底部內嵌雙進度條])"
+            layout_sep, "方塊佈局 2：緊湊二合一 ([CPU] [GPU 左右內嵌垂直雙進度條])"
         )
         if cur_layout == "separate":
             layout_sep.set_active(True)
@@ -1396,7 +1420,7 @@ class TempMonitorWidget(Gtk.EventBox):
             None, "方塊模式佈局 1：獨立方塊 ([CPU 39°] [GPU 41°] [UTL 34%] [MEM 26%])"
         )
         rb_layout_comp = Gtk.RadioButton.new_with_label_from_widget(
-            rb_layout_sep, "方塊模式佈局 2：緊湊二合一 ([CPU 39°] [GPU 41° + 底部內嵌雙進度條])"
+            rb_layout_sep, "方塊模式佈局 2：緊湊二合一 ([CPU 39°] [GPU 41° + 左右垂直雙進度條: 左Util/右Mem])"
         )
         if self.config.get("gpu_badge_layout", "separate") == "separate":
             rb_layout_sep.set_active(True)
