@@ -1,0 +1,13 @@
+[Applet Factory]
+Id=TempMonitorAppletFactory
+InProcess=false
+Location=@APPLET_EXEC@
+Name=CPU/GPU Temperature Monitor Applet Factory
+Description=Factory for CPU and GPU Temperature Monitor Applet
+
+[TempMonitorApplet]
+Name=CPU/GPU Temp Monitor Plus
+Name[zh_TW]=CPU/GPU 溫度監控 Plus
+Description=Monitor CPU and GPU average temperatures with detailed sensor menu and frequency control
+Description[zh_TW]=顯示 CPU 與 GPU 平均溫度圖示，點選檢視所有感測單元並可調整監控頻率或關閉監控
+Icon=sensors-applet

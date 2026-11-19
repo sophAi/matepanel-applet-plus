@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=org.mate.panel.applet.TempMonitorAppletFactory
+Exec=/usr/bin/python3 @APPLET_EXEC@
