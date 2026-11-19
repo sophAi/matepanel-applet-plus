@@ -1,28 +1,27 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 """
-MATE Panel Taskwarrior Task Manager Applet (TaskwarriorApplet)
+MATE Panel Taskwarrior Task Manager + Pomodoro Timer Applet (TaskwarriorApplet)
 
 Features:
 - Event-driven synchronization with ~/.task directory using Gio.FileMonitor (0% idle polling overhead)
   plus periodic 60s due-time recalculation.
-- Two switchable panel display modes:
-  1. 'badge'      : Compact rounded badge [TASK / count] with optional active-task indicator dot
-  2. 'badge_text' : Badge + top urgency task summary [TASK / count] [H] 加強mate-panel功能 (4d)
-- Customizable 3-stage panel font colors (Normal / Warning: High Priority or Due Soon / Critical: Overdue or Due Today),
-  badge background style ('dark', 'light', 'transparent'), and text contrast outline shadow.
-- Dual-column Interactive Monthly Calendar Dashboard (`TaskCalendarWindow`):
-  - Left column: Custom 7x6 color-coded monthly calendar grid showing:
-    - Pending tasks due on each date (color dots/count badges by priority & urgency + mini task title preview)
-    - Historical completed tasks (`status:completed` mapped by `end` completion date, toggleable via checkbox)
-    - Single-click a date to inspect its due/completed tasks on the right panel
-    - Double-click any date cell to immediately add a new task with `Due` pre-filled to that date
-  - Right column:
-    - Selected Date tasks list (Due pending tasks + Completed tasks on that day) with one-click Done, Start/Stop timer,
-      Reschedule (`+1d`, `+3d`, or assign to selected date), Edit, Annotate, Delete, or Restore to Pending
-    - Unscheduled / All Pending tasks list (tasks without `due` date or all pending tasks, with one-click
-      "📅 指派至選取日期" button)
-- Switchable Left-Click default action ('calendar' vs 'menu') in Preferences, while both are always accessible.
+- Integrated Pomodoro Focus Timer (🍅 番茄鐘專注與中場休息倒數):
+  - Configurable Work duration (default 25 min), Break duration (default 5 min),
+    and Target Cycle Count (default 4 cycles; 1 cycle = 25m work + 5m break).
+  - Full playback controls: Start, Pause (暫停), Resume (繼續), Reset current phase / cycles (重新計時),
+    Skip to next phase (跳至休息/專注), and Stop (停止並關閉).
+  - Middle-click on the panel applet icon directly toggles Pause / Resume (or starts Pomodoro if idle).
+  - Optional task binding: Start Pomodoro on any specific Taskwarrior task, automatically syncing
+    `task <uuid> start` during Work phase and `task <uuid> stop` on Pause/Break/Finish, with Desktop Notifications.
+  - Three switchable Panel Icon Pomodoro display modes:
+    1. 'auto_switch': Shows [TASK count] when idle; automatically switches to [WORK 24:59] / [BRK 04:59] when active
+    2. 'always_pomo': Always displays the Pomodoro countdown badge on the panel
+    3. 'dual_badge' : Displays both [TASK count] and [WORK 24:59] badges side-by-side
+- Two text display modes ('badge' vs 'badge_text' showing top task or active Pomodoro task summary).
+- Customizable 3-stage panel font colors, badge background style ('dark', 'light', 'transparent'),
+  text outline shadow, and adjustable Calendar View font size.
+- Dual-column Interactive Monthly Calendar Dashboard (`TaskCalendarWindow`) with embedded Pomodoro control bar.
 """
 
 import calendar
@@ -37,7 +36,7 @@ import sys
 import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango
+from gi.repository import Gdk, Gio, GLib, GObject, Gtk
 import cairo
 
 try:
@@ -53,10 +52,15 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "taskwarrior.json")
 TASK_DATA_DIR = os.path.expanduser("~/.task")
 
 DEFAULT_CONFIG = {
-    "display_mode": "badge",             # "badge" (僅方塊圖示) or "badge_text" (方塊 + 首要任務標題)
+    "display_mode": "badge",             # "badge" (僅方塊圖示) or "badge_text" (方塊 + 首要任務/專注任務標題)
+    "pomo_panel_mode": "auto_switch",    # "auto_switch" (計時中自動切換為番茄鐘), "always_pomo" (常駐番茄鐘), "dual_badge" (雙方塊並排), "task_only" (僅顯示TASK)
+    "pomo_work_min": 25,                 # 番茄鐘專注工作時間 (分鐘，預設 25)
+    "pomo_break_min": 5,                 # 番茄鐘中場休息時間 (分鐘，預設 5)
+    "pomo_cycles": 4,                    # 番茄鐘循環次數設定 (預設 4 個循環)
+    "pomo_sync_task_start": True,        # 綁定任務啟動番茄鐘時同步執行 task start / stop
     "left_click_action": "calendar",     # "calendar" (開啟雙欄月曆任務看板) or "menu" (開啟傳統下拉快速選單)
     "calendar_show_completed": True,     # 在月曆格子與右側清單中顯示歷史已完成任務 (依 end 完成日期對應)
-    "calendar_font_size": 11,            # 月曆看板基準字型大小 (pt/px, 範圍 8..20，同步縮放月曆格子與右側清單)
+    "calendar_font_size": 11,            # 月曆看板基準字型大小 (pt/px, 範圍 8..22)
     "max_title_chars": 22,               # badge_text 模式下顯示的最大字元數
     "show_due_in_panel": True,           # badge_text 模式下是否在標題後附加上到期倒數
     "filter_project": "",                # 空字串代表顯示全部專案
@@ -70,6 +74,23 @@ DEFAULT_CONFIG = {
     "text_shadow": False,                # 文字高對比描邊陰影
     "completed_limit": 20,               # 下拉選單最近已完成任務顯示筆數
 }
+
+
+def send_desktop_notification(title, body, urgent=False):
+    """Send desktop notification via notify-send and system bell."""
+    try:
+        Gdk.beep()
+    except Exception:
+        pass
+    try:
+        urg = "critical" if urgent else "normal"
+        subprocess.Popen(
+            ["notify-send", "-u", urg, "-i", "appointment-soon", title, body],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
 
 
 def parse_tw_timestamp(ts_str):
@@ -141,16 +162,6 @@ class TaskwarriorBackend:
 
     @classmethod
     def fetch_all(cls, due_soon_days=3, completed_limit=20):
-        """
-        Export all tasks from Taskwarrior and organize into:
-        {
-            "pending": [ ... sorted by urgency desc ... ],
-            "completed": [ ... most recent completed_limit tasks ... ],
-            "all_completed": [ ... all completed tasks with _end_date for calendar mapping ... ],
-            "projects": [ ... all known project names ... ],
-            "tags": [ ... all known user tags ... ],
-        }
-        """
         rc, out, _ = cls._run_task(["export"])
         if rc != 0 or not out:
             return {
@@ -215,6 +226,13 @@ class TaskwarriorBackend:
     @classmethod
     def mark_done(cls, uuid_str):
         return cls._run_task([f"uuid:{uuid_str}", "done"])
+
+    @classmethod
+    def set_active_state(cls, uuid_str, should_start):
+        if not uuid_str:
+            return 0, "", ""
+        action = "start" if should_start else "stop"
+        return cls._run_task([f"uuid:{uuid_str}", action])
 
     @classmethod
     def toggle_start_stop(cls, uuid_str, is_active):
@@ -350,6 +368,51 @@ def level_to_colors(level):
         )
 
 
+def pomo_phase_to_colors(phase, running):
+    """
+    Return (bg_rgb, border_rgb, text_rgb, accent_hex, level) for Pomodoro state:
+    - phase == 'idle'  : Muted slate
+    - not running      : Paused amber/yellow
+    - phase == 'work'  : Tomato crimson/coral red
+    - phase == 'break' : Refreshing cyan/emerald
+    """
+    if phase == "idle":
+        return (
+            (0.22, 0.24, 0.28),
+            (0.50, 0.56, 0.64),
+            (0.85, 0.88, 0.92),
+            "#94a3b8",
+            "normal",
+        )
+    if not running:
+        # Paused state -> Amber
+        return (
+            (0.45, 0.28, 0.07),
+            (0.96, 0.68, 0.16),
+            (1.00, 0.98, 0.92),
+            "#fbbf24",
+            "warn",
+        )
+    if phase == "work":
+        # Work focus state -> Tomato Red / Coral
+        return (
+            (0.50, 0.12, 0.15),
+            (0.98, 0.34, 0.36),
+            (1.00, 0.96, 0.96),
+            "#f87171",
+            "crit",
+        )
+    else:
+        # Break state -> Refreshing Cyan-Green
+        return (
+            (0.09, 0.34, 0.36),
+            (0.22, 0.82, 0.88),
+            (0.94, 1.00, 1.00),
+            "#22d3ee",
+            "normal",
+        )
+
+
 def draw_rounded_rect(ctx, x, y, w, h, r):
     r = min(r, w / 2.0, h / 2.0)
     ctx.new_sub_path()
@@ -362,27 +425,22 @@ def draw_rounded_rect(ctx, x, y, w, h, r):
 
 class TaskCalendarWindow(Gtk.Window):
     """
-    Dual-column Interactive Monthly Calendar Dashboard for Taskwarrior:
-    - Left Column : Custom Cairo-rendered 7x6 Monthly Calendar Grid with task badges, mini task titles,
-                    and historical completed task markers.
-    - Right Column:
-      1. Tasks on the Selected Date (Due pending tasks + Completed tasks on that date) with direct action buttons.
-      2. Unscheduled Pending Tasks (no due date) & All Pending Tasks with one-click "Assign to selected date".
+    Dual-column Interactive Monthly Calendar Dashboard for Taskwarrior with embedded Pomodoro Bar.
     """
 
     WEEKDAYS_ZH = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
 
     def __init__(self, parent_widget):
-        super().__init__(title="📅 Taskwarrior 月曆任務看板")
+        super().__init__(title="📅 Taskwarrior 月曆任務看板 & 🍅 番茄鐘專注中心")
         self.parent_widget = parent_widget
-        self.set_default_size(940, 580)
+        self.set_default_size(960, 630)
         self.set_position(Gtk.WindowPosition.CENTER)
 
         today = date.today()
         self.view_year = today.year
         self.view_month = today.month
         self.selected_date = today
-        self.cell_dates = []  # 42 date objects for the 6x7 grid
+        self.cell_dates = []
 
         self._build_ui()
         self.refresh_view()
@@ -394,7 +452,7 @@ class TaskCalendarWindow(Gtk.Window):
         root_vbox.set_margin_start(14)
         root_vbox.set_margin_end(14)
 
-        # Top Toolbar
+        # Row 1: Calendar Navigation Toolbar
         toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
 
         btn_prev_m = Gtk.Button(label="◀ 上個月")
@@ -413,7 +471,6 @@ class TaskCalendarWindow(Gtk.Window):
         toolbar.pack_start(btn_next_m, False, False, 0)
         toolbar.pack_start(self.month_title_lbl, False, False, 0)
 
-        # Right side of toolbar: Show Completed toggle, Add Task, Undo, Preferences
         btn_prefs = Gtk.Button(label="⚙️ 偏好設定")
         btn_prefs.connect("clicked", lambda *_: self.parent_widget.show_preferences_dialog())
         toolbar.pack_end(btn_prefs, False, False, 0)
@@ -435,7 +492,7 @@ class TaskCalendarWindow(Gtk.Window):
         )
         toolbar.pack_end(btn_add_sel, False, False, 0)
 
-        self.chk_show_comp = Gtk.CheckButton(label="在月曆顯示已完成紀錄 (✓)")
+        self.chk_show_comp = Gtk.CheckButton(label="顯示已完成紀錄 (✓)")
         self.chk_show_comp.set_active(
             self.parent_widget.config.get("calendar_show_completed", True)
         )
@@ -443,6 +500,40 @@ class TaskCalendarWindow(Gtk.Window):
         toolbar.pack_end(self.chk_show_comp, False, False, 6)
 
         root_vbox.pack_start(toolbar, False, False, 0)
+
+        # Row 2: Dedicated Pomodoro Timer Interactive Control Bar
+        pomo_frame = Gtk.Frame()
+        pomo_frame.set_shadow_type(Gtk.ShadowType.ETCHED_IN)
+        pomo_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        pomo_hbox.set_margin_top(6)
+        pomo_hbox.set_margin_bottom(6)
+        pomo_hbox.set_margin_start(10)
+        pomo_hbox.set_margin_end(10)
+
+        self.pomo_status_lbl = Gtk.Label(xalign=0.0)
+        pomo_hbox.pack_start(self.pomo_status_lbl, True, True, 0)
+
+        self.btn_pomo_toggle = Gtk.Button(label="▶️ 開始專注")
+        self.btn_pomo_toggle.connect("clicked", lambda *_: self.parent_widget.pomo_toggle_pause_resume())
+        pomo_hbox.pack_start(self.btn_pomo_toggle, False, False, 0)
+
+        self.btn_pomo_reset = Gtk.Button(label="🔄 重新計時")
+        self.btn_pomo_reset.set_tooltip_text("重置目前階段的倒數時間")
+        self.btn_pomo_reset.connect("clicked", lambda *_: self.parent_widget.pomo_reset_current_phase())
+        pomo_hbox.pack_start(self.btn_pomo_reset, False, False, 0)
+
+        self.btn_pomo_skip = Gtk.Button(label="⏭ 切換專注/休息")
+        self.btn_pomo_skip.set_tooltip_text("跳至下一階段（25分專注 ⇄ 5分中場休息）")
+        self.btn_pomo_skip.connect("clicked", lambda *_: self.parent_widget.pomo_skip_phase())
+        pomo_hbox.pack_start(self.btn_pomo_skip, False, False, 0)
+
+        self.btn_pomo_stop = Gtk.Button(label="⏹ 結束番茄鐘")
+        self.btn_pomo_stop.connect("clicked", lambda *_: self.parent_widget.pomo_stop())
+        pomo_hbox.pack_start(self.btn_pomo_stop, False, False, 0)
+
+        pomo_frame.add(pomo_hbox)
+        root_vbox.pack_start(pomo_frame, False, False, 0)
+
         root_vbox.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
         # Main Dual-Column Paned Area
@@ -454,7 +545,7 @@ class TaskCalendarWindow(Gtk.Window):
         left_vbox.set_margin_end(8)
 
         self.cal_canvas = Gtk.DrawingArea()
-        self.cal_canvas.set_size_request(500, 440)
+        self.cal_canvas.set_size_request(500, 430)
         self.cal_canvas.set_hexpand(True)
         self.cal_canvas.set_vexpand(True)
         self.cal_canvas.add_events(
@@ -480,16 +571,14 @@ class TaskCalendarWindow(Gtk.Window):
         right_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         right_vbox.set_margin_start(8)
 
-        # Top right: Selected date header + quick add
         sel_hdr_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.sel_date_lbl = Gtk.Label(xalign=0.0)
         sel_hdr_box.pack_start(self.sel_date_lbl, True, True, 0)
         right_vbox.pack_start(sel_hdr_box, False, False, 0)
 
-        # Scrolled list for Selected Date tasks
         sel_scroll = Gtk.ScrolledWindow()
         sel_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        sel_scroll.set_min_content_height(210)
+        sel_scroll.set_min_content_height(200)
         sel_scroll.set_vexpand(True)
         self.sel_tasks_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         sel_scroll.add(self.sel_tasks_box)
@@ -497,13 +586,12 @@ class TaskCalendarWindow(Gtk.Window):
 
         right_vbox.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
-        # Bottom right: Unscheduled & Other Pending Tasks section
         self.unsched_hdr_lbl = Gtk.Label(xalign=0.0)
         right_vbox.pack_start(self.unsched_hdr_lbl, False, False, 0)
 
         unsched_scroll = Gtk.ScrolledWindow()
         unsched_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        unsched_scroll.set_min_content_height(175)
+        unsched_scroll.set_min_content_height(170)
         unsched_scroll.set_vexpand(True)
         self.unsched_tasks_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         unsched_scroll.add(self.unsched_tasks_box)
@@ -514,6 +602,50 @@ class TaskCalendarWindow(Gtk.Window):
 
         self.add(root_vbox)
         self.show_all()
+
+    def update_pomo_bar(self):
+        """Update the Pomodoro status label and button states in the Calendar window without rebuilding task lists."""
+        pw = self.parent_widget
+        phase = pw.pomo_phase
+        running = pw.pomo_running
+        rem_str = pw.format_pomo_mmss()
+        cur_c = pw.pomo_current_cycle
+        max_c = int(pw.config.get("pomo_cycles", 4))
+        w_min = int(pw.config.get("pomo_work_min", 25))
+        b_min = int(pw.config.get("pomo_break_min", 5))
+        task_title = html.escape(pw.pomo_task_desc) if pw.pomo_task_desc else "未綁定特定任務"
+
+        if phase == "idle":
+            self.pomo_status_lbl.set_markup(
+                f"<b>🍅 番茄鐘待命</b>  "
+                f"<small>(設定: 專注 <b>{w_min}</b> 分 / 休息 <b>{b_min}</b> 分 / 共 <b>{max_c}</b> 循環)</small>"
+            )
+            self.btn_pomo_toggle.set_label(f"▶️ 開始專注 ({w_min}:00)")
+            self.btn_pomo_reset.set_sensitive(False)
+            self.btn_pomo_skip.set_sensitive(False)
+            self.btn_pomo_stop.set_sensitive(False)
+        else:
+            if phase == "work":
+                p_badge = (
+                    "<span foreground='#f87171'><b>🍅 專注工作中</b></span>"
+                    if running
+                    else "<span foreground='#fbbf24'><b>⏸ 專注已暫停</b></span>"
+                )
+            else:
+                p_badge = (
+                    "<span foreground='#22d3ee'><b>☕ 中場休息中</b></span>"
+                    if running
+                    else "<span foreground='#fbbf24'><b>⏸ 休息已暫停</b></span>"
+                )
+            self.pomo_status_lbl.set_markup(
+                f"{p_badge}   <tt><span size='large'><b>{rem_str}</b></span></tt>   "
+                f"<span foreground='#a78bfa'><b>[循環 {cur_c}/{max_c}]</b></span>   "
+                f"<small>🎯 目標: {task_title}</small>"
+            )
+            self.btn_pomo_toggle.set_label("⏸ 暫停計時" if running else "▶️ 繼續計時")
+            self.btn_pomo_reset.set_sensitive(True)
+            self.btn_pomo_skip.set_sensitive(True)
+            self.btn_pomo_stop.set_sensitive(True)
 
     def _on_toggle_show_completed(self, chk):
         self.parent_widget.config["calendar_show_completed"] = chk.get_active()
@@ -544,7 +676,7 @@ class TaskCalendarWindow(Gtk.Window):
         self.refresh_view()
 
     def _compute_month_cells(self):
-        cal = calendar.Calendar(firstweekday=0)  # Monday first
+        cal = calendar.Calendar(firstweekday=0)
         days = list(cal.itermonthdates(self.view_year, self.view_month))
         while len(days) < 42:
             last = days[-1]
@@ -552,11 +684,6 @@ class TaskCalendarWindow(Gtk.Window):
         self.cell_dates = days[:42]
 
     def _group_tasks_by_date(self):
-        """
-        Return (due_map, completed_map, unscheduled_pending)
-        due_map: {'YYYY-MM-DD': [pending_task, ...]}
-        completed_map: {'YYYY-MM-DD': [completed_task, ...]}
-        """
         due_map = {}
         completed_map = {}
         unscheduled = []
@@ -576,7 +703,6 @@ class TaskCalendarWindow(Gtk.Window):
                     continue
                 if f_tag and f_tag not in ct.get("tags", []):
                     continue
-                # Map completed task by its completion date (_end_date), or _due_date fallback
                 c_date = ct.get("_end_date") or ct.get("_due_date")
                 if c_date:
                     completed_map.setdefault(c_date, []).append(ct)
@@ -586,8 +712,8 @@ class TaskCalendarWindow(Gtk.Window):
     def refresh_view(self):
         self._compute_month_cells()
         self.due_map, self.completed_map, self.unscheduled = self._group_tasks_by_date()
+        self.update_pomo_bar()
 
-        # Update month header label
         ym_prefix = f"{self.view_year:04d}-{self.view_month:02d}"
         m_pending_cnt = sum(
             len(v) for k, v in self.due_map.items() if k.startswith(ym_prefix)
@@ -618,7 +744,6 @@ class TaskCalendarWindow(Gtk.Window):
         base_fs = float(max(8, min(22, int(self.parent_widget.config.get("calendar_font_size", 11)))))
         scale = base_fs / 11.0
 
-        # Dark slate theme background for calendar grid
         draw_rounded_rect(ctx, 0, 0, w, h, 6.0)
         ctx.set_source_rgba(0.11, 0.13, 0.16, 0.98)
         ctx.fill()
@@ -630,7 +755,6 @@ class TaskCalendarWindow(Gtk.Window):
         row_h = grid_h / 6.0
         start_x = 4.0
 
-        # Draw Weekday Headers
         ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
         ctx.set_font_size(base_fs + 0.5)
         for col_idx, wd_name in enumerate(self.WEEKDAYS_ZH):
@@ -669,7 +793,6 @@ class TaskCalendarWindow(Gtk.Window):
             day_pending = self.due_map.get(d_str, [])
             day_comp = self.completed_map.get(d_str, [])
 
-            # Cell background
             draw_rounded_rect(ctx, cx, cy, cw, ch, 4.5)
             if is_selected:
                 ctx.set_source_rgba(0.18, 0.32, 0.52, 0.95)
@@ -683,7 +806,6 @@ class TaskCalendarWindow(Gtk.Window):
                 ctx.set_source_rgba(0.10, 0.11, 0.14, 0.65)
             ctx.fill_preserve()
 
-            # Cell border
             if is_selected:
                 ctx.set_source_rgba(0.38, 0.72, 0.98, 1.0)
                 ctx.set_line_width(1.8)
@@ -695,7 +817,6 @@ class TaskCalendarWindow(Gtk.Window):
                 ctx.set_line_width(0.8)
             ctx.stroke()
 
-            # Day number in top-left
             ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
             ctx.set_font_size(day_num_fs)
             day_num_str = f"{d_obj.day}"
@@ -712,7 +833,6 @@ class TaskCalendarWindow(Gtk.Window):
             ctx.move_to(cx + 5.0, day_baseline_y)
             ctx.show_text(day_num_str)
 
-            # Top-right badges: Pending count pill & Completed count checkmark
             badge_right_x = cx + cw - 4.0
             if day_pending:
                 has_crit = any(t.get("_due_level") == "crit" or t.get("priority") == "H" for t in day_pending)
@@ -751,7 +871,6 @@ class TaskCalendarWindow(Gtk.Window):
                 ctx.move_to(badge_right_x - c_ext.width, day_baseline_y - 1.0)
                 ctx.show_text(c_txt)
 
-            # Mini Task Title Previews inside cell (up to 2 lines)
             line_y = day_baseline_y + line_step + 1.5
             char_px = max(6.5, task_fs * 0.86)
             max_chars = max(4, int((cw - 8.0) / char_px))
@@ -776,7 +895,6 @@ class TaskCalendarWindow(Gtk.Window):
                 line_y += line_step
                 shown_lines += 1
 
-            # If space remains, show up to 1 completed task preview in muted green
             if shown_lines < 2 and day_comp and (line_y + 3.0 <= cy + ch):
                 ct = day_comp[0]
                 cdesc = ct.get("description", "").strip()
@@ -820,7 +938,6 @@ class TaskCalendarWindow(Gtk.Window):
 
         self.refresh_view()
 
-        # Double-click on a date cell opens the Add Task dialog with Due pre-filled to that date!
         if event.type == Gdk.EventType._2BUTTON_PRESS and event.button == 1:
             self.parent_widget.show_add_or_edit_task_dialog(
                 task=None, default_due=clicked_date.strftime("%Y-%m-%d")
@@ -845,7 +962,6 @@ class TaskCalendarWindow(Gtk.Window):
         main_pt = int(round(base_fs * 1024))
         sub_pt = int(round(max(7.5, base_fs - 1.5) * 1024))
 
-        # Row 1: Task ID / Status / Priority / Description / Project & Tags
         top_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         lbl = Gtk.Label(xalign=0.0)
         lbl.set_line_wrap(True)
@@ -874,6 +990,10 @@ class TaskCalendarWindow(Gtk.Window):
         else:
             tid = t.get("id", "?")
             is_act = t.get("_is_active", False)
+            is_pomo_bound = (
+                self.parent_widget.pomo_phase != "idle"
+                and self.parent_widget.pomo_task_uuid == uuid_str
+            )
             pri_m = (
                 "<span foreground='#f87171'><b>[H]</b></span> "
                 if pri == "H"
@@ -883,19 +1003,23 @@ class TaskCalendarWindow(Gtk.Window):
                     else ("<span foreground='#38bdf8'><b>[L]</b></span> " if pri == "L" else "")
                 )
             )
-            act_m = "<span foreground='#34d399'><b>▶️[計時中]</b></span> " if is_act else ""
+            pomo_m = "<span foreground='#f87171'><b>🍅[番茄鐘專注]</b></span> " if is_pomo_bound else ""
+            act_m = (
+                "<span foreground='#34d399'><b>▶️[計時中]</b></span> "
+                if (is_act and not is_pomo_bound)
+                else ""
+            )
             due_rel = t.get("_due_rel", "")
             due_lvl = t.get("_due_level", "normal")
             due_col = "#f87171" if due_lvl == "crit" else ("#fbbf24" if due_lvl == "warn" else "#34d399")
             due_m = f"  <span size='{sub_pt}'><span foreground='{due_col}'>({html.escape(due_rel)})</span></span>" if due_rel else ""
             lbl.set_markup(
-                f"<span size='{main_pt}'><tt><b>#{tid}</b></tt> {act_m}{pri_m}<b>{desc}</b></span>{meta_m}{due_m}"
+                f"<span size='{main_pt}'><tt><b>#{tid}</b></tt> {pomo_m}{act_m}{pri_m}<b>{desc}</b></span>{meta_m}{due_m}"
             )
 
         top_hbox.pack_start(lbl, True, True, 0)
         vbox.pack_start(top_hbox, False, False, 0)
 
-        # Row 2: Quick Action Buttons
         act_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
 
         if is_completed:
@@ -917,15 +1041,15 @@ class TaskCalendarWindow(Gtk.Window):
             )
             act_hbox.pack_start(btn_done, False, False, 0)
 
-            is_act = t.get("_is_active", False)
-            btn_timer = Gtk.Button(label="⏹ 停止" if is_act else "▶️ 計時")
-            btn_timer.connect(
+            btn_pomo = Gtk.Button(label="🍅 番茄鐘")
+            btn_pomo.set_tooltip_text("綁定此任務並啟動 25 分鐘番茄鐘專注倒數")
+            btn_pomo.connect(
                 "clicked",
-                lambda _b, u=uuid_str, act=is_act: self.parent_widget._run_and_refresh(
-                    TaskwarriorBackend.toggle_start_stop, u, act
+                lambda _b, task_obj=t: self.parent_widget.pomo_start_work(
+                    task=task_obj, reset_cycles=True
                 ),
             )
-            act_hbox.pack_start(btn_timer, False, False, 0)
+            act_hbox.pack_start(btn_pomo, False, False, 0)
 
             if allow_assign_to_selected:
                 sel_str = self.selected_date.strftime("%Y-%m-%d")
@@ -1019,7 +1143,6 @@ class TaskCalendarWindow(Gtk.Window):
                     0,
                 )
 
-        # Populate bottom-right: Unscheduled pending tasks + Other dates pending tasks
         other_scheduled = [
             t for t in self.parent_widget.filtered_pending
             if t.get("_due_date") and t.get("_due_date") != sel_str
@@ -1057,6 +1180,7 @@ class TaskCalendarWindow(Gtk.Window):
 class TaskwarriorWidget(Gtk.EventBox):
     """
     Main widget placed inside either a MatePanelApplet or a standalone Gtk.Window.
+    Integrates Taskwarrior Pending Task Badge + Pomodoro Focus/Break Countdown Timer.
     """
 
     FONT_THEME_PRESETS = [
@@ -1098,6 +1222,16 @@ class TaskwarriorWidget(Gtk.EventBox):
         self.debounce_id = None
         self.periodic_timer_id = None
 
+        # Pomodoro State Machine
+        self.pomo_phase = "idle"  # 'idle', 'work', 'break'
+        self.pomo_running = False
+        self.pomo_remaining_sec = int(self.config.get("pomo_work_min", 25)) * 60
+        self.pomo_total_sec = self.pomo_remaining_sec
+        self.pomo_current_cycle = 1
+        self.pomo_task_uuid = None
+        self.pomo_task_desc = ""
+        self.pomo_timer_id = None
+
         self.canvas = Gtk.DrawingArea()
         self.canvas.add_events(
             Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
@@ -1133,6 +1267,177 @@ class TaskwarriorWidget(Gtk.EventBox):
                 json.dump(self.config, f, indent=2, ensure_ascii=False)
         except Exception:
             pass
+
+    # =========================================================================
+    # Pomodoro Timer Control Methods
+    # =========================================================================
+
+    def format_pomo_mmss(self):
+        if self.pomo_phase == "idle":
+            w_min = int(self.config.get("pomo_work_min", 25))
+            return f"{w_min:02d}:00"
+        sec = max(0, int(self.pomo_remaining_sec))
+        return f"{sec // 60:02d}:{sec % 60:02d}"
+
+    def _sync_pomo_timer(self):
+        if self.pomo_timer_id is not None:
+            GLib.source_remove(self.pomo_timer_id)
+            self.pomo_timer_id = None
+        if self.pomo_running and self.pomo_phase in ("work", "break"):
+            self.pomo_timer_id = GLib.timeout_add_seconds(1, self._on_pomo_tick)
+
+    def _sync_bound_task_active(self, should_be_active):
+        if not self.config.get("pomo_sync_task_start", True):
+            return
+        if not self.pomo_task_uuid:
+            return
+        TaskwarriorBackend.set_active_state(self.pomo_task_uuid, should_be_active)
+
+    def pomo_start_work(self, task=None, reset_cycles=True):
+        """Start a 25-minute (configurable) Pomodoro Work Focus countdown."""
+        if task is not None:
+            self.pomo_task_uuid = task.get("uuid")
+            self.pomo_task_desc = task.get("description", "")
+        elif not self.pomo_task_uuid and self.filtered_pending:
+            top = self.filtered_pending[0]
+            self.pomo_task_uuid = top.get("uuid")
+            self.pomo_task_desc = top.get("description", "")
+
+        if reset_cycles or self.pomo_phase == "idle":
+            self.pomo_current_cycle = 1
+
+        w_min = max(1, int(self.config.get("pomo_work_min", 25)))
+        self.pomo_phase = "work"
+        self.pomo_total_sec = w_min * 60
+        self.pomo_remaining_sec = self.pomo_total_sec
+        self.pomo_running = True
+        self._sync_bound_task_active(True)
+        self._sync_pomo_timer()
+        self._on_pomo_state_updated()
+
+    def pomo_start_break(self):
+        """Switch to a 5-minute (configurable) Pomodoro Mid-session Break countdown."""
+        b_min = max(1, int(self.config.get("pomo_break_min", 5)))
+        self.pomo_phase = "break"
+        self.pomo_total_sec = b_min * 60
+        self.pomo_remaining_sec = self.pomo_total_sec
+        self.pomo_running = True
+        self._sync_bound_task_active(False)
+        self._sync_pomo_timer()
+        self._on_pomo_state_updated()
+
+    def pomo_toggle_pause_resume(self, *_args):
+        """Pause if running, Resume if paused, or Start Work cycle 1 if idle."""
+        if self.pomo_phase == "idle":
+            self.pomo_start_work(reset_cycles=True)
+            return
+
+        self.pomo_running = not self.pomo_running
+        if self.pomo_phase == "work":
+            self._sync_bound_task_active(self.pomo_running)
+        self._sync_pomo_timer()
+        self._on_pomo_state_updated()
+
+    def pomo_reset_current_phase(self, *_args):
+        """Reset countdown timer of the current phase (Work or Break) back to full duration."""
+        if self.pomo_phase == "break":
+            b_min = max(1, int(self.config.get("pomo_break_min", 5)))
+            self.pomo_total_sec = b_min * 60
+        else:
+            self.pomo_phase = "work"
+            w_min = max(1, int(self.config.get("pomo_work_min", 25)))
+            self.pomo_total_sec = w_min * 60
+        self.pomo_remaining_sec = self.pomo_total_sec
+        self.pomo_running = True
+        if self.pomo_phase == "work":
+            self._sync_bound_task_active(True)
+        self._sync_pomo_timer()
+        self._on_pomo_state_updated()
+
+    def pomo_skip_phase(self, *_args):
+        """Manually skip from Work to Break or from Break to next Work cycle."""
+        max_c = max(1, int(self.config.get("pomo_cycles", 4)))
+        if self.pomo_phase == "work":
+            self.pomo_start_break()
+        elif self.pomo_phase == "break":
+            if self.pomo_current_cycle < max_c:
+                self.pomo_current_cycle += 1
+            else:
+                self.pomo_current_cycle = 1
+            self.pomo_start_work(reset_cycles=False)
+        else:
+            self.pomo_start_work(reset_cycles=True)
+
+    def pomo_stop(self, *_args):
+        """Stop and exit Pomodoro timer mode back to idle."""
+        if self.pomo_phase == "work" and self.pomo_running:
+            self._sync_bound_task_active(False)
+        self.pomo_running = False
+        self.pomo_phase = "idle"
+        self.pomo_current_cycle = 1
+        w_min = max(1, int(self.config.get("pomo_work_min", 25)))
+        self.pomo_total_sec = w_min * 60
+        self.pomo_remaining_sec = self.pomo_total_sec
+        self._sync_pomo_timer()
+        self._on_pomo_state_updated()
+
+    def _on_pomo_tick(self):
+        if not self.pomo_running or self.pomo_phase == "idle":
+            self.pomo_timer_id = None
+            return False
+
+        self.pomo_remaining_sec -= 1
+        if self.pomo_remaining_sec <= 0:
+            self._handle_pomo_phase_completed()
+            return False
+
+        self._update_tooltip()
+        self.canvas.queue_draw()
+        if self.calendar_win is not None:
+            self.calendar_win.update_pomo_bar()
+        return True
+
+    def _handle_pomo_phase_completed(self):
+        max_c = max(1, int(self.config.get("pomo_cycles", 4)))
+        w_min = max(1, int(self.config.get("pomo_work_min", 25)))
+        b_min = max(1, int(self.config.get("pomo_break_min", 5)))
+        t_note = f"（任務：{self.pomo_task_desc}）" if self.pomo_task_desc else ""
+
+        if self.pomo_phase == "work":
+            # Work finished -> automatically start 5-minute Break!
+            send_desktop_notification(
+                f"🍅 番茄鐘專注完成！(循環 {self.pomo_current_cycle}/{max_c})",
+                f"已完成 {w_min} 分鐘專注工作{t_note}。\n現在自動進入 {b_min} 分鐘中場休息倒數！",
+                urgent=False,
+            )
+            self.pomo_start_break()
+        elif self.pomo_phase == "break":
+            # Break finished -> check if more cycles remain
+            if self.pomo_current_cycle < max_c:
+                self.pomo_current_cycle += 1
+                send_desktop_notification(
+                    f"☕ 休息結束！開始第 {self.pomo_current_cycle}/{max_c} 循環專注",
+                    f"中場休息 {b_min} 分鐘結束，自動進入下一輪 {w_min} 分鐘專注工作{t_note}！",
+                    urgent=False,
+                )
+                self.pomo_start_work(reset_cycles=False)
+            else:
+                send_desktop_notification(
+                    f"🎉 恭喜完成全部 {max_c} 個番茄鐘循環！",
+                    f"已完成設定的 {max_c} 輪番茄鐘專注與休息循環{t_note}！",
+                    urgent=True,
+                )
+                self.pomo_stop()
+
+    def _on_pomo_state_updated(self):
+        self._update_tooltip()
+        self._update_canvas_size()
+        if self.calendar_win is not None:
+            self.calendar_win.refresh_view()
+
+    # =========================================================================
+    # Taskwarrior Sync & Panel Rendering
+    # =========================================================================
 
     def _setup_file_monitor(self):
         if not os.path.isdir(TASK_DATA_DIR):
@@ -1209,12 +1514,35 @@ class TaskwarriorWidget(Gtk.EventBox):
         if self.calendar_win is not None:
             self.calendar_win.refresh_view()
 
+    def _which_badges_to_draw(self):
+        """
+        Return tuple (show_task_badge, show_pomo_badge) based on pomo_panel_mode and current pomo_phase.
+        """
+        p_mode = self.config.get("pomo_panel_mode", "auto_switch")
+        if p_mode == "task_only":
+            return (True, False)
+        elif p_mode == "always_pomo":
+            return (False, True)
+        elif p_mode == "dual_badge":
+            return (True, True)
+        else:  # 'auto_switch'
+            if self.pomo_phase != "idle":
+                return (False, True)
+            return (True, False)
+
     def _get_top_task_summary_text(self):
+        max_c = max(6, int(self.config.get("max_title_chars", 22)))
+        if self.pomo_phase != "idle" and self.pomo_task_desc:
+            desc = self.pomo_task_desc.strip()
+            if len(desc) > max_c:
+                desc = desc[: max_c - 1] + "…"
+            max_cyc = max(1, int(self.config.get("pomo_cycles", 4)))
+            return f"🍅({self.pomo_current_cycle}/{max_cyc}) {desc}"
+
         if not self.filtered_pending:
             return "無待辦事項"
         top = self.filtered_pending[0]
         desc = top.get("description", "").strip()
-        max_c = max(6, int(self.config.get("max_title_chars", 22)))
         if len(desc) > max_c:
             desc = desc[: max_c - 1] + "…"
         pri = top.get("priority", "")
@@ -1231,15 +1559,26 @@ class TaskwarriorWidget(Gtk.EventBox):
     def _update_canvas_size(self):
         h = max(24, self.panel_size)
         mode = self.config.get("display_mode", "badge")
-        badge_w = max(32, int(h * 1.22))
+        show_task, show_pomo = self._which_badges_to_draw()
+
+        task_bw = max(32, int(h * 1.22))
+        pomo_bw = max(44, int(h * 1.62))  # slightly wider to fit '24:59' cleanly
+
+        badges_w = 0
+        if show_task and show_pomo:
+            badges_w = task_bw + 4 + pomo_bw
+        elif show_pomo:
+            badges_w = pomo_bw
+        else:
+            badges_w = task_bw
 
         if mode == "badge":
-            total_w = badge_w + 4
+            total_w = badges_w + 4
         else:
             top_txt = self._get_top_task_summary_text()
             est_char_w = max(7.5, h * 0.34)
             text_w = int(len(top_txt) * est_char_w) + 16
-            total_w = badge_w + 6 + min(380, max(90, text_w))
+            total_w = badges_w + 6 + min(380, max(90, text_w))
         self.canvas.set_size_request(total_w, h)
         self.canvas.queue_draw()
 
@@ -1256,9 +1595,30 @@ class TaskwarriorWidget(Gtk.EventBox):
         f_str = f" (篩選: {', '.join(filter_notes)})" if filter_notes else ""
 
         lines = [
-            f"<b>📋 Taskwarrior 任務管理 Plus{html.escape(f_str)}</b>",
-            f"• 待辦任務數: <b>{count}</b>" + (f" (總計 {total_all} 筆)" if f_str else ""),
+            f"<b>📋 Taskwarrior 任務管理 &amp; 🍅 番茄鐘 Plus{html.escape(f_str)}</b>",
         ]
+
+        # Pomodoro section in tooltip
+        max_c = int(self.config.get("pomo_cycles", 4))
+        w_min = int(self.config.get("pomo_work_min", 25))
+        b_min = int(self.config.get("pomo_break_min", 5))
+        if self.pomo_phase == "idle":
+            lines.append(
+                f"• 🍅 番茄鐘: <b>待命中</b> ({w_min}分專注 / {b_min}分休息 / {max_c}循環 — 中鍵點擊可立即開始)"
+            )
+        else:
+            p_name = "專注工作中" if self.pomo_phase == "work" else "中場休息中"
+            if not self.pomo_running:
+                p_name += " [已暫停]"
+            t_str = f" — 🎯 {html.escape(self.pomo_task_desc)}" if self.pomo_task_desc else ""
+            lines.append(
+                f"• 🍅 番茄鐘: <b>{p_name} {self.format_pomo_mmss()}</b> "
+                f"(循環 <b>{self.pomo_current_cycle}/{max_c}</b>){t_str}"
+            )
+
+        lines.append(
+            f"• 待辦任務數: <b>{count}</b>" + (f" (總計 {total_all} 筆)" if f_str else "")
+        )
         for t in self.filtered_pending[:5]:
             tid = t.get("id", "?")
             pri = f"[{t['priority']}] " if t.get("priority") else ""
@@ -1269,8 +1629,7 @@ class TaskwarriorWidget(Gtk.EventBox):
             lines.append(f"  #{tid} {pri}{desc}{proj}{due_r}{act}")
         if count > 5:
             lines.append(f"  <small>...及其他 {count - 5} 筆待辦任務</small>")
-        lc_mode = "開啟月曆任務看板" if self.config.get("left_click_action", "calendar") == "calendar" else "開啟任務下拉選單"
-        lines.append(f"<small>左鍵點選: {lc_mode} | 右鍵選單可切換檢視與偏好設定</small>")
+        lines.append("<small>左鍵: 月曆看板/選單 | 中鍵: 番茄鐘開始/暫停/繼續 | 右鍵: 選單與偏好設定</small>")
         self.set_tooltip_markup("\n".join(lines))
 
     def _resolve_panel_text_rgb(self, level, default_rgb):
@@ -1297,21 +1656,11 @@ class TaskwarriorWidget(Gtk.EventBox):
         ctx.move_to(x, y)
         ctx.show_text(text)
 
-    def _on_draw(self, widget, ctx):
-        alloc = widget.get_allocation()
-        w, h = alloc.width, alloc.height
-        mode = self.config.get("display_mode", "badge")
-
-        pad_y = 1.0
-        bh = max(20.0, h - pad_y * 2)
-        bw = max(30.0, min(float(w - 2), h * 1.22))
-
+    def _draw_task_badge(self, ctx, x, y, bw, bh):
         colors = level_to_colors(self.summary_level)
         bg_rgb, border_rgb, text_rgb, _, sev_lvl = colors
         bg_style = self.config.get("badge_bg_style", "dark")
 
-        x = 1.0
-        y = pad_y
         draw_rounded_rect(ctx, x + 0.5, y + 0.5, bw - 1.0, bh - 1.0, 4.5)
         if bg_style == "dark":
             ctx.set_source_rgba(bg_rgb[0], bg_rgb[1], bg_rgb[2], 0.92)
@@ -1357,15 +1706,111 @@ class TaskwarriorWidget(Gtk.EventBox):
         vy = y + bh - 3.0
         self._draw_styled_text(ctx, vx, vy, count_str, val_rgb)
 
+    def _draw_pomo_badge(self, ctx, x, y, bw, bh):
+        colors = pomo_phase_to_colors(self.pomo_phase, self.pomo_running)
+        bg_rgb, border_rgb, text_rgb, _, sev_lvl = colors
+        bg_style = self.config.get("badge_bg_style", "dark")
+
+        draw_rounded_rect(ctx, x + 0.5, y + 0.5, bw - 1.0, bh - 1.0, 4.5)
+        if bg_style == "dark":
+            ctx.set_source_rgba(bg_rgb[0], bg_rgb[1], bg_rgb[2], 0.92)
+            ctx.fill_preserve()
+        elif bg_style == "light":
+            l_r = min(1.0, 0.88 + bg_rgb[0] * 0.22)
+            l_g = min(1.0, 0.88 + bg_rgb[1] * 0.22)
+            l_b = min(1.0, 0.88 + bg_rgb[2] * 0.22)
+            ctx.set_source_rgba(l_r, l_g, l_b, 0.92)
+            ctx.fill_preserve()
+
+        ctx.set_source_rgba(border_rgb[0], border_rgb[1], border_rgb[2], 0.95)
+        ctx.set_line_width(1.2)
+        ctx.stroke()
+
+        # Bottom mini progress bar showing countdown progress
+        if self.pomo_phase != "idle" and self.pomo_total_sec > 0:
+            pct = max(0.0, min(1.0, float(self.pomo_remaining_sec) / float(self.pomo_total_sec)))
+            bar_x = x + 3.0
+            bar_w = max(8.0, bw - 6.0)
+            bar_h = 2.2
+            bar_y = y + bh - 3.2
+            ctx.set_source_rgba(0.08, 0.10, 0.12, 0.70)
+            ctx.rectangle(bar_x, bar_y, bar_w, bar_h)
+            ctx.fill()
+            fill_w = max(1.0, bar_w * pct)
+            ctx.set_source_rgba(border_rgb[0], border_rgb[1], border_rgb[2], 0.98)
+            ctx.rectangle(bar_x, bar_y, fill_w, bar_h)
+            ctx.fill()
+
+        if self.config.get("font_color_mode", "dynamic") == "custom":
+            stage_rgb = self._resolve_panel_text_rgb(sev_lvl, text_rgb)
+            title_rgb = stage_rgb
+            val_rgb = stage_rgb
+        else:
+            title_rgb = border_rgb
+            val_rgb = (bg_rgb[0] * 0.85, bg_rgb[1] * 0.85, bg_rgb[2] * 0.85) if bg_style == "light" else text_rgb
+
+        max_c = max(1, int(self.config.get("pomo_cycles", 4)))
+        if self.pomo_phase == "idle":
+            title = "POMO"
+        elif not self.pomo_running:
+            title = f"PAUS {self.pomo_current_cycle}/{max_c}"
+        elif self.pomo_phase == "work":
+            title = f"WORK {self.pomo_current_cycle}/{max_c}"
+        else:
+            title = f"REST {self.pomo_current_cycle}/{max_c}"
+
+        ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        header_size = max(6.0, bh * 0.23)
+        ctx.set_font_size(header_size)
+        ext = ctx.text_extents(title)
+        tx = x + (bw - ext.width) / 2.0 - ext.x_bearing
+        ty = y + header_size + 1.2
+        self._draw_styled_text(ctx, tx, ty, title, title_rgb)
+
+        mmss = self.format_pomo_mmss()
+        val_size = max(8.5, bh * 0.36)
+        ctx.set_font_size(val_size)
+        v_ext = ctx.text_extents(mmss)
+        vx = x + (bw - v_ext.width) / 2.0 - v_ext.x_bearing
+        vy = y + bh - (5.2 if self.pomo_phase != "idle" else 3.0)
+        self._draw_styled_text(ctx, vx, vy, mmss, val_rgb)
+
+    def _on_draw(self, widget, ctx):
+        alloc = widget.get_allocation()
+        w, h = alloc.width, alloc.height
+        mode = self.config.get("display_mode", "badge")
+        show_task, show_pomo = self._which_badges_to_draw()
+
+        pad_y = 1.0
+        bh = max(20.0, h - pad_y * 2)
+        task_bw = max(30.0, h * 1.22)
+        pomo_bw = max(42.0, h * 1.62)
+
+        cur_x = 1.0
+        if show_task:
+            bw = min(float(w - 2), task_bw)
+            self._draw_task_badge(ctx, cur_x, pad_y, bw, bh)
+            cur_x += bw + 4.0
+
+        if show_pomo:
+            bw = min(float(w - cur_x - 1), pomo_bw)
+            self._draw_pomo_badge(ctx, cur_x, pad_y, bw, bh)
+            cur_x += bw + 4.0
+
         if mode == "badge_text":
             top_txt = self._get_top_task_summary_text()
             font_sz = min(12.5, max(9.5, h * 0.42))
+            ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
             ctx.set_font_size(font_sz)
             t_ext = ctx.text_extents(top_txt)
+            if self.pomo_phase != "idle":
+                _, border_rgb, _, _, sev_lvl = pomo_phase_to_colors(self.pomo_phase, self.pomo_running)
+            else:
+                _, border_rgb, _, _, sev_lvl = level_to_colors(self.summary_level)
             summary_rgb = self._resolve_panel_text_rgb(sev_lvl, border_rgb)
             self._draw_styled_text(
                 ctx,
-                x + bw + 6.0,
+                cur_x + 2.0,
                 (h + t_ext.height) / 2.0,
                 top_txt,
                 summary_rgb,
@@ -1378,6 +1823,11 @@ class TaskwarriorWidget(Gtk.EventBox):
             GObject.signal_stop_emission_by_name(widget, "button-press-event")
             self._trigger_left_click_action(event)
             return True
+        elif event.button == 2:
+            # Middle-click toggles Pomodoro Pause / Resume / Start!
+            GObject.signal_stop_emission_by_name(widget, "button-press-event")
+            self.pomo_toggle_pause_resume()
+            return True
         return False
 
     def _on_button_press(self, widget, event):
@@ -1385,6 +1835,11 @@ class TaskwarriorWidget(Gtk.EventBox):
             if self.applet is not None:
                 GObject.signal_stop_emission_by_name(widget, "button-press-event")
             self._trigger_left_click_action(event)
+            return True
+        elif event.button == 2:
+            if self.applet is not None:
+                GObject.signal_stop_emission_by_name(widget, "button-press-event")
+            self.pomo_toggle_pause_resume()
             return True
         elif event.button == 3 and self.applet is None:
             self.popup_task_menu(event)
@@ -1469,7 +1924,109 @@ class TaskwarriorWidget(Gtk.EventBox):
         menu.append(cal_open_item)
         menu.append(Gtk.SeparatorMenuItem())
 
-        # 2. Pending Tasks List
+        # 2. Pomodoro Timer Quick Control Submenu / Section
+        w_min = int(self.config.get("pomo_work_min", 25))
+        b_min = int(self.config.get("pomo_break_min", 5))
+        max_c = int(self.config.get("pomo_cycles", 4))
+        if self.pomo_phase == "idle":
+            pomo_hdr_txt = (
+                f"🍅 <b>番茄鐘專注計時器</b> — <span foreground='#94a3b8'>待命中 ({w_min}分專注 / {b_min}分休息 / {max_c}循環)</span>"
+            )
+        else:
+            _, _, _, p_hex, _ = pomo_phase_to_colors(self.pomo_phase, self.pomo_running)
+            p_name = "專注工作中" if self.pomo_phase == "work" else "中場休息中"
+            if not self.pomo_running:
+                p_name += " [已暫停]"
+            pomo_hdr_txt = (
+                f"🍅 <b>番茄鐘：{p_name}</b>  "
+                f"<span foreground='{p_hex}'><b>{self.format_pomo_mmss()}</b></span>  "
+                f"<span foreground='#a78bfa'>[循環 {self.pomo_current_cycle}/{max_c}]</span>"
+            )
+
+        pomo_item = self._create_markup_menu_item(pomo_hdr_txt, sensitive=True)
+        pomo_sub = Gtk.Menu()
+
+        if self.pomo_phase == "idle":
+            pomo_sub.append(
+                self._create_markup_menu_item(
+                    f"▶️ <b>開始番茄鐘專注倒數 ({w_min} 分鐘，共 {max_c} 循環)</b>",
+                    sensitive=True,
+                    callback=lambda *_: self.pomo_start_work(reset_cycles=True),
+                )
+            )
+            pomo_sub.append(
+                self._create_markup_menu_item(
+                    f"☕ 直接開始中場休息倒數 ({b_min} 分鐘)",
+                    sensitive=True,
+                    callback=lambda *_: self.pomo_start_break(),
+                )
+            )
+        else:
+            if self.pomo_task_desc:
+                pomo_sub.append(
+                    self._create_markup_menu_item(
+                        f"🎯 綁定任務：<b>{html.escape(self.pomo_task_desc)}</b>",
+                        sensitive=False,
+                    )
+                )
+                pomo_sub.append(Gtk.SeparatorMenuItem())
+
+            toggle_lbl = "⏸ <b>暫停計時 (Pause)</b>" if self.pomo_running else "▶️ <b>繼續計時 (Resume)</b>"
+            pomo_sub.append(
+                self._create_markup_menu_item(
+                    toggle_lbl,
+                    sensitive=True,
+                    callback=lambda *_: self.pomo_toggle_pause_resume(),
+                )
+            )
+            pomo_sub.append(
+                Gtk.MenuItem(
+                    label=f"🔄 重新計時目前階段 (重置為 {w_min if self.pomo_phase == 'work' else b_min}:00)"
+                )
+            )
+            pomo_sub.get_children()[-1].connect("activate", lambda *_: self.pomo_reset_current_phase())
+
+            next_lbl = (
+                f"⏭ 跳至下一階段：進入 {b_min} 分鐘中場休息"
+                if self.pomo_phase == "work"
+                else f"⏭ 跳至下一階段：進入下一輪 {w_min} 分鐘專注"
+            )
+            skip_mi = Gtk.MenuItem(label=next_lbl)
+            skip_mi.connect("activate", lambda *_: self.pomo_skip_phase())
+            pomo_sub.append(skip_mi)
+
+            pomo_sub.append(Gtk.SeparatorMenuItem())
+            stop_mi = self._create_markup_menu_item(
+                "<span foreground='#f87171'>⏹ 結束並關閉番茄鐘 (Stop)</span>",
+                sensitive=True,
+                callback=lambda *_: self.pomo_stop(),
+            )
+            pomo_sub.append(stop_mi)
+
+        pomo_sub.append(Gtk.SeparatorMenuItem())
+        # Panel icon Pomodoro mode switcher inside submenu
+        cur_pm = self.config.get("pomo_panel_mode", "auto_switch")
+        pm_options = [
+            ("auto_switch", "面板圖示：計時啟動時自動切換為番茄鐘倒數 (推薦)"),
+            ("always_pomo", "面板圖示：常駐顯示番茄鐘倒數方塊"),
+            ("dual_badge", "面板圖示：並排同時顯示 [TASK] 與 [番茄鐘] 雙方塊"),
+            ("task_only", "面板圖示：僅顯示 [TASK] 待辦數量"),
+        ]
+        pm_grp = None
+        for pm_code, pm_label in pm_options:
+            r_pm = Gtk.RadioMenuItem.new_with_label_from_widget(pm_grp, pm_label)
+            if pm_grp is None:
+                pm_grp = r_pm
+            if cur_pm == pm_code:
+                r_pm.set_active(True)
+            r_pm.connect("toggled", self._on_pomo_panel_mode_toggled, pm_code)
+            pomo_sub.append(r_pm)
+
+        pomo_item.set_submenu(pomo_sub)
+        menu.append(pomo_item)
+        menu.append(Gtk.SeparatorMenuItem())
+
+        # 3. Pending Tasks List
         if not pending:
             empty_msg = "🎉 目前沒有符合篩選條件的待辦任務！" if (f_proj or f_tag) else "🎉 目前沒有任何待辦任務！"
             menu.append(self._create_markup_menu_item(f"   <i>{empty_msg}</i>", sensitive=False))
@@ -1479,7 +2036,7 @@ class TaskwarriorWidget(Gtk.EventBox):
 
         menu.append(Gtk.SeparatorMenuItem())
 
-        # 3. Quick Add Task
+        # 4. Quick Add Task
         add_item = self._create_markup_menu_item(
             "<b>➕ 快速新增任務 (Add New Task)...</b>",
             sensitive=True,
@@ -1487,7 +2044,7 @@ class TaskwarriorWidget(Gtk.EventBox):
         )
         menu.append(add_item)
 
-        # 4. Filter by Project / Tag Submenu
+        # 5. Filter by Project / Tag Submenu
         projects = self.task_data.get("projects", [])
         tags = self.task_data.get("tags", [])
         filter_label = "🔍 依專案 / 標籤篩選檢視"
@@ -1544,7 +2101,7 @@ class TaskwarriorWidget(Gtk.EventBox):
         filter_item.set_submenu(filter_sub)
         menu.append(filter_item)
 
-        # 5. Recent Completed Tasks & Undo Submenu
+        # 6. Recent Completed Tasks & Undo Submenu
         completed = self.task_data.get("completed", [])
         comp_item = Gtk.MenuItem(label=f"📜 最近已完成任務 ({len(completed)} 筆) 與復原")
         comp_sub = Gtk.Menu()
@@ -1586,7 +2143,7 @@ class TaskwarriorWidget(Gtk.EventBox):
 
         menu.append(Gtk.SeparatorMenuItem())
 
-        # 6. Submenu: Display Style & 3-Stage Font Colors
+        # 7. Submenu: Display Style & 3-Stage Font Colors
         style_item = Gtk.MenuItem(label="🎨 面板顯示樣式與三段字形顏色")
         style_sub = Gtk.Menu()
 
@@ -1610,10 +2167,10 @@ class TaskwarriorWidget(Gtk.EventBox):
 
         cur_mode = self.config.get("display_mode", "badge")
         m_badge = Gtk.RadioMenuItem.new_with_label_from_widget(
-            None, "模式 A：精簡任務計數方塊 ([TASK 1])"
+            None, "模式 A：精簡方塊圖示 ([TASK] / [番茄鐘])"
         )
         m_text = Gtk.RadioMenuItem.new_with_label_from_widget(
-            m_badge, "模式 B：方塊 + 最高緊急度任務標題 ([TASK 1] [H] 加強mate-panel...)"
+            m_badge, "模式 B：方塊 + 最高緊急度/專注任務標題"
         )
         if cur_mode == "badge":
             m_badge.set_active(True)
@@ -1668,7 +2225,7 @@ class TaskwarriorWidget(Gtk.EventBox):
         style_item.set_submenu(style_sub)
         menu.append(style_item)
 
-        # 7. Preferences
+        # 8. Preferences
         prefs_item = Gtk.MenuItem(label="⚙️ 偏好設定 (Preferences)...")
         prefs_item.connect("activate", lambda *_: self.show_preferences_dialog())
         menu.append(prefs_item)
@@ -1688,6 +2245,7 @@ class TaskwarriorWidget(Gtk.EventBox):
         due_date = t.get("_due_date", "")
         due_rel = t.get("_due_rel", "")
         due_lvl = t.get("_due_level", "normal")
+        is_pomo_bound = self.pomo_phase != "idle" and self.pomo_task_uuid == uuid_str
 
         if pri == "H":
             pri_m = "<span foreground='#f87171'><b>[H]</b></span> "
@@ -1698,7 +2256,12 @@ class TaskwarriorWidget(Gtk.EventBox):
         else:
             pri_m = ""
 
-        active_m = "<span foreground='#34d399'><b>▶️[執行中]</b></span> " if is_active else ""
+        pomo_m = "<span foreground='#f87171'><b>🍅[番茄鐘]</b></span> " if is_pomo_bound else ""
+        active_m = (
+            "<span foreground='#34d399'><b>▶️[執行中]</b></span> "
+            if (is_active and not is_pomo_bound)
+            else ""
+        )
 
         meta_parts = []
         if proj:
@@ -1715,7 +2278,7 @@ class TaskwarriorWidget(Gtk.EventBox):
         urg_m = f"  <small><span foreground='#888888'>[Urg: {urg:.1f}]</span></small>"
 
         row_item = self._create_markup_menu_item(
-            f"<tt><b>#{tid:<2}</b></tt> {active_m}{pri_m}<b>{desc}</b>{meta_m}{due_m}{urg_m}",
+            f"<tt><b>#{tid:<2}</b></tt> {pomo_m}{active_m}{pri_m}<b>{desc}</b>{meta_m}{due_m}{urg_m}",
             sensitive=True,
         )
 
@@ -1734,6 +2297,16 @@ class TaskwarriorWidget(Gtk.EventBox):
                     )
                 )
             sub.append(Gtk.SeparatorMenuItem())
+
+        # Start Pomodoro bound to this task!
+        w_min = int(self.config.get("pomo_work_min", 25))
+        max_c = int(self.config.get("pomo_cycles", 4))
+        pomo_start_item = self._create_markup_menu_item(
+            f"🍅 <b>以此任務啟動番茄鐘專注 ({w_min} 分鐘 × {max_c} 循環)</b>",
+            sensitive=True,
+            callback=lambda _w, task_obj=t: self.pomo_start_work(task=task_obj, reset_cycles=True),
+        )
+        sub.append(pomo_start_item)
 
         done_item = self._create_markup_menu_item(
             f"✅ <b>標記為完成 (task {tid} done)</b>",
@@ -1824,9 +2397,6 @@ class TaskwarriorWidget(Gtk.EventBox):
         self.refresh_tasks()
 
     def show_add_or_edit_task_dialog(self, task=None, default_due=""):
-        """
-        Show dialog to Add a new task (task=None) or Edit an existing task (task=dict).
-        """
         is_edit = task is not None
         title = f"編輯任務 #{task.get('id', '')}" if is_edit else "新增 Taskwarrior 任務"
 
@@ -1856,7 +2426,6 @@ class TaskwarriorWidget(Gtk.EventBox):
 
         grid = Gtk.Grid(column_spacing=10, row_spacing=10)
 
-        # 1. Description
         lbl_desc = Gtk.Label(label="任務描述 (必填)：", xalign=0.0)
         entry_desc = Gtk.Entry()
         entry_desc.set_hexpand(True)
@@ -1866,7 +2435,6 @@ class TaskwarriorWidget(Gtk.EventBox):
         grid.attach(lbl_desc, 0, 0, 1, 1)
         grid.attach(entry_desc, 1, 0, 2, 1)
 
-        # 2. Project
         lbl_proj = Gtk.Label(label="專案 (Project)：", xalign=0.0)
         combo_proj = Gtk.ComboBoxText.new_with_entry()
         for p in self.task_data.get("projects", []):
@@ -1880,7 +2448,6 @@ class TaskwarriorWidget(Gtk.EventBox):
         grid.attach(lbl_proj, 0, 1, 1, 1)
         grid.attach(combo_proj, 1, 1, 2, 1)
 
-        # 3. Priority
         lbl_pri = Gtk.Label(label="優先級 (Priority)：", xalign=0.0)
         combo_pri = Gtk.ComboBoxText()
         pri_options = [
@@ -1899,7 +2466,6 @@ class TaskwarriorWidget(Gtk.EventBox):
         grid.attach(lbl_pri, 0, 2, 1, 1)
         grid.attach(combo_pri, 1, 2, 2, 1)
 
-        # 4. Tags
         lbl_tags = Gtk.Label(label="標籤 (Tags)：", xalign=0.0)
         entry_tags = Gtk.Entry()
         entry_tags.set_placeholder_text("以空白分隔，例如：WORK")
@@ -1926,7 +2492,6 @@ class TaskwarriorWidget(Gtk.EventBox):
             tag_btn_box.pack_start(b_tg, False, False, 0)
         grid.attach(tag_btn_box, 2, 3, 1, 1)
 
-        # 5. Due Date
         lbl_due = Gtk.Label(label="到期日 (Due)：", xalign=0.0)
         entry_due = Gtk.Entry()
         entry_due.set_placeholder_text("YYYY-MM-DD 或 tomorrow, +3d, eow (可留空)")
@@ -2069,8 +2634,8 @@ class TaskwarriorWidget(Gtk.EventBox):
             self.prefs_win.present()
             return
 
-        win = Gtk.Window(title="Taskwarrior 任務管理 Plus — 偏好設定")
-        win.set_default_size(510, 620)
+        win = Gtk.Window(title="Taskwarrior 任務管理 & 番茄鐘 Plus — 偏好設定")
+        win.set_default_size(530, 740)
         win.set_position(Gtk.WindowPosition.CENTER)
         win.set_resizable(False)
         self.prefs_win = win
@@ -2080,9 +2645,9 @@ class TaskwarriorWidget(Gtk.EventBox):
 
         win.connect("destroy", on_win_destroy)
 
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        outer.set_margin_top(14)
-        outer.set_margin_bottom(14)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        outer.set_margin_top(12)
+        outer.set_margin_bottom(12)
         outer.set_margin_start(18)
         outer.set_margin_end(18)
 
@@ -2130,16 +2695,90 @@ class TaskwarriorWidget(Gtk.EventBox):
 
         outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
-        # Section 2: Panel Display Mode
+        # Section 2: Pomodoro Focus Timer & Cycle Settings
+        sec_pomo_lbl = Gtk.Label(xalign=0.0)
+        sec_pomo_lbl.set_markup("<b>2. 🍅 番茄鐘倒數計時與循環次數設定</b>")
+        outer.pack_start(sec_pomo_lbl, False, False, 0)
+
+        pomo_mode_combo = Gtk.ComboBoxText()
+        pm_items = [
+            ("auto_switch", "計時啟動時自動將面板 [TASK] 圖示切換為番茄鐘倒數 (平時顯示 TASK)"),
+            ("always_pomo", "面板常駐顯示番茄鐘倒數圖示 ([WORK 25:00])"),
+            ("dual_badge", "面板並排同時顯示 [TASK] 與 [番茄鐘] 雙方塊圖示"),
+            ("task_only", "面板僅顯示 [TASK] 圖示 (不顯示面板番茄鐘)"),
+        ]
+        cur_pm = self.config.get("pomo_panel_mode", "auto_switch")
+        pm_active = 0
+        for idx, (pm_id, pm_txt) in enumerate(pm_items):
+            pomo_mode_combo.append(pm_id, pm_txt)
+            if pm_id == cur_pm:
+                pm_active = idx
+        pomo_mode_combo.set_active(pm_active)
+        outer.pack_start(pomo_mode_combo, False, False, 0)
+
+        pomo_grid = Gtk.Grid(column_spacing=12, row_spacing=6)
+        pomo_grid.set_margin_start(14)
+
+        lbl_w_min = Gtk.Label(label="專注工作時間 (分鐘)：", xalign=0.0)
+        adj_w_min = Gtk.Adjustment(
+            value=float(self.config.get("pomo_work_min", 25)),
+            lower=1.0,
+            upper=180.0,
+            step_increment=1.0,
+            page_increment=5.0,
+            page_size=0.0,
+        )
+        spin_w_min = Gtk.SpinButton(adjustment=adj_w_min, climb_rate=1.0, digits=0)
+
+        lbl_b_min = Gtk.Label(label="中場休息時間 (分鐘)：", xalign=0.0)
+        adj_b_min = Gtk.Adjustment(
+            value=float(self.config.get("pomo_break_min", 5)),
+            lower=1.0,
+            upper=60.0,
+            step_increment=1.0,
+            page_increment=5.0,
+            page_size=0.0,
+        )
+        spin_b_min = Gtk.SpinButton(adjustment=adj_b_min, climb_rate=1.0, digits=0)
+
+        lbl_cycles = Gtk.Label(label="番茄鐘循環次數 (輪)：", xalign=0.0)
+        adj_cycles = Gtk.Adjustment(
+            value=float(self.config.get("pomo_cycles", 4)),
+            lower=1.0,
+            upper=20.0,
+            step_increment=1.0,
+            page_increment=2.0,
+            page_size=0.0,
+        )
+        spin_cycles = Gtk.SpinButton(adjustment=adj_cycles, climb_rate=1.0, digits=0)
+
+        pomo_grid.attach(lbl_w_min, 0, 0, 1, 1)
+        pomo_grid.attach(spin_w_min, 1, 0, 1, 1)
+        pomo_grid.attach(lbl_b_min, 2, 0, 1, 1)
+        pomo_grid.attach(spin_b_min, 3, 0, 1, 1)
+        pomo_grid.attach(lbl_cycles, 0, 1, 1, 1)
+        pomo_grid.attach(spin_cycles, 1, 1, 1, 1)
+        outer.pack_start(pomo_grid, False, False, 0)
+
+        chk_pomo_sync = Gtk.CheckButton(
+            label="綁定任務啟動/暫停番茄鐘時，同步觸發 Taskwarrior 的 task start / stop"
+        )
+        chk_pomo_sync.set_margin_start(14)
+        chk_pomo_sync.set_active(self.config.get("pomo_sync_task_start", True))
+        outer.pack_start(chk_pomo_sync, False, False, 0)
+
+        outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+
+        # Section 3: Panel Display Mode
         sec1_lbl = Gtk.Label(xalign=0.0)
-        sec1_lbl.set_markup("<b>2. 面板圖示顯示模式</b>")
+        sec1_lbl.set_markup("<b>3. 面板任務標題與到期警戒設定</b>")
         outer.pack_start(sec1_lbl, False, False, 0)
 
         rb_badge = Gtk.RadioButton.new_with_label_from_widget(
-            None, "模式 A：精簡任務計數方塊 ([TASK 1])"
+            None, "模式 A：僅顯示精簡方塊圖示 ([TASK] / [番茄鐘])"
         )
         rb_text = Gtk.RadioButton.new_with_label_from_widget(
-            rb_badge, "模式 B：方塊 + 最高緊急度任務標題 ([TASK 1] [H] 加強mate-panel功能)"
+            rb_badge, "模式 B：方塊圖示 + 最高緊急度/番茄鐘專注任務標題"
         )
         if self.config.get("display_mode", "badge") == "badge":
             rb_badge.set_active(True)
@@ -2161,7 +2800,7 @@ class TaskwarriorWidget(Gtk.EventBox):
         )
         spin_maxc = Gtk.SpinButton(adjustment=adj_maxc, climb_rate=1.0, digits=0)
 
-        lbl_duesoon = Gtk.Label(label="即將到期警戒天數 (Due <= N 天變橘色)：", xalign=0.0)
+        lbl_duesoon = Gtk.Label(label="即將到期警戒天數 (Due <= N 天)：", xalign=0.0)
         adj_duesoon = Gtk.Adjustment(
             value=float(self.config.get("due_soon_days", 3)),
             lower=1.0,
@@ -2174,8 +2813,8 @@ class TaskwarriorWidget(Gtk.EventBox):
 
         opt_grid.attach(lbl_maxc, 0, 0, 1, 1)
         opt_grid.attach(spin_maxc, 1, 0, 1, 1)
-        opt_grid.attach(lbl_duesoon, 0, 1, 1, 1)
-        opt_grid.attach(spin_duesoon, 1, 1, 1, 1)
+        opt_grid.attach(lbl_duesoon, 2, 0, 1, 1)
+        opt_grid.attach(spin_duesoon, 3, 0, 1, 1)
         outer.pack_start(opt_grid, False, False, 0)
 
         chk_due_panel = Gtk.CheckButton(label="在模式 B 面板標題後方附上到期倒數 (例如 剩 4 天)")
@@ -2185,16 +2824,16 @@ class TaskwarriorWidget(Gtk.EventBox):
 
         outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
-        # Section 3: 3-Stage Font Colors & Background Style
+        # Section 4: 3-Stage Font Colors & Background Style
         sec2_lbl = Gtk.Label(xalign=0.0)
-        sec2_lbl.set_markup("<b>3. 面板三段式字形顏色與底色適應 (一般 / 高優先或即將到期 / 逾期或今日到期)</b>")
+        sec2_lbl.set_markup("<b>4. 面板三段式字形顏色與底色適應</b>")
         outer.pack_start(sec2_lbl, False, False, 0)
 
         rb_font_dyn = Gtk.RadioButton.new_with_label_from_widget(
             None, "使用預設內建動態字形色階"
         )
         rb_font_cus = Gtk.RadioButton.new_with_label_from_widget(
-            rb_font_dyn, "自訂三段式字形顏色 (隨任務緊急程度與到期日自動變換字色)："
+            rb_font_dyn, "自訂三段式字形顏色 (隨任務緊急度或番茄鐘階段自動切換字色)："
         )
         if self.config.get("font_color_mode", "dynamic") == "dynamic":
             rb_font_dyn.set_active(True)
@@ -2213,22 +2852,22 @@ class TaskwarriorWidget(Gtk.EventBox):
             return cb
 
         color_norm_btn = make_color_btn(
-            self.config.get("custom_font_color", "#ffffff"), "選擇一般狀態字形顏色"
+            self.config.get("custom_font_color", "#ffffff"), "選擇一般/休息狀態字形顏色"
         )
         color_warn_btn = make_color_btn(
-            self.config.get("custom_warn_font_color", "#fbbf24"), "選擇高優先/即將到期字形顏色"
+            self.config.get("custom_warn_font_color", "#fbbf24"), "選擇高優先/暫停狀態字形顏色"
         )
         color_crit_btn = make_color_btn(
-            self.config.get("custom_crit_font_color", "#f87171"), "選擇已逾期/今日到期字形顏色"
+            self.config.get("custom_crit_font_color", "#f87171"), "選擇逾期/番茄鐘專注狀態字形顏色"
         )
 
         c_grid = Gtk.Grid(column_spacing=12, row_spacing=6)
         c_grid.set_margin_start(14)
-        c_grid.attach(Gtk.Label(label="🟢 一般待辦字形色：", xalign=0.0), 0, 0, 1, 1)
+        c_grid.attach(Gtk.Label(label="🟢 一般/休息字色：", xalign=0.0), 0, 0, 1, 1)
         c_grid.attach(color_norm_btn, 1, 0, 1, 1)
-        c_grid.attach(Gtk.Label(label="🟡 高優先/近期到期色：", xalign=0.0), 2, 0, 1, 1)
+        c_grid.attach(Gtk.Label(label="🟡 近期到期/暫停色：", xalign=0.0), 2, 0, 1, 1)
         c_grid.attach(color_warn_btn, 3, 0, 1, 1)
-        c_grid.attach(Gtk.Label(label="🔴 已逾期/今日到期色：", xalign=0.0), 0, 1, 1, 1)
+        c_grid.attach(Gtk.Label(label="🔴 逾期/專注工作色：", xalign=0.0), 0, 1, 1, 1)
         c_grid.attach(color_crit_btn, 1, 1, 1, 1)
 
         preset_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -2271,6 +2910,11 @@ class TaskwarriorWidget(Gtk.EventBox):
             self.config["left_click_action"] = "calendar" if rb_lc_cal.get_active() else "menu"
             self.config["calendar_show_completed"] = chk_cal_comp.get_active()
             self.config["calendar_font_size"] = int(spin_cal_fs.get_value_as_int())
+            self.config["pomo_panel_mode"] = pomo_mode_combo.get_active_id() or "auto_switch"
+            self.config["pomo_work_min"] = max(1, int(spin_w_min.get_value_as_int()))
+            self.config["pomo_break_min"] = max(1, int(spin_b_min.get_value_as_int()))
+            self.config["pomo_cycles"] = max(1, int(spin_cycles.get_value_as_int()))
+            self.config["pomo_sync_task_start"] = chk_pomo_sync.get_active()
             self.config["display_mode"] = "badge" if rb_badge.get_active() else "badge_text"
             self.config["max_title_chars"] = int(spin_maxc.get_value_as_int())
             self.config["due_soon_days"] = int(spin_duesoon.get_value_as_int())
@@ -2286,6 +2930,9 @@ class TaskwarriorWidget(Gtk.EventBox):
             else:
                 self.config["badge_bg_style"] = "transparent"
             self.config["text_shadow"] = chk_shadow.get_active()
+            if self.pomo_phase == "idle":
+                self.pomo_total_sec = self.config["pomo_work_min"] * 60
+                self.pomo_remaining_sec = self.pomo_total_sec
             self._save_config()
             self.refresh_tasks()
 
@@ -2310,10 +2957,12 @@ class TaskwarriorWidget(Gtk.EventBox):
             "clicked", lambda *_: set_quick_theme("#111827", "#b45309", "#b91c1c")
         )
 
+        pomo_mode_combo.connect("changed", apply_changes)
         for w_ctrl in (
             rb_lc_cal,
             rb_lc_menu,
             chk_cal_comp,
+            chk_pomo_sync,
             rb_badge,
             rb_text,
             chk_due_panel,
@@ -2325,19 +2974,26 @@ class TaskwarriorWidget(Gtk.EventBox):
             chk_shadow,
         ):
             w_ctrl.connect("toggled", apply_changes)
-        for sp_ctrl in (spin_cal_fs, spin_maxc, spin_duesoon):
+        for sp_ctrl in (
+            spin_cal_fs,
+            spin_w_min,
+            spin_b_min,
+            spin_cycles,
+            spin_maxc,
+            spin_duesoon,
+        ):
             sp_ctrl.connect("value-changed", apply_changes)
 
         # Bottom buttons
         btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         btn_cal = Gtk.Button(label="📅 開啟月曆看板")
         btn_cal.connect("clicked", lambda *_: self.show_calendar_window())
-        btn_add = Gtk.Button(label="➕ 新增任務")
-        btn_add.connect("clicked", lambda *_: self.show_add_or_edit_task_dialog(task=None))
+        btn_pomo = Gtk.Button(label="🍅 啟動/暫停番茄鐘")
+        btn_pomo.connect("clicked", lambda *_: self.pomo_toggle_pause_resume())
         btn_close = Gtk.Button(label="關閉")
         btn_close.connect("clicked", lambda *_: win.destroy())
         btn_box.pack_start(btn_cal, False, False, 0)
-        btn_box.pack_start(btn_add, False, False, 0)
+        btn_box.pack_start(btn_pomo, False, False, 0)
         btn_box.pack_end(btn_close, False, False, 0)
         outer.pack_end(btn_box, False, False, 0)
 
@@ -2346,15 +3002,22 @@ class TaskwarriorWidget(Gtk.EventBox):
 
     def show_about_dialog(self, *_args):
         dlg = Gtk.AboutDialog()
-        dlg.set_program_name("Taskwarrior 任務管理 Plus")
-        dlg.set_version("1.1.0")
+        dlg.set_program_name("Taskwarrior 任務管理 & 番茄鐘 Plus")
+        dlg.set_version("1.2.0")
         dlg.set_comments(
-            "事件驅動 (`Gio.FileMonitor` 監聽 ~/.task) 的 MATE 面板 Taskwarrior 任務管理 Applet。\n"
-            "內建雙欄式互動彩色月曆任務看板、歷史完成紀錄歸檔回顧與三段式自訂字形顏色。"
+            "事件驅動 (`Gio.FileMonitor` 監聽 ~/.task) 的 MATE 面板 Taskwarrior 任務管理與番茄鐘 Applet。\n"
+            "內建雙欄式互動彩色月曆看板、25/5分鐘番茄鐘循環倒數計時與三段式自訂字形顏色。"
         )
         dlg.set_website("https://github.com/sophAi/matepanel-applet-plus")
         dlg.run()
         dlg.destroy()
+
+    def _on_pomo_panel_mode_toggled(self, radio_item, pm_code):
+        if not radio_item.get_active():
+            return
+        self.config["pomo_panel_mode"] = pm_code
+        self._save_config()
+        self._update_canvas_size()
 
     def _on_left_click_action_toggled(self, radio_item, action_name):
         if not radio_item.get_active():
@@ -2393,6 +3056,9 @@ class TaskwarriorWidget(Gtk.EventBox):
         self.canvas.queue_draw()
 
     def _on_destroy(self, *_args):
+        if self.pomo_timer_id is not None:
+            GLib.source_remove(self.pomo_timer_id)
+            self.pomo_timer_id = None
         if self.debounce_id is not None:
             GLib.source_remove(self.debounce_id)
             self.debounce_id = None
@@ -2419,8 +3085,40 @@ def setup_applet_context_menu(applet, widget):
                 Gtk.STOCK_INDEX,
                 "月曆任務看板 (_Calendar View)...",
                 None,
-                "開啟雙欄式互動月曆任務看板",
+                "開啟雙欄式互動月曆任務看板與番茄鐘控制列",
                 widget.show_calendar_window,
+            ),
+            (
+                "PomoToggleAction",
+                Gtk.STOCK_MEDIA_PLAY,
+                "番茄鐘：開始 / 暫停 / 繼續 (_Pomodoro Toggle)",
+                None,
+                "啟動、暫停或繼續 25 分鐘番茄鐘倒數",
+                widget.pomo_toggle_pause_resume,
+            ),
+            (
+                "PomoResetAction",
+                Gtk.STOCK_REFRESH,
+                "番茄鐘：重新計時本階段 (_Reset Timer)",
+                None,
+                "將目前番茄鐘階段重置回完整時間",
+                widget.pomo_reset_current_phase,
+            ),
+            (
+                "PomoSkipAction",
+                Gtk.STOCK_MEDIA_NEXT,
+                "番茄鐘：切換專注 / 5分休息 (_Skip Phase)",
+                None,
+                "在專注工作與中場休息之間切換",
+                widget.pomo_skip_phase,
+            ),
+            (
+                "PomoStopAction",
+                Gtk.STOCK_MEDIA_STOP,
+                "番茄鐘：結束並關閉 (_Stop Pomodoro)",
+                None,
+                "結束番茄鐘倒數並恢復一般顯示",
+                widget.pomo_stop,
             ),
             (
                 "AddTaskAction",
@@ -2435,7 +3133,7 @@ def setup_applet_context_menu(applet, widget):
                 Gtk.STOCK_INFO,
                 "傳統下拉任務選單 (_Quick Menu)...",
                 None,
-                "顯示傳統下拉式待辦任務與操作選單",
+                "顯示傳統下拉式待辦任務與番茄鐘操作選單",
                 lambda *_: widget.popup_task_menu(None),
             ),
             (
@@ -2443,7 +3141,7 @@ def setup_applet_context_menu(applet, widget):
                 Gtk.STOCK_PREFERENCES,
                 "偏好設定 (_Preferences)...",
                 None,
-                "設定左鍵預設行為、面板顯示樣式與三段字形顏色",
+                "設定番茄鐘循環次數、月曆字體大小、面板顯示樣式與三段字色",
                 widget.show_preferences_dialog,
             ),
             (
@@ -2451,7 +3149,7 @@ def setup_applet_context_menu(applet, widget):
                 Gtk.STOCK_ABOUT,
                 "關於 (_About)...",
                 None,
-                "關於 Taskwarrior 任務管理 Plus",
+                "關於 Taskwarrior 任務管理 & 番茄鐘 Plus",
                 widget.show_about_dialog,
             ),
         ]
@@ -2459,8 +3157,13 @@ def setup_applet_context_menu(applet, widget):
 
     menu_xml = (
         '<menuitem name="CalendarView" action="CalendarViewAction"/>'
-        '<menuitem name="AddTask" action="AddTaskAction"/>'
         '<menuitem name="ShowTasksMenu" action="ShowTasksMenuAction"/>'
+        '<menuitem name="AddTask" action="AddTaskAction"/>'
+        "<separator/>"
+        '<menuitem name="PomoToggle" action="PomoToggleAction"/>'
+        '<menuitem name="PomoReset" action="PomoResetAction"/>'
+        '<menuitem name="PomoSkip" action="PomoSkipAction"/>'
+        '<menuitem name="PomoStop" action="PomoStopAction"/>'
         "<separator/>"
         '<menuitem name="Preferences" action="PreferencesAction"/>'
         '<menuitem name="About" action="AboutAction"/>'
@@ -2501,8 +3204,8 @@ def applet_factory(applet, iid, _data):
 
 
 def run_standalone_window():
-    win = Gtk.Window(title="MATE Taskwarrior Applet - 預覽測試視窗")
-    win.set_default_size(640, 170)
+    win = Gtk.Window(title="MATE Taskwarrior & Pomodoro Applet - 預覽測試視窗")
+    win.set_default_size(680, 175)
     win.set_position(Gtk.WindowPosition.CENTER)
     win.connect("destroy", Gtk.main_quit)
 
@@ -2514,9 +3217,9 @@ def run_standalone_window():
 
     info_lbl = Gtk.Label(xalign=0.0)
     info_lbl.set_markup(
-        "<b>MATE Panel 模擬預覽列 — Taskwarrior 任務管理 Plus (含雙欄月曆看板)</b>\n"
-        "<small>• <b>左鍵點選</b>下方 <tt>[TASK]</tt> 圖示：直接開啟/收合<b>📅 雙欄式互動月曆任務看板</b>\n"
-        "• <b>右鍵點選</b>下方圖示（或按右側按鈕）：開啟傳統下拉式快速選單或偏好設定</small>"
+        "<b>MATE Panel 模擬預覽列 — Taskwarrior 任務管理 &amp; 🍅 番茄鐘 Plus</b>\n"
+        "<small>• <b>左鍵點選</b>下方圖示：開啟<b>📅 雙欄月曆任務看板 (頂部內嵌番茄鐘控制列)</b>\n"
+        "• <b>中鍵點選</b>下方圖示（或按「🍅 番茄鐘」）：立即<b>開始 / 暫停 / 繼續 25 分鐘番茄鐘倒數</b> (面板圖示自動切換顯示倒數)</small>"
     )
     vbox.pack_start(info_lbl, False, False, 0)
 
@@ -2553,9 +3256,9 @@ def run_standalone_window():
     btn_cal.connect("clicked", widget.show_calendar_window)
     hbox.pack_end(btn_cal, False, False, 0)
 
-    btn_add = Gtk.Button(label="➕ 新增任務")
-    btn_add.connect("clicked", lambda *_: widget.show_add_or_edit_task_dialog(task=None))
-    hbox.pack_end(btn_add, False, False, 0)
+    btn_pomo = Gtk.Button(label="🍅 開始/暫停番茄鐘")
+    btn_pomo.connect("clicked", widget.pomo_toggle_pause_resume)
+    hbox.pack_end(btn_pomo, False, False, 0)
 
     is_dark = [True]
 
