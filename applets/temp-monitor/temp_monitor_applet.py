@@ -203,9 +203,86 @@ class HardwareSensorManager:
 
     def __init__(self):
         self.nvml = NVMLReader()
+        self._prev_cpu_total = None
+        self._prev_cpu_idle = None
+        # Prime initial /proc/stat snapshot so the first poll has a valid baseline
+        self._read_cpu_usage_pct()
 
     def close(self):
         self.nvml.shutdown()
+
+    def _read_cpu_usage_pct(self):
+        """
+        Zero-overhead CPU average loading (%) read directly from /proc/stat line 1.
+        Returns float (0.0..100.0) or None on the very first prime call.
+        """
+        try:
+            with open("/proc/stat", "r", encoding="utf-8") as f:
+                line = f.readline()
+            parts = line.split()
+            if len(parts) < 5 or parts[0] != "cpu":
+                return None
+            vals = [int(x) for x in parts[1:]]
+            idle = vals[3] + (vals[4] if len(vals) > 4 else 0)  # idle + iowait
+            total = sum(vals)
+            prev_t = self._prev_cpu_total
+            prev_i = self._prev_cpu_idle
+            self._prev_cpu_total = total
+            self._prev_cpu_idle = idle
+            if prev_t is None or prev_i is None:
+                return None
+            dt = total - prev_t
+            di = idle - prev_i
+            if dt <= 0:
+                return 0.0
+            pct = (1.0 - (float(di) / float(dt))) * 100.0
+            return max(0.0, min(100.0, pct))
+        except OSError:
+            return None
+
+    @staticmethod
+    def _read_loadavg_str():
+        try:
+            with open("/proc/loadavg", "r", encoding="utf-8") as f:
+                parts = f.read().split()
+            if len(parts) >= 3:
+                return f"{parts[0]}, {parts[1]}, {parts[2]}"
+        except OSError:
+            pass
+        return None
+
+    @staticmethod
+    def _read_ram_usage():
+        """
+        Zero-overhead System RAM usage read directly from /proc/meminfo.
+        Returns (ram_pct, ram_used_gib, ram_total_gib).
+        """
+        mem_total_kb = None
+        mem_avail_kb = None
+        mem_free_kb = None
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        mem_total_kb = int(line.split()[1])
+                    elif line.startswith("MemAvailable:"):
+                        mem_avail_kb = int(line.split()[1])
+                    elif line.startswith("MemFree:"):
+                        mem_free_kb = int(line.split()[1])
+                    if mem_total_kb is not None and mem_avail_kb is not None:
+                        break
+            if mem_total_kb and mem_total_kb > 0:
+                avail = mem_avail_kb if mem_avail_kb is not None else (mem_free_kb or 0)
+                used_kb = max(0, mem_total_kb - avail)
+                pct = (float(used_kb) / float(mem_total_kb)) * 100.0
+                return (
+                    max(0.0, min(100.0, pct)),
+                    used_kb / (1024.0 * 1024.0),
+                    mem_total_kb / (1024.0 * 1024.0),
+                )
+        except OSError:
+            pass
+        return (None, None, None)
 
     @staticmethod
     def _read_file_str(path):
@@ -349,8 +426,17 @@ class HardwareSensorManager:
                 gpu_mem_used_mib = sum(used_vals)
                 gpu_mem_total_mib = sum(total_vals)
 
+        cpu_load_pct = self._read_cpu_usage_pct()
+        loadavg_str = self._read_loadavg_str()
+        ram_pct, ram_used_gib, ram_total_gib = self._read_ram_usage()
+
         return {
             "cpu_avg": cpu_avg,
+            "cpu_load_pct": cpu_load_pct,
+            "loadavg_str": loadavg_str,
+            "ram_pct": ram_pct,
+            "ram_used_gib": ram_used_gib,
+            "ram_total_gib": ram_total_gib,
             "gpu_avg": gpu_avg,
             "gpu_util_avg": gpu_util_avg,
             "gpu_mem_pct_avg": gpu_mem_pct_avg,
@@ -521,6 +607,11 @@ class TempMonitorWidget(Gtk.EventBox):
         self.sensor_mgr = HardwareSensorManager()
         self.latest_data = {
             "cpu_avg": None,
+            "cpu_load_pct": None,
+            "loadavg_str": None,
+            "ram_pct": None,
+            "ram_used_gib": None,
+            "ram_total_gib": None,
             "gpu_avg": None,
             "gpu_util_avg": None,
             "gpu_mem_pct_avg": None,
@@ -707,6 +798,11 @@ class TempMonitorWidget(Gtk.EventBox):
         enabled = self.config.get("enabled", True)
         interval = self.config.get("interval_sec", 2)
         cpu_avg = self.latest_data.get("cpu_avg")
+        cpu_load = self.latest_data.get("cpu_load_pct")
+        loadavg = self.latest_data.get("loadavg_str")
+        ram_pct = self.latest_data.get("ram_pct")
+        ram_used = self.latest_data.get("ram_used_gib")
+        ram_tot = self.latest_data.get("ram_total_gib")
         gpu_avg = self.latest_data.get("gpu_avg")
         gpu_util = self.latest_data.get("gpu_util_avg")
         mem_pct = self.latest_data.get("gpu_mem_pct_avg")
@@ -714,6 +810,16 @@ class TempMonitorWidget(Gtk.EventBox):
         mem_tot = self.latest_data.get("gpu_mem_total_mib")
 
         cpu_str = f"{cpu_avg:.1f}°C" if (enabled and cpu_avg is not None) else ("已關閉" if not enabled else "N/A")
+        if enabled and cpu_load is not None:
+            load_extra = f" (Load: {loadavg})" if loadavg else ""
+            cpu_load_str = f"{cpu_load:.1f}%{load_extra}"
+        else:
+            cpu_load_str = "已關閉" if not enabled else "N/A"
+        if enabled and ram_used is not None and ram_tot is not None and ram_pct is not None:
+            ram_str = f"{ram_used:.1f} / {ram_tot:.1f} GiB ({ram_pct:.1f}%)"
+        else:
+            ram_str = "已關閉" if not enabled else "N/A"
+
         gpu_str = f"{gpu_avg:.1f}°C" if (enabled and gpu_avg is not None) else ("已關閉" if not enabled else "N/A")
         util_str = f"{gpu_util:.0f}%" if (enabled and gpu_util is not None) else ("已關閉" if not enabled else "N/A")
         if enabled and mem_used is not None and mem_tot is not None:
@@ -725,6 +831,8 @@ class TempMonitorWidget(Gtk.EventBox):
         self.set_tooltip_markup(
             f"<b>CPU / GPU 溫度與負載監控 Plus</b>\n"
             f"• CPU 平均溫度: <b>{cpu_str}</b>\n"
+            f"• CPU 平均負載: <b>{cpu_load_str}</b>\n"
+            f"• 系統記憶體 (RAM): <b>{ram_str}</b>\n"
             f"• GPU 平均溫度: <b>{gpu_str}</b>\n"
             f"• Volatile GPU-Util: <b>{util_str}</b>\n"
             f"• GPU Memory-Usage: <b>{mem_str}</b>\n"
@@ -848,6 +956,8 @@ class TempMonitorWidget(Gtk.EventBox):
 
     def _draw_badge_mode(self, ctx, w, h, enabled):
         cpu_avg = self.latest_data.get("cpu_avg") if enabled else None
+        cpu_load = self.latest_data.get("cpu_load_pct") if enabled else None
+        ram_pct = self.latest_data.get("ram_pct") if enabled else None
         gpu_avg = self.latest_data.get("gpu_avg") if enabled else None
         gpu_util = self.latest_data.get("gpu_util_avg") if enabled else None
         mem_pct = self.latest_data.get("gpu_mem_pct_avg") if enabled else None
@@ -859,21 +969,32 @@ class TempMonitorWidget(Gtk.EventBox):
         badges = []
 
         cpu_val_str = "OFF" if not enabled else ("--°" if cpu_avg is None else f"{int(round(cpu_avg))}°")
-        badges.append(("CPU", cpu_val_str, self._get_temp_colors(cpu_avg, enabled), None))
+        cpu_side_bars = None
+        if layout == "compact":
+            # In compact 2-in-1 layout, embed left (CPU avg loading %) and right (System RAM usage %) vertical bars
+            _, cl_border, _, _, cl_lvl = self._get_pct_colors(cpu_load, enabled, base_hue="cyan")
+            cl_bar_rgb = self._resolve_panel_text_rgb(cl_lvl, cl_border)
+            _, rm_border, _, _, rm_lvl = self._get_pct_colors(ram_pct, enabled, base_hue="purple")
+            rm_bar_rgb = self._resolve_panel_text_rgb(rm_lvl, rm_border)
+            cpu_side_bars = {
+                "left": (cpu_load if enabled else 0.0, cl_bar_rgb),
+                "right": (ram_pct if enabled else 0.0, rm_bar_rgb),
+            }
+        badges.append(("CPU", cpu_val_str, self._get_temp_colors(cpu_avg, enabled), cpu_side_bars))
 
         gpu_val_str = "OFF" if not enabled else ("--°" if gpu_avg is None else f"{int(round(gpu_avg))}°")
-        side_bars = None
+        gpu_side_bars = None
         if layout == "compact":
             # In compact 2-in-1 layout, always embed left (GPU-Util) and right (Memory-Usage) vertical bars
             _, u_border, _, _, u_lvl = self._get_pct_colors(gpu_util, enabled, base_hue="cyan")
             u_bar_rgb = self._resolve_panel_text_rgb(u_lvl, u_border)
             _, m_border, _, _, m_lvl = self._get_pct_colors(mem_pct, enabled, base_hue="purple")
             m_bar_rgb = self._resolve_panel_text_rgb(m_lvl, m_border)
-            side_bars = {
+            gpu_side_bars = {
                 "left": (gpu_util if enabled else 0.0, u_bar_rgb),
                 "right": (mem_pct if enabled else 0.0, m_bar_rgb),
             }
-        badges.append(("GPU", gpu_val_str, self._get_temp_colors(gpu_avg, enabled), side_bars))
+        badges.append(("GPU", gpu_val_str, self._get_temp_colors(gpu_avg, enabled), gpu_side_bars))
 
         if layout == "separate":
             if show_util:
@@ -1046,11 +1167,39 @@ class TempMonitorWidget(Gtk.EventBox):
         menu.append(header_item)
         menu.append(Gtk.SeparatorMenuItem())
 
-        # 2. CPU Sensor Units Section
+        # 2. CPU Sensor Units & System Load/RAM Section
         cpu_title = self._create_markup_menu_item(
-            f"<b>🖥 CPU 監控單元 (平均: {cpu_avg_txt})</b>", sensitive=False
+            f"<b>🖥 CPU 與系統資源監控 (平均溫度: {cpu_avg_txt})</b>", sensitive=False
         )
         menu.append(cpu_title)
+
+        cpu_load = self.latest_data.get("cpu_load_pct")
+        loadavg = self.latest_data.get("loadavg_str")
+        if cpu_load is not None:
+            _, _, _, cl_col, _ = self._get_pct_colors(cpu_load, True, base_hue="cyan")
+            cl_bar = make_ascii_bar(cpu_load, 10)
+            la_str = f" <small><span foreground='#888888'>(LoadAvg: {loadavg})</span></small>" if loadavg else ""
+            menu.append(
+                self._create_markup_menu_item(
+                    f"   ├─ <tt>CPU 平均負載 (Load) :</tt> <tt><span foreground='{cl_col}'>[{cl_bar}]</span></tt> "
+                    f"<span foreground='{cl_col}'><b>{cpu_load:.1f}%</b></span>{la_str}",
+                    sensitive=True,
+                )
+            )
+
+        ram_pct = self.latest_data.get("ram_pct")
+        ram_used = self.latest_data.get("ram_used_gib")
+        ram_tot = self.latest_data.get("ram_total_gib")
+        if ram_pct is not None and ram_used is not None and ram_tot is not None:
+            _, _, _, rm_col, _ = self._get_pct_colors(ram_pct, True, base_hue="purple")
+            rm_bar = make_ascii_bar(ram_pct, 10)
+            menu.append(
+                self._create_markup_menu_item(
+                    f"   └─ <tt>系統記憶體 (RAM)    :</tt> <tt><span foreground='{rm_col}'>[{rm_bar}]</span></tt> "
+                    f"<span foreground='{rm_col}'><b>{ram_used:.1f} GiB / {ram_tot:.1f} GiB ({ram_pct:.1f}%)</b></span>",
+                    sensitive=True,
+                )
+            )
 
         cpu_sensors = self.latest_data.get("cpu_sensors", [])
         if not cpu_sensors:
@@ -1216,7 +1365,7 @@ class TempMonitorWidget(Gtk.EventBox):
             None, "方塊佈局 1：獨立方塊 ([CPU] [GPU] [UTL] [MEM])"
         )
         layout_comp = Gtk.RadioMenuItem.new_with_label_from_widget(
-            layout_sep, "方塊佈局 2：緊湊二合一 ([CPU] [GPU 左右內嵌垂直雙進度條])"
+            layout_sep, "方塊佈局 2：緊湊二合一 ([CPU 左右內嵌 Load/RAM] [GPU 左右內嵌 Util/VRAM])"
         )
         if cur_layout == "separate":
             layout_sep.set_active(True)
@@ -1420,7 +1569,7 @@ class TempMonitorWidget(Gtk.EventBox):
             None, "方塊模式佈局 1：獨立方塊 ([CPU 39°] [GPU 41°] [UTL 34%] [MEM 26%])"
         )
         rb_layout_comp = Gtk.RadioButton.new_with_label_from_widget(
-            rb_layout_sep, "方塊模式佈局 2：緊湊二合一 ([CPU 39°] [GPU 41° + 左右垂直雙進度條: 左Util/右Mem])"
+            rb_layout_sep, "方塊模式佈局 2：緊湊二合一 (CPU: 左Load/右RAM  |  GPU: 左Util/右VRAM)"
         )
         if self.config.get("gpu_badge_layout", "separate") == "separate":
             rb_layout_sep.set_active(True)
