@@ -56,6 +56,7 @@ DEFAULT_CONFIG = {
     "display_mode": "badge",             # "badge" (僅方塊圖示) or "badge_text" (方塊 + 首要任務標題)
     "left_click_action": "calendar",     # "calendar" (開啟雙欄月曆任務看板) or "menu" (開啟傳統下拉快速選單)
     "calendar_show_completed": True,     # 在月曆格子與右側清單中顯示歷史已完成任務 (依 end 完成日期對應)
+    "calendar_font_size": 11,            # 月曆看板基準字型大小 (pt/px, 範圍 8..20，同步縮放月曆格子與右側清單)
     "max_title_chars": 22,               # badge_text 模式下顯示的最大字元數
     "show_due_in_panel": True,           # badge_text 模式下是否在標題後附加上到期倒數
     "filter_project": "",                # 空字串代表顯示全部專案
@@ -594,10 +595,17 @@ class TaskCalendarWindow(Gtk.Window):
         m_comp_cnt = sum(
             len(v) for k, v in self.completed_map.items() if k.startswith(ym_prefix)
         )
+        base_fs = max(8, min(22, int(self.parent_widget.config.get("calendar_font_size", 11))))
+        title_pt = int(round((base_fs + 3.5) * 1024))
+        sub_pt = int(round(max(8.5, base_fs - 0.5) * 1024))
         self.month_title_lbl.set_markup(
-            f"<span size='large'><b>{self.view_year} 年 {self.view_month:02d} 月</b></span>   "
-            f"<small><span foreground='#38bdf8'>本月排程待辦: {m_pending_cnt} 筆</span>"
-            + (f"  |  <span foreground='#34d399'>本月完成: {m_comp_cnt} 筆</span></small>" if self.parent_widget.config.get("calendar_show_completed", True) else "</small>")
+            f"<span size='{title_pt}'><b>{self.view_year} 年 {self.view_month:02d} 月</b></span>   "
+            f"<span size='{sub_pt}'><span foreground='#38bdf8'>本月排程待辦: {m_pending_cnt} 筆</span>"
+            + (
+                f"  |  <span foreground='#34d399'>本月完成: {m_comp_cnt} 筆</span></span>"
+                if self.parent_widget.config.get("calendar_show_completed", True)
+                else "</span>"
+            )
         )
 
         self.cal_canvas.queue_draw()
@@ -607,12 +615,15 @@ class TaskCalendarWindow(Gtk.Window):
         alloc = widget.get_allocation()
         w, h = float(alloc.width), float(alloc.height)
 
+        base_fs = float(max(8, min(22, int(self.parent_widget.config.get("calendar_font_size", 11)))))
+        scale = base_fs / 11.0
+
         # Dark slate theme background for calendar grid
         draw_rounded_rect(ctx, 0, 0, w, h, 6.0)
         ctx.set_source_rgba(0.11, 0.13, 0.16, 0.98)
         ctx.fill()
 
-        header_h = 28.0
+        header_h = max(26.0, 28.0 * scale)
         grid_y = header_h + 2.0
         grid_h = max(120.0, h - grid_y - 4.0)
         col_w = (w - 8.0) / 7.0
@@ -621,7 +632,7 @@ class TaskCalendarWindow(Gtk.Window):
 
         # Draw Weekday Headers
         ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-        ctx.set_font_size(11.5)
+        ctx.set_font_size(base_fs + 0.5)
         for col_idx, wd_name in enumerate(self.WEEKDAYS_ZH):
             cx = start_x + col_idx * col_w
             ext = ctx.text_extents(wd_name)
@@ -629,12 +640,18 @@ class TaskCalendarWindow(Gtk.Window):
                 ctx.set_source_rgba(0.96, 0.55, 0.45, 0.95)
             else:
                 ctx.set_source_rgba(0.75, 0.80, 0.86, 0.95)
-            ctx.move_to(cx + (col_w - ext.width) / 2.0 - ext.x_bearing, 19.0)
+            ctx.move_to(cx + (col_w - ext.width) / 2.0 - ext.x_bearing, header_h * 0.68)
             ctx.show_text(wd_name)
 
         today = date.today()
         if not self.cell_dates:
             self._compute_month_cells()
+
+        day_num_fs = base_fs + 0.5
+        pill_fs = max(7.5, base_fs - 1.5)
+        comp_fs = max(7.5, base_fs - 2.0)
+        task_fs = max(7.5, base_fs - 1.2)
+        line_step = max(11.0, task_fs + 3.5)
 
         for idx, d_obj in enumerate(self.cell_dates):
             r_idx = idx // 7
@@ -680,7 +697,7 @@ class TaskCalendarWindow(Gtk.Window):
 
             # Day number in top-left
             ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-            ctx.set_font_size(11.5)
+            ctx.set_font_size(day_num_fs)
             day_num_str = f"{d_obj.day}"
             if is_today:
                 day_num_str += " 今"
@@ -691,7 +708,8 @@ class TaskCalendarWindow(Gtk.Window):
                 ctx.set_source_rgba(0.96, 0.62, 0.55, 0.95)
             else:
                 ctx.set_source_rgba(0.92, 0.94, 0.96, 0.95)
-            ctx.move_to(cx + 5.0, cy + 14.0)
+            day_baseline_y = cy + day_num_fs + 3.0
+            ctx.move_to(cx + 5.0, day_baseline_y)
             ctx.show_text(day_num_str)
 
             # Top-right badges: Pending count pill & Completed count checkmark
@@ -707,10 +725,10 @@ class TaskCalendarWindow(Gtk.Window):
                     p_rgb = (0.22, 0.74, 0.97)
 
                 p_txt = str(len(day_pending))
-                ctx.set_font_size(9.5)
+                ctx.set_font_size(pill_fs)
                 p_ext = ctx.text_extents(p_txt)
-                pill_w = max(14.0, p_ext.width + 7.0)
-                pill_h = 13.5
+                pill_w = max(14.0 * scale, p_ext.width + 7.0)
+                pill_h = max(13.0, pill_fs + 4.5)
                 px = badge_right_x - pill_w
                 py = cy + 3.0
                 draw_rounded_rect(ctx, px, py, pill_w, pill_h, 3.5)
@@ -718,27 +736,31 @@ class TaskCalendarWindow(Gtk.Window):
                 ctx.fill()
 
                 ctx.set_source_rgba(0.08, 0.09, 0.11, 1.0)
-                ctx.move_to(px + (pill_w - p_ext.width) / 2.0 - p_ext.x_bearing, py + 10.2)
+                ctx.move_to(
+                    px + (pill_w - p_ext.width) / 2.0 - p_ext.x_bearing,
+                    py + (pill_h + p_ext.height) / 2.0,
+                )
                 ctx.show_text(p_txt)
                 badge_right_x = px - 3.0
 
             if day_comp:
                 c_txt = f"✓{len(day_comp)}"
-                ctx.set_font_size(9.0)
+                ctx.set_font_size(comp_fs)
                 c_ext = ctx.text_extents(c_txt)
                 ctx.set_source_rgba(0.25, 0.85, 0.58, 0.92)
-                ctx.move_to(badge_right_x - c_ext.width, cy + 13.0)
+                ctx.move_to(badge_right_x - c_ext.width, day_baseline_y - 1.0)
                 ctx.show_text(c_txt)
 
             # Mini Task Title Previews inside cell (up to 2 lines)
-            line_y = cy + 28.0
-            max_chars = max(5, int((cw - 8.0) / 8.2))
+            line_y = day_baseline_y + line_step + 1.5
+            char_px = max(6.5, task_fs * 0.86)
+            max_chars = max(4, int((cw - 8.0) / char_px))
             ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
-            ctx.set_font_size(9.5)
+            ctx.set_font_size(task_fs)
 
             shown_lines = 0
             for t in day_pending[:2]:
-                if line_y + 4.0 > cy + ch:
+                if line_y + 3.0 > cy + ch:
                     break
                 desc = t.get("description", "").strip()
                 if len(desc) > max_chars:
@@ -751,11 +773,11 @@ class TaskCalendarWindow(Gtk.Window):
                     ctx.set_source_rgba(0.65, 0.88, 0.98, 1.0)
                 ctx.move_to(cx + 4.5, line_y)
                 ctx.show_text(f"• {desc}")
-                line_y += 13.0
+                line_y += line_step
                 shown_lines += 1
 
             # If space remains, show up to 1 completed task preview in muted green
-            if shown_lines < 2 and day_comp and (line_y + 4.0 <= cy + ch):
+            if shown_lines < 2 and day_comp and (line_y + 3.0 <= cy + ch):
                 ct = day_comp[0]
                 cdesc = ct.get("description", "").strip()
                 if len(cdesc) > max_chars:
@@ -769,7 +791,9 @@ class TaskCalendarWindow(Gtk.Window):
     def _on_calendar_button_press(self, widget, event):
         alloc = widget.get_allocation()
         w, h = float(alloc.width), float(alloc.height)
-        header_h = 28.0
+        base_fs = float(max(8, min(22, int(self.parent_widget.config.get("calendar_font_size", 11)))))
+        scale = base_fs / 11.0
+        header_h = max(26.0, 28.0 * scale)
         grid_y = header_h + 2.0
         grid_h = max(120.0, h - grid_y - 4.0)
         col_w = (w - 8.0) / 7.0
@@ -817,6 +841,10 @@ class TaskCalendarWindow(Gtk.Window):
         vbox.set_margin_start(8)
         vbox.set_margin_end(8)
 
+        base_fs = max(8, min(22, int(self.parent_widget.config.get("calendar_font_size", 11))))
+        main_pt = int(round(base_fs * 1024))
+        sub_pt = int(round(max(7.5, base_fs - 1.5) * 1024))
+
         # Row 1: Task ID / Status / Priority / Description / Project & Tags
         top_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         lbl = Gtk.Label(xalign=0.0)
@@ -834,14 +862,14 @@ class TaskCalendarWindow(Gtk.Window):
             meta_parts.append(f"<span foreground='#60a5fa'>{html.escape(proj)}</span>")
         for tg in tags:
             meta_parts.append(f"<span foreground='#a78bfa'>+{html.escape(tg)}</span>")
-        meta_m = f" <small>({ ' · '.join(meta_parts) })</small>" if meta_parts else ""
+        meta_m = f" <span size='{sub_pt}'>({ ' · '.join(meta_parts) })</span>" if meta_parts else ""
 
         if is_completed:
             end_d = t.get("_end_date", "")
             end_t = t.get("_end_time", "")
             lbl.set_markup(
-                f"<span foreground='#34d399'><b>✓ [已完成]</b></span> <s>{desc}</s>{meta_m} "
-                f"<small><span foreground='#888888'>({end_d} {end_t})</span></small>"
+                f"<span size='{main_pt}'><span foreground='#34d399'><b>✓ [已完成]</b></span> <s>{desc}</s></span>{meta_m} "
+                f"<span size='{sub_pt}'><span foreground='#888888'>({end_d} {end_t})</span></span>"
             )
         else:
             tid = t.get("id", "?")
@@ -859,8 +887,10 @@ class TaskCalendarWindow(Gtk.Window):
             due_rel = t.get("_due_rel", "")
             due_lvl = t.get("_due_level", "normal")
             due_col = "#f87171" if due_lvl == "crit" else ("#fbbf24" if due_lvl == "warn" else "#34d399")
-            due_m = f"  <small><span foreground='{due_col}'>({html.escape(due_rel)})</span></small>" if due_rel else ""
-            lbl.set_markup(f"<tt><b>#{tid}</b></tt> {act_m}{pri_m}<b>{desc}</b>{meta_m}{due_m}")
+            due_m = f"  <span size='{sub_pt}'><span foreground='{due_col}'>({html.escape(due_rel)})</span></span>" if due_rel else ""
+            lbl.set_markup(
+                f"<span size='{main_pt}'><tt><b>#{tid}</b></tt> {act_m}{pri_m}<b>{desc}</b></span>{meta_m}{due_m}"
+            )
 
         top_hbox.pack_start(lbl, True, True, 0)
         vbox.pack_start(top_hbox, False, False, 0)
@@ -945,18 +975,22 @@ class TaskCalendarWindow(Gtk.Window):
         self._clear_box(self.sel_tasks_box)
         self._clear_box(self.unsched_tasks_box)
 
+        base_fs = max(8, min(22, int(self.parent_widget.config.get("calendar_font_size", 11))))
+        hdr_pt = int(round((base_fs + 1.0) * 1024))
+        sub_pt = int(round(max(8.0, base_fs - 0.5) * 1024))
+
         sel_str = self.selected_date.strftime("%Y-%m-%d")
         wd_str = self.WEEKDAYS_ZH[self.selected_date.weekday()]
         day_pending = self.due_map.get(sel_str, [])
         day_comp = self.completed_map.get(sel_str, [])
 
         self.sel_date_lbl.set_markup(
-            f"<b>📌 {sel_str} ({wd_str})</b>   "
-            f"<span foreground='#38bdf8'>到期: {len(day_pending)} 筆</span>"
+            f"<span size='{hdr_pt}'><b>📌 {sel_str} ({wd_str})</b></span>   "
+            f"<span size='{sub_pt}'><span foreground='#38bdf8'>到期: {len(day_pending)} 筆</span>"
             + (
-                f"  |  <span foreground='#34d399'>當日完成: {len(day_comp)} 筆</span>"
+                f"  |  <span foreground='#34d399'>當日完成: {len(day_comp)} 筆</span></span>"
                 if self.parent_widget.config.get("calendar_show_completed", True)
-                else ""
+                else "</span>"
             )
         )
 
@@ -965,8 +999,8 @@ class TaskCalendarWindow(Gtk.Window):
             empty_lbl.set_margin_top(12)
             empty_lbl.set_margin_start(8)
             empty_lbl.set_markup(
-                f"<i>此日期 ({sel_str}) 尚無排程到期或已完成的任務。\n"
-                f"可點選上方「➕ 在選取日新增任務」或雙擊左側月曆格新增。</i>"
+                f"<span size='{sub_pt}'><i>此日期 ({sel_str}) 尚無排程到期或已完成的任務。\n"
+                f"可點選上方「➕ 在選取日新增任務」或雙擊左側月曆格新增。</i></span>"
             )
             self.sel_tasks_box.pack_start(empty_lbl, False, False, 0)
         else:
@@ -991,14 +1025,14 @@ class TaskCalendarWindow(Gtk.Window):
             if t.get("_due_date") and t.get("_due_date") != sel_str
         ]
         self.unsched_hdr_lbl.set_markup(
-            f"<b>📋 未設到期日待辦 ({len(self.unscheduled)} 筆) 與其他日期排程 ({len(other_scheduled)} 筆)</b>"
+            f"<span size='{hdr_pt}'><b>📋 未設到期日待辦 ({len(self.unscheduled)} 筆) 與其他日期排程 ({len(other_scheduled)} 筆)</b></span>"
         )
 
         if not self.unscheduled and not other_scheduled:
             u_empty = Gtk.Label(xalign=0.0)
             u_empty.set_margin_top(8)
             u_empty.set_margin_start(8)
-            u_empty.set_markup("<i>目前沒有未排程或其他日期的待辦任務。</i>")
+            u_empty.set_markup(f"<span size='{sub_pt}'><i>目前沒有未排程或其他日期的待辦任務。</i></span>")
             self.unsched_tasks_box.pack_start(u_empty, False, False, 0)
         else:
             for t in self.unscheduled:
@@ -2076,6 +2110,24 @@ class TaskwarriorWidget(Gtk.EventBox):
         chk_cal_comp.set_active(self.config.get("calendar_show_completed", True))
         outer.pack_start(chk_cal_comp, False, False, 0)
 
+        cal_fs_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        cal_fs_box.set_margin_start(14)
+        lbl_cal_fs = Gtk.Label(
+            label="月曆看板字型大小 (pt/px，同步調整月曆格子與右側任務清單)：", xalign=0.0
+        )
+        adj_cal_fs = Gtk.Adjustment(
+            value=float(self.config.get("calendar_font_size", 11)),
+            lower=8.0,
+            upper=22.0,
+            step_increment=1.0,
+            page_increment=2.0,
+            page_size=0.0,
+        )
+        spin_cal_fs = Gtk.SpinButton(adjustment=adj_cal_fs, climb_rate=1.0, digits=0)
+        cal_fs_box.pack_start(lbl_cal_fs, True, True, 0)
+        cal_fs_box.pack_start(spin_cal_fs, False, False, 0)
+        outer.pack_start(cal_fs_box, False, False, 0)
+
         outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
         # Section 2: Panel Display Mode
@@ -2218,6 +2270,7 @@ class TaskwarriorWidget(Gtk.EventBox):
         def apply_changes(*_):
             self.config["left_click_action"] = "calendar" if rb_lc_cal.get_active() else "menu"
             self.config["calendar_show_completed"] = chk_cal_comp.get_active()
+            self.config["calendar_font_size"] = int(spin_cal_fs.get_value_as_int())
             self.config["display_mode"] = "badge" if rb_badge.get_active() else "badge_text"
             self.config["max_title_chars"] = int(spin_maxc.get_value_as_int())
             self.config["due_soon_days"] = int(spin_duesoon.get_value_as_int())
@@ -2272,7 +2325,7 @@ class TaskwarriorWidget(Gtk.EventBox):
             chk_shadow,
         ):
             w_ctrl.connect("toggled", apply_changes)
-        for sp_ctrl in (spin_maxc, spin_duesoon):
+        for sp_ctrl in (spin_cal_fs, spin_maxc, spin_duesoon):
             sp_ctrl.connect("value-changed", apply_changes)
 
         # Bottom buttons
