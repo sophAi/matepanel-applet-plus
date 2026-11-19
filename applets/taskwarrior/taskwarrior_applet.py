@@ -11,22 +11,22 @@ Features:
   2. 'badge_text' : Badge + top urgency task summary [TASK / count] [H] 加強mate-panel功能 (4d)
 - Customizable 3-stage panel font colors (Normal / Warning: High Priority or Due Soon / Critical: Overdue or Due Today),
   badge background style ('dark', 'light', 'transparent'), and text contrast outline shadow.
-- Left-click interactive Taskwarrior control center menu:
-  - Pending tasks sorted by Urgency descending
-  - Per-task submenu:
-    - ✅ Mark Done (`task <uuid> done`)
-    - ▶️ Start / ⏹ Stop active timer (`task <uuid> start/stop`)
-    - ⚡ Quick Priority switch (`H` / `M` / `L` / `None`)
-    - ✏️ Edit Task dialog (Description, Project dropdown with historical projects, Priority, Tags, Due date)
-    - 📝 Add Annotation (`task <uuid> annotate ...`)
-    - 🗑 Delete Task (`task <uuid> delete`)
-  - ➕ Add New Task dialog (Form mode with historical Project/Tag dropdowns + Calendar picker, or Raw CLI syntax)
-  - 🔍 Filter by Project / Tag
-  - 📜 Recent Completed Tasks submenu with one-click Restore to Pending (`status:pending`) & `task undo`
-- Right-click MATE Panel native context menu + full Preferences window.
+- Dual-column Interactive Monthly Calendar Dashboard (`TaskCalendarWindow`):
+  - Left column: Custom 7x6 color-coded monthly calendar grid showing:
+    - Pending tasks due on each date (color dots/count badges by priority & urgency + mini task title preview)
+    - Historical completed tasks (`status:completed` mapped by `end` completion date, toggleable via checkbox)
+    - Single-click a date to inspect its due/completed tasks on the right panel
+    - Double-click any date cell to immediately add a new task with `Due` pre-filled to that date
+  - Right column:
+    - Selected Date tasks list (Due pending tasks + Completed tasks on that day) with one-click Done, Start/Stop timer,
+      Reschedule (`+1d`, `+3d`, or assign to selected date), Edit, Annotate, Delete, or Restore to Pending
+    - Unscheduled / All Pending tasks list (tasks without `due` date or all pending tasks, with one-click
+      "📅 指派至選取日期" button)
+- Switchable Left-Click default action ('calendar' vs 'menu') in Preferences, while both are always accessible.
 """
 
-from datetime import datetime, timezone
+import calendar
+from datetime import date, datetime, timedelta, timezone
 import html
 import json
 import math
@@ -37,7 +37,7 @@ import sys
 import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, Gio, GLib, GObject, Gtk
+from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango
 import cairo
 
 try:
@@ -54,6 +54,8 @@ TASK_DATA_DIR = os.path.expanduser("~/.task")
 
 DEFAULT_CONFIG = {
     "display_mode": "badge",             # "badge" (僅方塊圖示) or "badge_text" (方塊 + 首要任務標題)
+    "left_click_action": "calendar",     # "calendar" (開啟雙欄月曆任務看板) or "menu" (開啟傳統下拉快速選單)
+    "calendar_show_completed": True,     # 在月曆格子與右側清單中顯示歷史已完成任務 (依 end 完成日期對應)
     "max_title_chars": 22,               # badge_text 模式下顯示的最大字元數
     "show_due_in_panel": True,           # badge_text 模式下是否在標題後附加上到期倒數
     "filter_project": "",                # 空字串代表顯示全部專案
@@ -65,7 +67,7 @@ DEFAULT_CONFIG = {
     "custom_crit_font_color": "#f87171", # 自訂「已逾期 / 今日到期」字形顏色
     "badge_bg_style": "dark",            # "dark", "light", "transparent"
     "text_shadow": False,                # 文字高對比描邊陰影
-    "completed_limit": 10,               # 最近已完成任務顯示筆數
+    "completed_limit": 20,               # 下拉選單最近已完成任務顯示筆數
 }
 
 
@@ -80,7 +82,7 @@ def parse_tw_timestamp(ts_str):
         return None
 
 
-def format_due_Status(due_str, due_soon_days=3):
+def format_due_status(due_str, due_soon_days=3):
     """
     Analyze a Taskwarrior `due` timestamp string.
     Returns (due_date_str, relative_str, severity_level)
@@ -95,13 +97,9 @@ def format_due_Status(due_str, due_soon_days=3):
     delta_sec = (dt_local - now).total_seconds()
     delta_days = delta_sec / 86400.0
 
-    # Check if overdue or due today
     if delta_sec < 0:
         abs_days = abs(int(round(delta_days)))
-        if abs_days == 0:
-            rel = "已逾期 (<1天)"
-        else:
-            rel = f"已逾期 {abs_days} 天"
+        rel = "已逾期 (<1天)" if abs_days == 0 else f"已逾期 {abs_days} 天"
         return (date_str, rel, "crit")
 
     if dt_local.date() == now.date():
@@ -109,11 +107,7 @@ def format_due_Status(due_str, due_soon_days=3):
         return (date_str, f"今日到期 ({hours_left}h)", "crit")
 
     days_left = (dt_local.date() - now.date()).days
-    if days_left == 1:
-        rel = "明天到期"
-    else:
-        rel = f"剩 {days_left} 天"
-
+    rel = "明天到期" if days_left == 1 else f"剩 {days_left} 天"
     lvl = "warn" if days_left <= due_soon_days else "normal"
     return (date_str, rel, lvl)
 
@@ -129,7 +123,7 @@ class TaskwarriorBackend:
             cls.TASK_BIN,
             "rc.confirmation=off",
             "rc.verbose=nothing",
-            "rc.Hooks=on",
+            "rc.hooks=on",
         ] + list(args)
         try:
             proc = subprocess.run(
@@ -145,27 +139,40 @@ class TaskwarriorBackend:
             return 1, "", str(e)
 
     @classmethod
-    def fetch_all(cls, due_soon_days=3, completed_limit=10):
+    def fetch_all(cls, due_soon_days=3, completed_limit=20):
         """
         Export all tasks from Taskwarrior and organize into:
         {
             "pending": [ ... sorted by urgency desc ... ],
             "completed": [ ... most recent completed_limit tasks ... ],
+            "all_completed": [ ... all completed tasks with _end_date for calendar mapping ... ],
             "projects": [ ... all known project names ... ],
             "tags": [ ... all known user tags ... ],
         }
         """
         rc, out, _ = cls._run_task(["export"])
         if rc != 0 or not out:
-            return {"pending": [], "completed": [], "projects": [], "tags": []}
+            return {
+                "pending": [],
+                "completed": [],
+                "all_completed": [],
+                "projects": [],
+                "tags": [],
+            }
 
         try:
             raw_tasks = json.loads(out)
         except Exception:
-            return {"pending": [], "completed": [], "projects": [], "tags": []}
+            return {
+                "pending": [],
+                "completed": [],
+                "all_completed": [],
+                "projects": [],
+                "tags": [],
+            }
 
         pending = []
-        completed = []
+        all_completed = []
         projects_set = set()
         tags_set = set()
 
@@ -178,25 +185,28 @@ class TaskwarriorBackend:
 
             status = t.get("status", "")
             if status == "pending":
-                due_date, due_rel, due_lvl = format_due_Status(t.get("due"), due_soon_days)
+                due_date, due_rel, due_lvl = format_due_status(t.get("due"), due_soon_days)
                 t["_due_date"] = due_date
                 t["_due_rel"] = due_rel
                 t["_due_level"] = due_lvl
                 t["_is_active"] = bool(t.get("start"))
                 pending.append(t)
             elif status == "completed":
-                completed.append(t)
+                end_dt = parse_tw_timestamp(t.get("end"))
+                t["_end_date"] = end_dt.strftime("%Y-%m-%d") if end_dt else ""
+                t["_end_time"] = end_dt.strftime("%H:%M") if end_dt else ""
+                due_dt = parse_tw_timestamp(t.get("due"))
+                t["_due_date"] = due_dt.strftime("%Y-%m-%d") if due_dt else ""
+                all_completed.append(t)
 
-        # Sort pending by urgency descending, then id ascending
         pending.sort(key=lambda x: (-float(x.get("urgency", 0.0)), int(x.get("id", 999999))))
-
-        # Sort completed by end timestamp descending
-        completed.sort(key=lambda x: x.get("end", ""), reverse=True)
-        completed = completed[: max(1, int(completed_limit))]
+        all_completed.sort(key=lambda x: x.get("end", ""), reverse=True)
+        completed = all_completed[: max(1, int(completed_limit))]
 
         return {
             "pending": pending,
             "completed": completed,
+            "all_completed": all_completed,
             "projects": sorted(projects_set),
             "tags": sorted(tags_set),
         }
@@ -212,8 +222,11 @@ class TaskwarriorBackend:
 
     @classmethod
     def set_priority(cls, uuid_str, pri_code):
-        # pri_code: 'H', 'M', 'L', or ''
         return cls._run_task([f"uuid:{uuid_str}", "modify", f"priority:{pri_code}"])
+
+    @classmethod
+    def set_due_date(cls, uuid_str, due_str):
+        return cls._run_task([f"uuid:{uuid_str}", "modify", f"due:{due_str}"])
 
     @classmethod
     def annotate_task(cls, uuid_str, text):
@@ -248,14 +261,6 @@ class TaskwarriorBackend:
         if due.strip():
             args.append(f"due:{due.strip()}")
         return cls._run_task(args)
-
-    @classmethod
-    def add_task_raw(cls, raw_str):
-        import shlex
-        tokens = shlex.split(raw_str)
-        if not tokens:
-            return 1, "", "Empty command"
-        return cls._run_task(["add"] + tokens)
 
     @classmethod
     def modify_task_structured(
@@ -354,6 +359,667 @@ def draw_rounded_rect(ctx, x, y, w, h, r):
     ctx.close_path()
 
 
+class TaskCalendarWindow(Gtk.Window):
+    """
+    Dual-column Interactive Monthly Calendar Dashboard for Taskwarrior:
+    - Left Column : Custom Cairo-rendered 7x6 Monthly Calendar Grid with task badges, mini task titles,
+                    and historical completed task markers.
+    - Right Column:
+      1. Tasks on the Selected Date (Due pending tasks + Completed tasks on that date) with direct action buttons.
+      2. Unscheduled Pending Tasks (no due date) & All Pending Tasks with one-click "Assign to selected date".
+    """
+
+    WEEKDAYS_ZH = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
+
+    def __init__(self, parent_widget):
+        super().__init__(title="📅 Taskwarrior 月曆任務看板")
+        self.parent_widget = parent_widget
+        self.set_default_size(940, 580)
+        self.set_position(Gtk.WindowPosition.CENTER)
+
+        today = date.today()
+        self.view_year = today.year
+        self.view_month = today.month
+        self.selected_date = today
+        self.cell_dates = []  # 42 date objects for the 6x7 grid
+
+        self._build_ui()
+        self.refresh_view()
+
+    def _build_ui(self):
+        root_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        root_vbox.set_margin_top(12)
+        root_vbox.set_margin_bottom(12)
+        root_vbox.set_margin_start(14)
+        root_vbox.set_margin_end(14)
+
+        # Top Toolbar
+        toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+
+        btn_prev_m = Gtk.Button(label="◀ 上個月")
+        btn_prev_m.connect("clicked", lambda *_: self._shift_month(-1))
+        btn_today = Gtk.Button(label="📍 回到今天")
+        btn_today.connect("clicked", lambda *_: self._jump_to_today())
+        btn_next_m = Gtk.Button(label="下個月 ▶")
+        btn_next_m.connect("clicked", lambda *_: self._shift_month(1))
+
+        self.month_title_lbl = Gtk.Label()
+        self.month_title_lbl.set_margin_start(10)
+        self.month_title_lbl.set_margin_end(10)
+
+        toolbar.pack_start(btn_prev_m, False, False, 0)
+        toolbar.pack_start(btn_today, False, False, 0)
+        toolbar.pack_start(btn_next_m, False, False, 0)
+        toolbar.pack_start(self.month_title_lbl, False, False, 0)
+
+        # Right side of toolbar: Show Completed toggle, Add Task, Undo, Preferences
+        btn_prefs = Gtk.Button(label="⚙️ 偏好設定")
+        btn_prefs.connect("clicked", lambda *_: self.parent_widget.show_preferences_dialog())
+        toolbar.pack_end(btn_prefs, False, False, 0)
+
+        btn_undo = Gtk.Button(label="↩️ 復原 (Undo)")
+        btn_undo.set_tooltip_text("執行 task undo 復原上一步變更")
+        btn_undo.connect(
+            "clicked",
+            lambda *_: self.parent_widget._run_and_refresh(TaskwarriorBackend.undo_last),
+        )
+        toolbar.pack_end(btn_undo, False, False, 0)
+
+        btn_add_sel = Gtk.Button(label="➕ 在選取日新增任務")
+        btn_add_sel.connect(
+            "clicked",
+            lambda *_: self.parent_widget.show_add_or_edit_task_dialog(
+                task=None, default_due=self.selected_date.strftime("%Y-%m-%d")
+            ),
+        )
+        toolbar.pack_end(btn_add_sel, False, False, 0)
+
+        self.chk_show_comp = Gtk.CheckButton(label="在月曆顯示已完成紀錄 (✓)")
+        self.chk_show_comp.set_active(
+            self.parent_widget.config.get("calendar_show_completed", True)
+        )
+        self.chk_show_comp.connect("toggled", self._on_toggle_show_completed)
+        toolbar.pack_end(self.chk_show_comp, False, False, 6)
+
+        root_vbox.pack_start(toolbar, False, False, 0)
+        root_vbox.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+
+        # Main Dual-Column Paned Area
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        paned.set_position(520)
+
+        # Left Column: Custom Cairo 7x6 Calendar Canvas + Legend
+        left_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        left_vbox.set_margin_end(8)
+
+        self.cal_canvas = Gtk.DrawingArea()
+        self.cal_canvas.set_size_request(500, 440)
+        self.cal_canvas.set_hexpand(True)
+        self.cal_canvas.set_vexpand(True)
+        self.cal_canvas.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.POINTER_MOTION_MASK
+        )
+        self.cal_canvas.connect("draw", self._on_draw_calendar)
+        self.cal_canvas.connect("button-press-event", self._on_calendar_button_press)
+        left_vbox.pack_start(self.cal_canvas, True, True, 0)
+
+        legend_lbl = Gtk.Label(xalign=0.0)
+        legend_lbl.set_markup(
+            "<small>💡 <b>月曆圖例</b>： "
+            "<span foreground='#f87171'>● 逾期/今日/高優先(H)</span>   "
+            "<span foreground='#fbbf24'>● 中優先(M)/近期到期</span>   "
+            "<span foreground='#38bdf8'>● 一般待辦</span>   "
+            "<span foreground='#34d399'>✓ 已完成任務</span>   "
+            "<i>(單擊選取日期，雙擊日期格直接新增任務)</i></small>"
+        )
+        left_vbox.pack_start(legend_lbl, False, False, 0)
+        paned.pack1(left_vbox, resize=True, shrink=False)
+
+        # Right Column: Selected Day Tasks + Unscheduled/All Pending Tasks
+        right_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        right_vbox.set_margin_start(8)
+
+        # Top right: Selected date header + quick add
+        sel_hdr_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.sel_date_lbl = Gtk.Label(xalign=0.0)
+        sel_hdr_box.pack_start(self.sel_date_lbl, True, True, 0)
+        right_vbox.pack_start(sel_hdr_box, False, False, 0)
+
+        # Scrolled list for Selected Date tasks
+        sel_scroll = Gtk.ScrolledWindow()
+        sel_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sel_scroll.set_min_content_height(210)
+        sel_scroll.set_vexpand(True)
+        self.sel_tasks_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        sel_scroll.add(self.sel_tasks_box)
+        right_vbox.pack_start(sel_scroll, True, True, 0)
+
+        right_vbox.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+
+        # Bottom right: Unscheduled & Other Pending Tasks section
+        self.unsched_hdr_lbl = Gtk.Label(xalign=0.0)
+        right_vbox.pack_start(self.unsched_hdr_lbl, False, False, 0)
+
+        unsched_scroll = Gtk.ScrolledWindow()
+        unsched_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        unsched_scroll.set_min_content_height(175)
+        unsched_scroll.set_vexpand(True)
+        self.unsched_tasks_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        unsched_scroll.add(self.unsched_tasks_box)
+        right_vbox.pack_start(unsched_scroll, True, True, 0)
+
+        paned.pack2(right_vbox, resize=True, shrink=False)
+        root_vbox.pack_start(paned, True, True, 0)
+
+        self.add(root_vbox)
+        self.show_all()
+
+    def _on_toggle_show_completed(self, chk):
+        self.parent_widget.config["calendar_show_completed"] = chk.get_active()
+        self.parent_widget._save_config()
+        self.refresh_view()
+
+    def _shift_month(self, delta_months):
+        m = self.view_month + delta_months
+        y = self.view_year
+        while m < 1:
+            m += 12
+            y -= 1
+        while m > 12:
+            m -= 12
+            y += 1
+        self.view_year = y
+        self.view_month = m
+        max_d = calendar.monthrange(y, m)[1]
+        sel_d = min(self.selected_date.day, max_d)
+        self.selected_date = date(y, m, sel_d)
+        self.refresh_view()
+
+    def _jump_to_today(self):
+        today = date.today()
+        self.view_year = today.year
+        self.view_month = today.month
+        self.selected_date = today
+        self.refresh_view()
+
+    def _compute_month_cells(self):
+        cal = calendar.Calendar(firstweekday=0)  # Monday first
+        days = list(cal.itermonthdates(self.view_year, self.view_month))
+        while len(days) < 42:
+            last = days[-1]
+            days.append(last + timedelta(days=1))
+        self.cell_dates = days[:42]
+
+    def _group_tasks_by_date(self):
+        """
+        Return (due_map, completed_map, unscheduled_pending)
+        due_map: {'YYYY-MM-DD': [pending_task, ...]}
+        completed_map: {'YYYY-MM-DD': [completed_task, ...]}
+        """
+        due_map = {}
+        completed_map = {}
+        unscheduled = []
+
+        for t in self.parent_widget.filtered_pending:
+            d_str = t.get("_due_date", "")
+            if d_str:
+                due_map.setdefault(d_str, []).append(t)
+            else:
+                unscheduled.append(t)
+
+        if self.parent_widget.config.get("calendar_show_completed", True):
+            f_proj = self.parent_widget.config.get("filter_project", "").strip()
+            f_tag = self.parent_widget.config.get("filter_tag", "").strip()
+            for ct in self.parent_widget.task_data.get("all_completed", []):
+                if f_proj and ct.get("project", "") != f_proj:
+                    continue
+                if f_tag and f_tag not in ct.get("tags", []):
+                    continue
+                # Map completed task by its completion date (_end_date), or _due_date fallback
+                c_date = ct.get("_end_date") or ct.get("_due_date")
+                if c_date:
+                    completed_map.setdefault(c_date, []).append(ct)
+
+        return due_map, completed_map, unscheduled
+
+    def refresh_view(self):
+        self._compute_month_cells()
+        self.due_map, self.completed_map, self.unscheduled = self._group_tasks_by_date()
+
+        # Update month header label
+        ym_prefix = f"{self.view_year:04d}-{self.view_month:02d}"
+        m_pending_cnt = sum(
+            len(v) for k, v in self.due_map.items() if k.startswith(ym_prefix)
+        )
+        m_comp_cnt = sum(
+            len(v) for k, v in self.completed_map.items() if k.startswith(ym_prefix)
+        )
+        self.month_title_lbl.set_markup(
+            f"<span size='large'><b>{self.view_year} 年 {self.view_month:02d} 月</b></span>   "
+            f"<small><span foreground='#38bdf8'>本月排程待辦: {m_pending_cnt} 筆</span>"
+            + (f"  |  <span foreground='#34d399'>本月完成: {m_comp_cnt} 筆</span></small>" if self.parent_widget.config.get("calendar_show_completed", True) else "</small>")
+        )
+
+        self.cal_canvas.queue_draw()
+        self._populate_right_panels()
+
+    def _on_draw_calendar(self, widget, ctx):
+        alloc = widget.get_allocation()
+        w, h = float(alloc.width), float(alloc.height)
+
+        # Dark slate theme background for calendar grid
+        draw_rounded_rect(ctx, 0, 0, w, h, 6.0)
+        ctx.set_source_rgba(0.11, 0.13, 0.16, 0.98)
+        ctx.fill()
+
+        header_h = 28.0
+        grid_y = header_h + 2.0
+        grid_h = max(120.0, h - grid_y - 4.0)
+        col_w = (w - 8.0) / 7.0
+        row_h = grid_h / 6.0
+        start_x = 4.0
+
+        # Draw Weekday Headers
+        ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        ctx.set_font_size(11.5)
+        for col_idx, wd_name in enumerate(self.WEEKDAYS_ZH):
+            cx = start_x + col_idx * col_w
+            ext = ctx.text_extents(wd_name)
+            if col_idx >= 5:
+                ctx.set_source_rgba(0.96, 0.55, 0.45, 0.95)
+            else:
+                ctx.set_source_rgba(0.75, 0.80, 0.86, 0.95)
+            ctx.move_to(cx + (col_w - ext.width) / 2.0 - ext.x_bearing, 19.0)
+            ctx.show_text(wd_name)
+
+        today = date.today()
+        if not self.cell_dates:
+            self._compute_month_cells()
+
+        for idx, d_obj in enumerate(self.cell_dates):
+            r_idx = idx // 7
+            c_idx = idx % 7
+            cx = start_x + c_idx * col_w + 1.5
+            cy = grid_y + r_idx * row_h + 1.5
+            cw = col_w - 3.0
+            ch = row_h - 3.0
+
+            d_str = d_obj.strftime("%Y-%m-%d")
+            is_cur_month = d_obj.month == self.view_month
+            is_today = d_obj == today
+            is_selected = d_obj == self.selected_date
+
+            day_pending = self.due_map.get(d_str, [])
+            day_comp = self.completed_map.get(d_str, [])
+
+            # Cell background
+            draw_rounded_rect(ctx, cx, cy, cw, ch, 4.5)
+            if is_selected:
+                ctx.set_source_rgba(0.18, 0.32, 0.52, 0.95)
+            elif is_today:
+                ctx.set_source_rgba(0.14, 0.26, 0.24, 0.95)
+            elif day_pending:
+                ctx.set_source_rgba(0.18, 0.20, 0.25, 0.95)
+            elif is_cur_month:
+                ctx.set_source_rgba(0.14, 0.16, 0.20, 0.92)
+            else:
+                ctx.set_source_rgba(0.10, 0.11, 0.14, 0.65)
+            ctx.fill_preserve()
+
+            # Cell border
+            if is_selected:
+                ctx.set_source_rgba(0.38, 0.72, 0.98, 1.0)
+                ctx.set_line_width(1.8)
+            elif is_today:
+                ctx.set_source_rgba(0.20, 0.85, 0.60, 0.95)
+                ctx.set_line_width(1.5)
+            else:
+                ctx.set_source_rgba(0.24, 0.28, 0.34, 0.7)
+                ctx.set_line_width(0.8)
+            ctx.stroke()
+
+            # Day number in top-left
+            ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(11.5)
+            day_num_str = f"{d_obj.day}"
+            if is_today:
+                day_num_str += " 今"
+                ctx.set_source_rgba(0.25, 0.96, 0.68, 1.0)
+            elif not is_cur_month:
+                ctx.set_source_rgba(0.45, 0.48, 0.54, 0.75)
+            elif c_idx >= 5:
+                ctx.set_source_rgba(0.96, 0.62, 0.55, 0.95)
+            else:
+                ctx.set_source_rgba(0.92, 0.94, 0.96, 0.95)
+            ctx.move_to(cx + 5.0, cy + 14.0)
+            ctx.show_text(day_num_str)
+
+            # Top-right badges: Pending count pill & Completed count checkmark
+            badge_right_x = cx + cw - 4.0
+            if day_pending:
+                has_crit = any(t.get("_due_level") == "crit" or t.get("priority") == "H" for t in day_pending)
+                has_warn = any(t.get("_due_level") == "warn" or t.get("priority") == "M" for t in day_pending)
+                if has_crit:
+                    p_rgb = (0.96, 0.30, 0.34)
+                elif has_warn:
+                    p_rgb = (0.96, 0.65, 0.14)
+                else:
+                    p_rgb = (0.22, 0.74, 0.97)
+
+                p_txt = str(len(day_pending))
+                ctx.set_font_size(9.5)
+                p_ext = ctx.text_extents(p_txt)
+                pill_w = max(14.0, p_ext.width + 7.0)
+                pill_h = 13.5
+                px = badge_right_x - pill_w
+                py = cy + 3.0
+                draw_rounded_rect(ctx, px, py, pill_w, pill_h, 3.5)
+                ctx.set_source_rgba(p_rgb[0], p_rgb[1], p_rgb[2], 0.92)
+                ctx.fill()
+
+                ctx.set_source_rgba(0.08, 0.09, 0.11, 1.0)
+                ctx.move_to(px + (pill_w - p_ext.width) / 2.0 - p_ext.x_bearing, py + 10.2)
+                ctx.show_text(p_txt)
+                badge_right_x = px - 3.0
+
+            if day_comp:
+                c_txt = f"✓{len(day_comp)}"
+                ctx.set_font_size(9.0)
+                c_ext = ctx.text_extents(c_txt)
+                ctx.set_source_rgba(0.25, 0.85, 0.58, 0.92)
+                ctx.move_to(badge_right_x - c_ext.width, cy + 13.0)
+                ctx.show_text(c_txt)
+
+            # Mini Task Title Previews inside cell (up to 2 lines)
+            line_y = cy + 28.0
+            max_chars = max(5, int((cw - 8.0) / 8.2))
+            ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            ctx.set_font_size(9.5)
+
+            shown_lines = 0
+            for t in day_pending[:2]:
+                if line_y + 4.0 > cy + ch:
+                    break
+                desc = t.get("description", "").strip()
+                if len(desc) > max_chars:
+                    desc = desc[: max_chars - 1] + "…"
+                if t.get("priority") == "H" or t.get("_due_level") == "crit":
+                    ctx.set_source_rgba(0.98, 0.62, 0.62, 1.0)
+                elif t.get("priority") == "M" or t.get("_due_level") == "warn":
+                    ctx.set_source_rgba(0.98, 0.82, 0.45, 1.0)
+                else:
+                    ctx.set_source_rgba(0.65, 0.88, 0.98, 1.0)
+                ctx.move_to(cx + 4.5, line_y)
+                ctx.show_text(f"• {desc}")
+                line_y += 13.0
+                shown_lines += 1
+
+            # If space remains, show up to 1 completed task preview in muted green
+            if shown_lines < 2 and day_comp and (line_y + 4.0 <= cy + ch):
+                ct = day_comp[0]
+                cdesc = ct.get("description", "").strip()
+                if len(cdesc) > max_chars:
+                    cdesc = cdesc[: max_chars - 1] + "…"
+                ctx.set_source_rgba(0.45, 0.82, 0.64, 0.85)
+                ctx.move_to(cx + 4.5, line_y)
+                ctx.show_text(f"✓ {cdesc}")
+
+        return False
+
+    def _on_calendar_button_press(self, widget, event):
+        alloc = widget.get_allocation()
+        w, h = float(alloc.width), float(alloc.height)
+        header_h = 28.0
+        grid_y = header_h + 2.0
+        grid_h = max(120.0, h - grid_y - 4.0)
+        col_w = (w - 8.0) / 7.0
+        row_h = grid_h / 6.0
+        start_x = 4.0
+
+        if event.y < grid_y or event.x < start_x or event.x > w - 4.0:
+            return False
+
+        c_idx = int((event.x - start_x) // col_w)
+        r_idx = int((event.y - grid_y) // row_h)
+        if not (0 <= c_idx < 7 and 0 <= r_idx < 6):
+            return False
+
+        cell_idx = r_idx * 7 + c_idx
+        if cell_idx >= len(self.cell_dates):
+            return False
+
+        clicked_date = self.cell_dates[cell_idx]
+        self.selected_date = clicked_date
+        if clicked_date.month != self.view_month or clicked_date.year != self.view_year:
+            self.view_year = clicked_date.year
+            self.view_month = clicked_date.month
+
+        self.refresh_view()
+
+        # Double-click on a date cell opens the Add Task dialog with Due pre-filled to that date!
+        if event.type == Gdk.EventType._2BUTTON_PRESS and event.button == 1:
+            self.parent_widget.show_add_or_edit_task_dialog(
+                task=None, default_due=clicked_date.strftime("%Y-%m-%d")
+            )
+        return True
+
+    def _clear_box(self, box):
+        for child in box.get_children():
+            box.remove(child)
+
+    def _build_task_row_widget(self, t, is_completed=False, allow_assign_to_selected=False):
+        frame = Gtk.Frame()
+        frame.set_shadow_type(Gtk.ShadowType.ETCHED_IN)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        vbox.set_margin_top(6)
+        vbox.set_margin_bottom(6)
+        vbox.set_margin_start(8)
+        vbox.set_margin_end(8)
+
+        # Row 1: Task ID / Status / Priority / Description / Project & Tags
+        top_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        lbl = Gtk.Label(xalign=0.0)
+        lbl.set_line_wrap(True)
+        lbl.set_max_width_chars(38)
+
+        desc = html.escape(t.get("description", ""))
+        proj = t.get("project", "")
+        tags = t.get("tags", [])
+        pri = t.get("priority", "")
+        uuid_str = t.get("uuid", "")
+
+        meta_parts = []
+        if proj:
+            meta_parts.append(f"<span foreground='#60a5fa'>{html.escape(proj)}</span>")
+        for tg in tags:
+            meta_parts.append(f"<span foreground='#a78bfa'>+{html.escape(tg)}</span>")
+        meta_m = f" <small>({ ' · '.join(meta_parts) })</small>" if meta_parts else ""
+
+        if is_completed:
+            end_d = t.get("_end_date", "")
+            end_t = t.get("_end_time", "")
+            lbl.set_markup(
+                f"<span foreground='#34d399'><b>✓ [已完成]</b></span> <s>{desc}</s>{meta_m} "
+                f"<small><span foreground='#888888'>({end_d} {end_t})</span></small>"
+            )
+        else:
+            tid = t.get("id", "?")
+            is_act = t.get("_is_active", False)
+            pri_m = (
+                "<span foreground='#f87171'><b>[H]</b></span> "
+                if pri == "H"
+                else (
+                    "<span foreground='#fbbf24'><b>[M]</b></span> "
+                    if pri == "M"
+                    else ("<span foreground='#38bdf8'><b>[L]</b></span> " if pri == "L" else "")
+                )
+            )
+            act_m = "<span foreground='#34d399'><b>▶️[計時中]</b></span> " if is_act else ""
+            due_rel = t.get("_due_rel", "")
+            due_lvl = t.get("_due_level", "normal")
+            due_col = "#f87171" if due_lvl == "crit" else ("#fbbf24" if due_lvl == "warn" else "#34d399")
+            due_m = f"  <small><span foreground='{due_col}'>({html.escape(due_rel)})</span></small>" if due_rel else ""
+            lbl.set_markup(f"<tt><b>#{tid}</b></tt> {act_m}{pri_m}<b>{desc}</b>{meta_m}{due_m}")
+
+        top_hbox.pack_start(lbl, True, True, 0)
+        vbox.pack_start(top_hbox, False, False, 0)
+
+        # Row 2: Quick Action Buttons
+        act_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+
+        if is_completed:
+            btn_restore = Gtk.Button(label="↩️ 復原為待辦")
+            btn_restore.connect(
+                "clicked",
+                lambda _b, u=uuid_str: self.parent_widget._run_and_refresh(
+                    TaskwarriorBackend.restore_task, u
+                ),
+            )
+            act_hbox.pack_start(btn_restore, False, False, 0)
+        else:
+            btn_done = Gtk.Button(label="✅ 完成")
+            btn_done.connect(
+                "clicked",
+                lambda _b, u=uuid_str: self.parent_widget._run_and_refresh(
+                    TaskwarriorBackend.mark_done, u
+                ),
+            )
+            act_hbox.pack_start(btn_done, False, False, 0)
+
+            is_act = t.get("_is_active", False)
+            btn_timer = Gtk.Button(label="⏹ 停止" if is_act else "▶️ 計時")
+            btn_timer.connect(
+                "clicked",
+                lambda _b, u=uuid_str, act=is_act: self.parent_widget._run_and_refresh(
+                    TaskwarriorBackend.toggle_start_stop, u, act
+                ),
+            )
+            act_hbox.pack_start(btn_timer, False, False, 0)
+
+            if allow_assign_to_selected:
+                sel_str = self.selected_date.strftime("%Y-%m-%d")
+                btn_assign = Gtk.Button(label=f"📅 排入 {self.selected_date.strftime('%m/%d')}")
+                btn_assign.set_tooltip_text(f"將此任務到期日 (Due) 設定為 {sel_str}")
+                btn_assign.connect(
+                    "clicked",
+                    lambda _b, u=uuid_str, ds=sel_str: self.parent_widget._run_and_refresh(
+                        TaskwarriorBackend.set_due_date, u, ds
+                    ),
+                )
+                act_hbox.pack_start(btn_assign, False, False, 0)
+            else:
+                btn_plus1d = Gtk.Button(label="+1天")
+                btn_plus1d.set_tooltip_text("將任務到期日延後 1 天")
+                next_day_str = (self.selected_date + timedelta(days=1)).strftime("%Y-%m-%d")
+                btn_plus1d.connect(
+                    "clicked",
+                    lambda _b, u=uuid_str, ds=next_day_str: self.parent_widget._run_and_refresh(
+                        TaskwarriorBackend.set_due_date, u, ds
+                    ),
+                )
+                act_hbox.pack_start(btn_plus1d, False, False, 0)
+
+            btn_edit = Gtk.Button(label="✏️ 編輯")
+            btn_edit.connect(
+                "clicked",
+                lambda _b, task_obj=t: self.parent_widget.show_add_or_edit_task_dialog(
+                    task=task_obj
+                ),
+            )
+            act_hbox.pack_start(btn_edit, False, False, 0)
+
+            btn_del = Gtk.Button(label="🗑")
+            btn_del.set_tooltip_text("刪除任務")
+            btn_del.connect(
+                "clicked",
+                lambda _b, task_obj=t: self.parent_widget.confirm_delete_task(task_obj),
+            )
+            act_hbox.pack_end(btn_del, False, False, 0)
+
+        vbox.pack_start(act_hbox, False, False, 0)
+        frame.add(vbox)
+        return frame
+
+    def _populate_right_panels(self):
+        self._clear_box(self.sel_tasks_box)
+        self._clear_box(self.unsched_tasks_box)
+
+        sel_str = self.selected_date.strftime("%Y-%m-%d")
+        wd_str = self.WEEKDAYS_ZH[self.selected_date.weekday()]
+        day_pending = self.due_map.get(sel_str, [])
+        day_comp = self.completed_map.get(sel_str, [])
+
+        self.sel_date_lbl.set_markup(
+            f"<b>📌 {sel_str} ({wd_str})</b>   "
+            f"<span foreground='#38bdf8'>到期: {len(day_pending)} 筆</span>"
+            + (
+                f"  |  <span foreground='#34d399'>當日完成: {len(day_comp)} 筆</span>"
+                if self.parent_widget.config.get("calendar_show_completed", True)
+                else ""
+            )
+        )
+
+        if not day_pending and not day_comp:
+            empty_lbl = Gtk.Label(xalign=0.0)
+            empty_lbl.set_margin_top(12)
+            empty_lbl.set_margin_start(8)
+            empty_lbl.set_markup(
+                f"<i>此日期 ({sel_str}) 尚無排程到期或已完成的任務。\n"
+                f"可點選上方「➕ 在選取日新增任務」或雙擊左側月曆格新增。</i>"
+            )
+            self.sel_tasks_box.pack_start(empty_lbl, False, False, 0)
+        else:
+            for t in day_pending:
+                self.sel_tasks_box.pack_start(
+                    self._build_task_row_widget(t, is_completed=False, allow_assign_to_selected=False),
+                    False,
+                    False,
+                    0,
+                )
+            for ct in day_comp:
+                self.sel_tasks_box.pack_start(
+                    self._build_task_row_widget(ct, is_completed=True),
+                    False,
+                    False,
+                    0,
+                )
+
+        # Populate bottom-right: Unscheduled pending tasks + Other dates pending tasks
+        other_scheduled = [
+            t for t in self.parent_widget.filtered_pending
+            if t.get("_due_date") and t.get("_due_date") != sel_str
+        ]
+        self.unsched_hdr_lbl.set_markup(
+            f"<b>📋 未設到期日待辦 ({len(self.unscheduled)} 筆) 與其他日期排程 ({len(other_scheduled)} 筆)</b>"
+        )
+
+        if not self.unscheduled and not other_scheduled:
+            u_empty = Gtk.Label(xalign=0.0)
+            u_empty.set_margin_top(8)
+            u_empty.set_margin_start(8)
+            u_empty.set_markup("<i>目前沒有未排程或其他日期的待辦任務。</i>")
+            self.unsched_tasks_box.pack_start(u_empty, False, False, 0)
+        else:
+            for t in self.unscheduled:
+                self.unsched_tasks_box.pack_start(
+                    self._build_task_row_widget(t, is_completed=False, allow_assign_to_selected=True),
+                    False,
+                    False,
+                    0,
+                )
+            for t in other_scheduled:
+                self.unsched_tasks_box.pack_start(
+                    self._build_task_row_widget(t, is_completed=False, allow_assign_to_selected=True),
+                    False,
+                    False,
+                    0,
+                )
+
+        self.sel_tasks_box.show_all()
+        self.unsched_tasks_box.show_all()
+
+
 class TaskwarriorWidget(Gtk.EventBox):
     """
     Main widget placed inside either a MatePanelApplet or a standalone Gtk.Window.
@@ -380,12 +1046,19 @@ class TaskwarriorWidget(Gtk.EventBox):
         )
 
         self.config = self._load_config()
-        self.task_data = {"pending": [], "completed": [], "projects": [], "tags": []}
+        self.task_data = {
+            "pending": [],
+            "completed": [],
+            "all_completed": [],
+            "projects": [],
+            "tags": [],
+        }
         self.filtered_pending = []
         self.summary_level = "zero"
         self.has_active_task = False
         self.panel_size = 28
         self.prefs_win = None
+        self.calendar_win = None
         self.active_menu = None
         self.file_monitor = None
         self.debounce_id = None
@@ -428,7 +1101,6 @@ class TaskwarriorWidget(Gtk.EventBox):
             pass
 
     def _setup_file_monitor(self):
-        """Monitor ~/.task directory for any modifications from CLI or applet."""
         if not os.path.isdir(TASK_DATA_DIR):
             return
         try:
@@ -465,7 +1137,7 @@ class TaskwarriorWidget(Gtk.EventBox):
     def refresh_tasks(self):
         self.task_data = TaskwarriorBackend.fetch_all(
             due_soon_days=int(self.config.get("due_soon_days", 3)),
-            completed_limit=int(self.config.get("completed_limit", 10)),
+            completed_limit=int(self.config.get("completed_limit", 20)),
         )
 
         f_proj = self.config.get("filter_project", "").strip()
@@ -482,7 +1154,6 @@ class TaskwarriorWidget(Gtk.EventBox):
         self.filtered_pending = filtered
         self.has_active_task = any(t.get("_is_active") for t in filtered)
 
-        # Compute overall severity level
         if not filtered:
             self.summary_level = "zero"
         else:
@@ -500,6 +1171,9 @@ class TaskwarriorWidget(Gtk.EventBox):
 
         self._update_tooltip()
         self._update_canvas_size()
+
+        if self.calendar_win is not None:
+            self.calendar_win.refresh_view()
 
     def _get_top_task_summary_text(self):
         if not self.filtered_pending:
@@ -529,7 +1203,6 @@ class TaskwarriorWidget(Gtk.EventBox):
             total_w = badge_w + 4
         else:
             top_txt = self._get_top_task_summary_text()
-            # Estimate text pixel width accurately
             est_char_w = max(7.5, h * 0.34)
             text_w = int(len(top_txt) * est_char_w) + 16
             total_w = badge_w + 6 + min(380, max(90, text_w))
@@ -562,7 +1235,8 @@ class TaskwarriorWidget(Gtk.EventBox):
             lines.append(f"  #{tid} {pri}{desc}{proj}{due_r}{act}")
         if count > 5:
             lines.append(f"  <small>...及其他 {count - 5} 筆待辦任務</small>")
-        lines.append("<small>左鍵點選管理任務/新增任務 | 右鍵開啟偏好設定</small>")
+        lc_mode = "開啟月曆任務看板" if self.config.get("left_click_action", "calendar") == "calendar" else "開啟任務下拉選單"
+        lines.append(f"<small>左鍵點選: {lc_mode} | 右鍵選單可切換檢視與偏好設定</small>")
         self.set_tooltip_markup("\n".join(lines))
 
     def _resolve_panel_text_rgb(self, level, default_rgb):
@@ -602,7 +1276,6 @@ class TaskwarriorWidget(Gtk.EventBox):
         bg_rgb, border_rgb, text_rgb, _, sev_lvl = colors
         bg_style = self.config.get("badge_bg_style", "dark")
 
-        # Draw TASK badge
         x = 1.0
         y = pad_y
         draw_rounded_rect(ctx, x + 0.5, y + 0.5, bw - 1.0, bh - 1.0, 4.5)
@@ -620,7 +1293,6 @@ class TaskwarriorWidget(Gtk.EventBox):
         ctx.set_line_width(1.2)
         ctx.stroke()
 
-        # Active timer green dot indicator in top-right corner of badge
         if self.has_active_task:
             ctx.arc(x + bw - 4.5, y + 4.5, 2.3, 0, 2 * math.pi)
             ctx.set_source_rgba(0.20, 0.95, 0.50, 1.0)
@@ -651,7 +1323,6 @@ class TaskwarriorWidget(Gtk.EventBox):
         vy = y + bh - 3.0
         self._draw_styled_text(ctx, vx, vy, count_str, val_rgb)
 
-        # Draw top task summary text if mode == 'badge_text'
         if mode == "badge_text":
             top_txt = self._get_top_task_summary_text()
             font_sz = min(12.5, max(9.5, h * 0.42))
@@ -671,17 +1342,47 @@ class TaskwarriorWidget(Gtk.EventBox):
     def handle_applet_button_press(self, widget, event):
         if event.button == 1:
             GObject.signal_stop_emission_by_name(widget, "button-press-event")
-            self.popup_task_menu(event)
+            self._trigger_left_click_action(event)
             return True
         return False
 
     def _on_button_press(self, widget, event):
-        if event.button == 1 or (event.button == 3 and self.applet is None):
+        if event.button == 1:
             if self.applet is not None:
                 GObject.signal_stop_emission_by_name(widget, "button-press-event")
+            self._trigger_left_click_action(event)
+            return True
+        elif event.button == 3 and self.applet is None:
             self.popup_task_menu(event)
             return True
         return False
+
+    def _trigger_left_click_action(self, event=None):
+        if self.config.get("left_click_action", "calendar") == "calendar":
+            self.toggle_calendar_window()
+        else:
+            self.popup_task_menu(event)
+
+    def toggle_calendar_window(self, *_args):
+        if self.calendar_win is not None:
+            if self.calendar_win.is_visible():
+                self.calendar_win.destroy()
+                self.calendar_win = None
+                return
+            self.calendar_win.present()
+            return
+        self.show_calendar_window()
+
+    def show_calendar_window(self, *_args):
+        self.refresh_tasks()
+        if self.calendar_win is not None:
+            self.calendar_win.refresh_view()
+            self.calendar_win.present()
+            return
+        win = TaskCalendarWindow(self)
+        win.connect("destroy", lambda *_: setattr(self, "calendar_win", None))
+        self.calendar_win = win
+        win.show_all()
 
     def popup_task_menu(self, event=None):
         self.refresh_tasks()
@@ -717,7 +1418,7 @@ class TaskwarriorWidget(Gtk.EventBox):
             parts = [p for p in (f"專案:{f_proj}" if f_proj else "", f"+{f_tag}" if f_tag else "") if p]
             filter_badge = f"  <span foreground='#38bdf8'>[篩選: {' '.join(parts)}]</span>"
 
-        # 1. Header
+        # 1. Header & Open Calendar Dashboard item
         header_item = self._create_markup_menu_item(
             f"<b>📋 Taskwarrior 任務管理中心</b>{filter_badge}   "
             f"<span foreground='{accent_hex}'><b>待辦: {len(pending)} 筆</b></span>  "
@@ -725,9 +1426,16 @@ class TaskwarriorWidget(Gtk.EventBox):
             sensitive=False,
         )
         menu.append(header_item)
+
+        cal_open_item = self._create_markup_menu_item(
+            "<b>📅 開啟互動式月曆任務看板 (Calendar View)...</b>",
+            sensitive=True,
+            callback=lambda *_: self.show_calendar_window(),
+        )
+        menu.append(cal_open_item)
         menu.append(Gtk.SeparatorMenuItem())
 
-        # 2. Pending Tasks List with rich action submenus
+        # 2. Pending Tasks List
         if not pending:
             empty_msg = "🎉 目前沒有符合篩選條件的待辦任務！" if (f_proj or f_tag) else "🎉 目前沒有任何待辦任務！"
             menu.append(self._create_markup_menu_item(f"   <i>{empty_msg}</i>", sensitive=False))
@@ -759,10 +1467,8 @@ class TaskwarriorWidget(Gtk.EventBox):
         filter_sub.append(clear_f)
         filter_sub.append(Gtk.SeparatorMenuItem())
 
-        # Projects
         proj_hdr = self._create_markup_menu_item("<b>📁 依專案 (Project) 篩選</b>", sensitive=False)
         filter_sub.append(proj_hdr)
-        grp_p = None
         all_p_item = Gtk.RadioMenuItem.new_with_label_from_widget(None, "全部專案")
         grp_p = all_p_item
         if not f_proj:
@@ -782,7 +1488,6 @@ class TaskwarriorWidget(Gtk.EventBox):
 
         filter_sub.append(Gtk.SeparatorMenuItem())
 
-        # Tags
         tag_hdr = self._create_markup_menu_item("<b>🏷 依標籤 (Tag) 篩選</b>", sensitive=False)
         filter_sub.append(tag_hdr)
         all_t_item = Gtk.RadioMenuItem.new_with_label_from_widget(None, "全部標籤")
@@ -831,8 +1536,8 @@ class TaskwarriorWidget(Gtk.EventBox):
                 c_uuid = ct.get("uuid", "")
                 c_desc = html.escape(ct.get("description", ""))
                 c_proj = f" <span foreground='#38bdf8'>[{html.escape(ct['project'])}]</span>" if ct.get("project") else ""
-                end_dt = parse_tw_timestamp(ct.get("end"))
-                end_str = f" <small><span foreground='#888888'>({end_dt.strftime('%Y-%m-%d')})</span></small>" if end_dt else ""
+                end_d = ct.get("_end_date", "")
+                end_str = f" <small><span foreground='#888888'>({end_d})</span></small>" if end_d else ""
                 c_row = self._create_markup_menu_item(
                     f"✓ {c_desc}{c_proj}{end_str}",
                     sensitive=True,
@@ -850,6 +1555,24 @@ class TaskwarriorWidget(Gtk.EventBox):
         # 6. Submenu: Display Style & 3-Stage Font Colors
         style_item = Gtk.MenuItem(label="🎨 面板顯示樣式與三段字形顏色")
         style_sub = Gtk.Menu()
+
+        cur_lc = self.config.get("left_click_action", "calendar")
+        lc_cal = Gtk.RadioMenuItem.new_with_label_from_widget(
+            None, "左鍵預設動作：開啟互動式月曆任務看板"
+        )
+        lc_menu = Gtk.RadioMenuItem.new_with_label_from_widget(
+            lc_cal, "左鍵預設動作：開啟傳統下拉快速選單"
+        )
+        if cur_lc == "calendar":
+            lc_cal.set_active(True)
+        else:
+            lc_menu.set_active(True)
+        lc_cal.connect("toggled", self._on_left_click_action_toggled, "calendar")
+        lc_menu.connect("toggled", self._on_left_click_action_toggled, "menu")
+        style_sub.append(lc_cal)
+        style_sub.append(lc_menu)
+
+        style_sub.append(Gtk.SeparatorMenuItem())
 
         cur_mode = self.config.get("display_mode", "badge")
         m_badge = Gtk.RadioMenuItem.new_with_label_from_widget(
@@ -932,7 +1655,6 @@ class TaskwarriorWidget(Gtk.EventBox):
         due_rel = t.get("_due_rel", "")
         due_lvl = t.get("_due_level", "normal")
 
-        # Priority badge markup
         if pri == "H":
             pri_m = "<span foreground='#f87171'><b>[H]</b></span> "
         elif pri == "M":
@@ -963,10 +1685,8 @@ class TaskwarriorWidget(Gtk.EventBox):
             sensitive=True,
         )
 
-        # Build action submenu for this task
         sub = Gtk.Menu()
 
-        # Show annotations if any
         ann_list = t.get("annotations", [])
         if ann_list:
             for ann in ann_list:
@@ -981,7 +1701,6 @@ class TaskwarriorWidget(Gtk.EventBox):
                 )
             sub.append(Gtk.SeparatorMenuItem())
 
-        # Action 1: Mark Done
         done_item = self._create_markup_menu_item(
             f"✅ <b>標記為完成 (task {tid} done)</b>",
             sensitive=True,
@@ -989,7 +1708,6 @@ class TaskwarriorWidget(Gtk.EventBox):
         )
         sub.append(done_item)
 
-        # Action 2: Start / Stop timer
         start_lbl = (
             f"⏹ 停止計時 (task {tid} stop)"
             if is_active
@@ -1006,10 +1724,14 @@ class TaskwarriorWidget(Gtk.EventBox):
 
         sub.append(Gtk.SeparatorMenuItem())
 
-        # Action 3: Quick Priority Switcher
         pri_item = Gtk.MenuItem(label=f"⚡ 快速切換優先級 (目前: {pri or '無'})")
         pri_sub = Gtk.Menu()
-        for p_code, p_label in (("H", "🔴 高優先級 (High - H)"), ("M", "🟡 中優先級 (Medium - M)"), ("L", "🔵 低優先級 (Low - L)"), ("", "⚪ 無優先級 (None)")):
+        for p_code, p_label in (
+            ("H", "🔴 高優先級 (High - H)"),
+            ("M", "🟡 中優先級 (Medium - M)"),
+            ("L", "🔵 低優先級 (Low - L)"),
+            ("", "⚪ 無優先級 (None)"),
+        ):
             p_mi = Gtk.MenuItem(label=p_label)
             p_mi.connect(
                 "activate",
@@ -1021,21 +1743,18 @@ class TaskwarriorWidget(Gtk.EventBox):
         pri_item.set_submenu(pri_sub)
         sub.append(pri_item)
 
-        # Action 4: Edit Task Dialog
         edit_item = Gtk.MenuItem(label="✏️ 編輯任務 (描述 / 專案 / 標籤 / 到期日)...")
         edit_item.connect(
             "activate", lambda _w, task_obj=t: self.show_add_or_edit_task_dialog(task=task_obj)
         )
         sub.append(edit_item)
 
-        # Action 5: Add Annotation Dialog
         ann_item = Gtk.MenuItem(label="📝 新增任務註解 (Annotate)...")
         ann_item.connect("activate", lambda _w, task_obj=t: self.show_annotate_dialog(task_obj))
         sub.append(ann_item)
 
         sub.append(Gtk.SeparatorMenuItem())
 
-        # Action 6: Delete Task
         del_item = self._create_markup_menu_item(
             f"<span foreground='#f87171'>🗑 刪除任務 (task {tid} delete)</span>",
             sensitive=True,
@@ -1070,16 +1789,20 @@ class TaskwarriorWidget(Gtk.EventBox):
         self._save_config()
         self.refresh_tasks()
 
-    def show_add_or_edit_task_dialog(self, task=None):
+    def show_add_or_edit_task_dialog(self, task=None, default_due=""):
         """
         Show dialog to Add a new task (task=None) or Edit an existing task (task=dict).
         """
         is_edit = task is not None
         title = f"編輯任務 #{task.get('id', '')}" if is_edit else "新增 Taskwarrior 任務"
 
+        parent_win = self.calendar_win
+        if parent_win is None and isinstance(self.get_toplevel(), Gtk.Window):
+            parent_win = self.get_toplevel()
+
         dlg = Gtk.Dialog(
             title=title,
-            transient_for=self.get_toplevel() if isinstance(self.get_toplevel(), Gtk.Window) else None,
+            transient_for=parent_win,
             flags=0,
         )
         dlg.add_buttons(
@@ -1109,11 +1832,10 @@ class TaskwarriorWidget(Gtk.EventBox):
         grid.attach(lbl_desc, 0, 0, 1, 1)
         grid.attach(entry_desc, 1, 0, 2, 1)
 
-        # 2. Project (ComboBoxText with Entry, pre-populated with user's historical projects)
+        # 2. Project
         lbl_proj = Gtk.Label(label="專案 (Project)：", xalign=0.0)
         combo_proj = Gtk.ComboBoxText.new_with_entry()
-        known_projects = self.task_data.get("projects", [])
-        for p in known_projects:
+        for p in self.task_data.get("projects", []):
             combo_proj.append_text(p)
         proj_entry = combo_proj.get_child()
         proj_entry.set_placeholder_text("可選填或從下拉選單挑選 (如 Linux, HPC, JS...)")
@@ -1127,7 +1849,12 @@ class TaskwarriorWidget(Gtk.EventBox):
         # 3. Priority
         lbl_pri = Gtk.Label(label="優先級 (Priority)：", xalign=0.0)
         combo_pri = Gtk.ComboBoxText()
-        pri_options = [("", "無 (None)"), ("H", "H - 高優先級 (High)"), ("M", "M - 中優先級 (Medium)"), ("L", "L - 低優先級 (Low)")]
+        pri_options = [
+            ("", "無 (None)"),
+            ("H", "H - 高優先級 (High)"),
+            ("M", "M - 中優先級 (Medium)"),
+            ("L", "L - 低優先級 (Low)"),
+        ]
         cur_pri = task.get("priority", "") if is_edit else "H"
         active_idx = 0
         for idx, (code, label) in enumerate(pri_options):
@@ -1138,7 +1865,7 @@ class TaskwarriorWidget(Gtk.EventBox):
         grid.attach(lbl_pri, 0, 2, 1, 1)
         grid.attach(combo_pri, 1, 2, 2, 1)
 
-        # 4. Tags (Entry + quick tag buttons from historical tags like WORK, HOBBY)
+        # 4. Tags
         lbl_tags = Gtk.Label(label="標籤 (Tags)：", xalign=0.0)
         entry_tags = Gtk.Entry()
         entry_tags.set_placeholder_text("以空白分隔，例如：WORK")
@@ -1154,23 +1881,28 @@ class TaskwarriorWidget(Gtk.EventBox):
         tag_btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         for known_tg in self.task_data.get("tags", ["WORK", "HOBBY"])[:4]:
             b_tg = Gtk.Button(label=f"+{known_tg}")
+
             def on_add_tag(_b, tg=known_tg):
                 cur_tokens = entry_tags.get_text().split()
                 if tg not in cur_tokens:
                     cur_tokens.append(tg)
                     entry_tags.set_text(" ".join(cur_tokens))
+
             b_tg.connect("clicked", on_add_tag)
             tag_btn_box.pack_start(b_tg, False, False, 0)
         grid.attach(tag_btn_box, 2, 3, 1, 1)
 
-        # 5. Due Date (Entry + Calendar popup button)
+        # 5. Due Date
         lbl_due = Gtk.Label(label="到期日 (Due)：", xalign=0.0)
         entry_due = Gtk.Entry()
         entry_due.set_placeholder_text("YYYY-MM-DD 或 tomorrow, +3d, eow (可留空)")
         if is_edit and task.get("_due_date"):
             entry_due.set_text(task.get("_due_date", ""))
+        elif default_due:
+            entry_due.set_text(default_due)
 
         btn_cal = Gtk.Button(label="📅 選擇日期")
+
         def on_pick_date(_btn):
             cal_dlg = Gtk.Dialog(
                 title="選擇到期日",
@@ -1178,9 +1910,12 @@ class TaskwarriorWidget(Gtk.EventBox):
                 flags=Gtk.DialogFlags.MODAL,
             )
             cal_dlg.add_buttons(
-                "清除日期", Gtk.ResponseType.REJECT,
-                Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
-                Gtk.STOCK_OK, Gtk.ResponseType.OK,
+                "清除日期",
+                Gtk.ResponseType.REJECT,
+                Gtk.STOCK_CANCEL,
+                Gtk.ResponseType.CANCEL,
+                Gtk.STOCK_OK,
+                Gtk.ResponseType.OK,
             )
             cal = Gtk.Calendar()
             cal_dlg.get_content_area().pack_start(cal, True, True, 8)
@@ -1250,7 +1985,7 @@ class TaskwarriorWidget(Gtk.EventBox):
     def show_annotate_dialog(self, task):
         dlg = Gtk.Dialog(
             title=f"為任務 #{task.get('id', '')} 新增註解",
-            transient_for=self.get_toplevel() if isinstance(self.get_toplevel(), Gtk.Window) else None,
+            transient_for=self.calendar_win,
             flags=0,
         )
         dlg.add_buttons(
@@ -1283,7 +2018,7 @@ class TaskwarriorWidget(Gtk.EventBox):
 
     def confirm_delete_task(self, task):
         dlg = Gtk.MessageDialog(
-            transient_for=self.get_toplevel() if isinstance(self.get_toplevel(), Gtk.Window) else None,
+            transient_for=self.calendar_win,
             flags=0,
             message_type=Gtk.MessageType.QUESTION,
             buttons=Gtk.ButtonsType.YES_NO,
@@ -1301,7 +2036,7 @@ class TaskwarriorWidget(Gtk.EventBox):
             return
 
         win = Gtk.Window(title="Taskwarrior 任務管理 Plus — 偏好設定")
-        win.set_default_size(500, 560)
+        win.set_default_size(510, 620)
         win.set_position(Gtk.WindowPosition.CENTER)
         win.set_resizable(False)
         self.prefs_win = win
@@ -1317,9 +2052,35 @@ class TaskwarriorWidget(Gtk.EventBox):
         outer.set_margin_start(18)
         outer.set_margin_end(18)
 
-        # Section 1: Panel Display Mode
+        # Section 1: Left-click Action & Calendar Options
+        sec0_lbl = Gtk.Label(xalign=0.0)
+        sec0_lbl.set_markup("<b>1. 左鍵點選行為與月曆視圖設定</b>")
+        outer.pack_start(sec0_lbl, False, False, 0)
+
+        rb_lc_cal = Gtk.RadioButton.new_with_label_from_widget(
+            None, "左鍵點選面板圖示時：直接開啟「📅 雙欄式月曆任務看板」(推薦)"
+        )
+        rb_lc_menu = Gtk.RadioButton.new_with_label_from_widget(
+            rb_lc_cal, "左鍵點選面板圖示時：開啟「📋 傳統下拉式快速選單」"
+        )
+        if self.config.get("left_click_action", "calendar") == "calendar":
+            rb_lc_cal.set_active(True)
+        else:
+            rb_lc_menu.set_active(True)
+        outer.pack_start(rb_lc_cal, False, False, 0)
+        outer.pack_start(rb_lc_menu, False, False, 0)
+
+        chk_cal_comp = Gtk.CheckButton(
+            label="在月曆格子與當日清單中顯示歷史「已完成任務 (✓)」(依完成日期歸檔)"
+        )
+        chk_cal_comp.set_active(self.config.get("calendar_show_completed", True))
+        outer.pack_start(chk_cal_comp, False, False, 0)
+
+        outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+
+        # Section 2: Panel Display Mode
         sec1_lbl = Gtk.Label(xalign=0.0)
-        sec1_lbl.set_markup("<b>1. 面板圖示顯示模式</b>")
+        sec1_lbl.set_markup("<b>2. 面板圖示顯示模式</b>")
         outer.pack_start(sec1_lbl, False, False, 0)
 
         rb_badge = Gtk.RadioButton.new_with_label_from_widget(
@@ -1372,9 +2133,9 @@ class TaskwarriorWidget(Gtk.EventBox):
 
         outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
-        # Section 2: 3-Stage Font Colors & Background Style
+        # Section 3: 3-Stage Font Colors & Background Style
         sec2_lbl = Gtk.Label(xalign=0.0)
-        sec2_lbl.set_markup("<b>2. 面板三段式字形顏色與底色適應 (一般 / 高優先或即將到期 / 逾期或今日到期)</b>")
+        sec2_lbl.set_markup("<b>3. 面板三段式字形顏色與底色適應 (一般 / 高優先或即將到期 / 逾期或今日到期)</b>")
         outer.pack_start(sec2_lbl, False, False, 0)
 
         rb_font_dyn = Gtk.RadioButton.new_with_label_from_widget(
@@ -1455,6 +2216,8 @@ class TaskwarriorWidget(Gtk.EventBox):
             return f"#{r:02x}{g:02x}{b:02x}"
 
         def apply_changes(*_):
+            self.config["left_click_action"] = "calendar" if rb_lc_cal.get_active() else "menu"
+            self.config["calendar_show_completed"] = chk_cal_comp.get_active()
             self.config["display_mode"] = "badge" if rb_badge.get_active() else "badge_text"
             self.config["max_title_chars"] = int(spin_maxc.get_value_as_int())
             self.config["due_soon_days"] = int(spin_duesoon.get_value_as_int())
@@ -1495,6 +2258,9 @@ class TaskwarriorWidget(Gtk.EventBox):
         )
 
         for w_ctrl in (
+            rb_lc_cal,
+            rb_lc_menu,
+            chk_cal_comp,
             rb_badge,
             rb_text,
             chk_due_panel,
@@ -1511,10 +2277,13 @@ class TaskwarriorWidget(Gtk.EventBox):
 
         # Bottom buttons
         btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_cal = Gtk.Button(label="📅 開啟月曆看板")
+        btn_cal.connect("clicked", lambda *_: self.show_calendar_window())
         btn_add = Gtk.Button(label="➕ 新增任務")
         btn_add.connect("clicked", lambda *_: self.show_add_or_edit_task_dialog(task=None))
         btn_close = Gtk.Button(label="關閉")
         btn_close.connect("clicked", lambda *_: win.destroy())
+        btn_box.pack_start(btn_cal, False, False, 0)
         btn_box.pack_start(btn_add, False, False, 0)
         btn_box.pack_end(btn_close, False, False, 0)
         outer.pack_end(btn_box, False, False, 0)
@@ -1525,14 +2294,21 @@ class TaskwarriorWidget(Gtk.EventBox):
     def show_about_dialog(self, *_args):
         dlg = Gtk.AboutDialog()
         dlg.set_program_name("Taskwarrior 任務管理 Plus")
-        dlg.set_version("1.0.0")
+        dlg.set_version("1.1.0")
         dlg.set_comments(
             "事件驅動 (`Gio.FileMonitor` 監聽 ~/.task) 的 MATE 面板 Taskwarrior 任務管理 Applet。\n"
-            "支援雙顯示模式、三段式自訂字形顏色、一鍵完成/計時/編輯與快速新增任務。"
+            "內建雙欄式互動彩色月曆任務看板、歷史完成紀錄歸檔回顧與三段式自訂字形顏色。"
         )
         dlg.set_website("https://github.com/sophAi/matepanel-applet-plus")
         dlg.run()
         dlg.destroy()
+
+    def _on_left_click_action_toggled(self, radio_item, action_name):
+        if not radio_item.get_active():
+            return
+        self.config["left_click_action"] = action_name
+        self._save_config()
+        self._update_tooltip()
 
     def _on_display_mode_toggled(self, radio_item, mode):
         if not radio_item.get_active():
@@ -1573,6 +2349,9 @@ class TaskwarriorWidget(Gtk.EventBox):
         if self.file_monitor is not None:
             self.file_monitor.cancel()
             self.file_monitor = None
+        if self.calendar_win is not None:
+            self.calendar_win.destroy()
+            self.calendar_win = None
         if self.prefs_win is not None:
             self.prefs_win.destroy()
             self.prefs_win = None
@@ -1583,6 +2362,14 @@ def setup_applet_context_menu(applet, widget):
     action_group.add_actions(
         [
             (
+                "CalendarViewAction",
+                Gtk.STOCK_INDEX,
+                "月曆任務看板 (_Calendar View)...",
+                None,
+                "開啟雙欄式互動月曆任務看板",
+                widget.show_calendar_window,
+            ),
+            (
                 "AddTaskAction",
                 Gtk.STOCK_ADD,
                 "新增任務 (_Add Task)...",
@@ -1591,11 +2378,11 @@ def setup_applet_context_menu(applet, widget):
                 lambda *_: widget.show_add_or_edit_task_dialog(task=None),
             ),
             (
-                "ShowTasksAction",
-                Gtk.STOCK_INDEX,
-                "待辦任務清單 (_Tasks)...",
+                "ShowTasksMenuAction",
+                Gtk.STOCK_INFO,
+                "傳統下拉任務選單 (_Quick Menu)...",
                 None,
-                "顯示所有待辦任務與操作選單",
+                "顯示傳統下拉式待辦任務與操作選單",
                 lambda *_: widget.popup_task_menu(None),
             ),
             (
@@ -1603,7 +2390,7 @@ def setup_applet_context_menu(applet, widget):
                 Gtk.STOCK_PREFERENCES,
                 "偏好設定 (_Preferences)...",
                 None,
-                "設定面板顯示樣式、三段字形顏色與到期警戒天數",
+                "設定左鍵預設行為、面板顯示樣式與三段字形顏色",
                 widget.show_preferences_dialog,
             ),
             (
@@ -1618,8 +2405,9 @@ def setup_applet_context_menu(applet, widget):
     )
 
     menu_xml = (
+        '<menuitem name="CalendarView" action="CalendarViewAction"/>'
         '<menuitem name="AddTask" action="AddTaskAction"/>'
-        '<menuitem name="ShowTasks" action="ShowTasksAction"/>'
+        '<menuitem name="ShowTasksMenu" action="ShowTasksMenuAction"/>'
         "<separator/>"
         '<menuitem name="Preferences" action="PreferencesAction"/>'
         '<menuitem name="About" action="AboutAction"/>'
@@ -1661,7 +2449,7 @@ def applet_factory(applet, iid, _data):
 
 def run_standalone_window():
     win = Gtk.Window(title="MATE Taskwarrior Applet - 預覽測試視窗")
-    win.set_default_size(580, 165)
+    win.set_default_size(640, 170)
     win.set_position(Gtk.WindowPosition.CENTER)
     win.connect("destroy", Gtk.main_quit)
 
@@ -1673,9 +2461,9 @@ def run_standalone_window():
 
     info_lbl = Gtk.Label(xalign=0.0)
     info_lbl.set_markup(
-        "<b>MATE Panel 模擬預覽列 — Taskwarrior 任務管理 Plus</b>\n"
-        "<small>• <b>左鍵點選</b>下方 <tt>[TASK]</tt> 圖示：檢視待辦任務、展開子選單（完成/計時/編輯/註解/刪除）或新增任務\n"
-        "• 支援切換<b>精簡方塊</b>或<b>方塊+首要任務標題</b>，以及<b>三段式自訂字形顏色</b></small>"
+        "<b>MATE Panel 模擬預覽列 — Taskwarrior 任務管理 Plus (含雙欄月曆看板)</b>\n"
+        "<small>• <b>左鍵點選</b>下方 <tt>[TASK]</tt> 圖示：直接開啟/收合<b>📅 雙欄式互動月曆任務看板</b>\n"
+        "• <b>右鍵點選</b>下方圖示（或按右側按鈕）：開啟傳統下拉式快速選單或偏好設定</small>"
     )
     vbox.pack_start(info_lbl, False, False, 0)
 
@@ -1690,7 +2478,7 @@ def run_standalone_window():
     )
     panel_frame.get_style_context().add_class("simulated-panel-dark")
 
-    hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+    hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
     hbox.set_margin_top(4)
     hbox.set_margin_bottom(4)
     hbox.set_margin_start(10)
@@ -1707,6 +2495,10 @@ def run_standalone_window():
     btn_prefs = Gtk.Button(label="⚙️ 偏好設定")
     btn_prefs.connect("clicked", widget.show_preferences_dialog)
     hbox.pack_end(btn_prefs, False, False, 0)
+
+    btn_cal = Gtk.Button(label="📅 月曆看板")
+    btn_cal.connect("clicked", widget.show_calendar_window)
+    hbox.pack_end(btn_cal, False, False, 0)
 
     btn_add = Gtk.Button(label="➕ 新增任務")
     btn_add.connect("clicked", lambda *_: widget.show_add_or_edit_task_dialog(task=None))
@@ -1742,6 +2534,11 @@ def run_standalone_window():
 if __name__ == "__main__":
     if "--window" in sys.argv or "-w" in sys.argv:
         run_standalone_window()
+    elif "--calendar" in sys.argv or "-c" in sys.argv:
+        w = TaskwarriorWidget(applet=None)
+        w.show_calendar_window()
+        w.calendar_win.connect("destroy", Gtk.main_quit)
+        Gtk.main()
     elif "--dump" in sys.argv:
         data = TaskwarriorBackend.fetch_all()
         print(json.dumps(data, indent=2, ensure_ascii=False))
