@@ -1046,6 +1046,9 @@ class WeatherAlertBubbleManager:
     def __init__(self):
         self._win = None
 
+    def is_visible(self):
+        return self._win is not None and self._win.is_visible()
+
     def close_all(self):
         if self._win is not None:
             w = self._win
@@ -1852,6 +1855,7 @@ class ClockWeatherWidget(Gtk.EventBox):
         self._icon_cache = {}
         self._fetching_weather = False
         self._last_weather_icon = None
+        self._last_alert_args = None
         if isinstance(self.weather_data, dict):
             _cur0 = self.weather_data.get("current") or {}
             if _cur0.get("code") is not None:
@@ -2309,6 +2313,7 @@ class ClockWeatherWidget(Gtk.EventBox):
                 self._syncing_menu_toggle = False
 
     def show_weather_change_bubble(self, old_icon, new_icon, new_desc="", temp_c=None):
+        self._last_alert_args = (old_icon, new_icon, new_desc, temp_c)
         old_pb = self.get_weather_pixbuf(old_icon, 28)
         new_pb = self.get_weather_pixbuf(new_icon, 28)
         remark = weather_change_remark(new_icon, new_desc)
@@ -2329,7 +2334,7 @@ class ClockWeatherWidget(Gtk.EventBox):
             fg_color=self.config.get("bubble_fg_color", "#f0f6ff"),
             bg_opacity=int(self.config.get("bubble_bg_opacity", 92)),
             font_size=int(self.config.get("calendar_font_size", 11)),
-            timeout_sec=t_sec if t_sec > 0 else 10,
+            timeout_sec=t_sec,
         )
 
     def set_display_mode(self, mode):
@@ -2701,7 +2706,7 @@ class ClockWeatherWidget(Gtk.EventBox):
         tab_bubble.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
         bs2 = Gtk.Label(xalign=0.0)
-        bs2.set_markup("<b>2. 自訂 RGBA 氣泡框位置與外觀</b>")
+        bs2.set_markup("<b>2. 自訂 RGBA 氣泡框位置與外觀（同時套用於精簡月曆與天氣變化提醒）</b>")
         tab_bubble.pack_start(bs2, False, False, 0)
 
         b_pos_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -2820,6 +2825,8 @@ class ClockWeatherWidget(Gtk.EventBox):
                 self.popup_win.refresh_view()
             elif self.bubble_mgr.is_visible():
                 self.show_compact_calendar_bubble()
+            if self.alert_bubble_mgr.is_visible() and self._last_alert_args is not None:
+                self.show_weather_change_bubble(*self._last_alert_args)
 
         def set_city(name, lat, lon):
             self.config["city_name"] = name
