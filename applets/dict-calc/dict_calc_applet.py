@@ -1433,25 +1433,12 @@ class DictCalcPopupWindow(Gtk.Window):
         root.set_margin_start(10)
         root.set_margin_end(10)
 
-        # Compact Header Bar (Query title + tiny action buttons; NO search entry!)
+        # Compact Header Bar (Query title + close button only; NO search entry / scan / prefs icons)
         hdr_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
         self.query_title_lbl = Gtk.Label(xalign=0.0)
         self.query_title_lbl.set_ellipsize(3)  # Pango.EllipsizeMode.END
         self.query_title_lbl.set_markup("<b>📖 StarDict &amp; 🧮 計算機結果</b>")
         hdr_box.pack_start(self.query_title_lbl, True, True, 0)
-
-        self.chk_scan = Gtk.ToggleButton(label="✂")
-        self.chk_scan.set_can_focus(False)
-        self.chk_scan.set_tooltip_text("開關滑鼠反白自動劃詞查詢 (Scan Selection)")
-        self.chk_scan.set_active(self.parent_widget.config.get("scan_selection_enabled", False))
-        self.chk_scan.connect("toggled", self._on_scan_toggled)
-        hdr_box.pack_start(self.chk_scan, False, False, 0)
-
-        btn_prefs = Gtk.Button(label="⚙️")
-        btn_prefs.set_can_focus(False)
-        btn_prefs.set_tooltip_text("偏好設定（詞典順位 / 字型大小 / 顯示方式 / 快捷鍵）")
-        btn_prefs.connect("clicked", lambda *_: self.parent_widget.show_preferences_dialog())
-        hdr_box.pack_start(btn_prefs, False, False, 0)
 
         btn_close = Gtk.Button(label="✖")
         btn_close.set_can_focus(False)
@@ -1591,7 +1578,6 @@ class DictCalcPopupWindow(Gtk.Window):
         self.status_lbl.set_markup(f"<small><span foreground='#94a3b8'>{html.escape(msg)}</span></small>")
 
     def sync_controls(self):
-        self.chk_scan.set_active(self.parent_widget.config.get("scan_selection_enabled", False))
         self.update_font_size()
         self._update_status_footer()
 
@@ -1697,9 +1683,14 @@ class DictCalcPopupWindow(Gtk.Window):
     def show_dict_results(self, query_word, results, near_pointer=False, spelling_info=None):
         if spelling_info:
             orig_w, sugs, auto_w = spelling_info
-            self.query_title_lbl.set_markup(
-                f"<b>📖 拼字修正：{html.escape(orig_w)} → {html.escape(auto_w or sugs[0])}</b>"
-            )
+            if auto_w:
+                self.query_title_lbl.set_markup(
+                    f"<b>📖 拼字修正：{html.escape(orig_w)} → {html.escape(auto_w)}</b>"
+                )
+            else:
+                self.query_title_lbl.set_markup(
+                    f"<b>❓ 查無「{html.escape(orig_w)}」— 拼字建議</b>"
+                )
             self.set_spelling_suggestions(orig_w, sugs, auto_word=auto_w)
         else:
             self.query_title_lbl.set_markup(f"<b>📖 查詢：{html.escape(query_word)}</b>")
@@ -1711,20 +1702,34 @@ class DictCalcPopupWindow(Gtk.Window):
         buf.set_text("")
 
         if not results:
-            sug_hint = ""
             if spelling_info:
-                _ow, sugs, _aw = spelling_info
-                sug_hint = f"💡 您是不是要找：{', '.join(sugs)}\n\n"
-            buf.insert_with_tags(
-                buf.get_end_iter(),
-                f"找不到「{query_word}」的詞條釋義。\n\n"
-                f"{sug_hint}"
-                f"💡 建議：\n"
-                f"• 點選右上角「⚙️ 偏好設定 → 詞典管理」勾選更多詞典\n"
-                f"• 若要進行數學計算，可在算式最前面加上「=」（例如 =2^10）\n",
-                self.tag_muted,
-            )
-            self._update_status_footer(f"查詢「{query_word}」：0 筆結果")
+                orig_w, sugs, _aw = spelling_info
+                buf.insert_with_tags(
+                    buf.get_end_iter(),
+                    f"查無單字「{orig_w}」。\n\n",
+                    self.tag_muted,
+                )
+                buf.insert_with_tags(
+                    buf.get_end_iter(),
+                    "💡 您是不是要找以下拼法？（可直接點上方按鈕查詢）\n",
+                    self.tag_word,
+                )
+                buf.insert_with_tags(
+                    buf.get_end_iter(),
+                    "  • " + "\n  • ".join(sugs) + "\n",
+                    self.tag_body,
+                )
+                self._update_status_footer(f"查無「{orig_w}」：提供 {len(sugs)} 個可能拼法")
+            else:
+                buf.insert_with_tags(
+                    buf.get_end_iter(),
+                    f"找不到「{query_word}」的詞條釋義。\n\n"
+                    f"💡 建議：\n"
+                    f"• 於面板輸入框按右鍵進入「⚙️ 偏好設定 → 詞典管理」勾選更多詞典\n"
+                    f"• 若要進行數學計算，可在算式最前面加上「=」（例如 =2^10）\n",
+                    self.tag_muted,
+                )
+                self._update_status_footer(f"查詢「{query_word}」：0 筆結果")
             self.position_and_show(near_pointer=near_pointer)
             return
 
@@ -2562,14 +2567,11 @@ class DictCalcWidget(Gtk.EventBox):
             def sdcv_worker():
                 res = self.dict_mgr.query_sync(q, dict_names=sdcv_names)
                 sp_info = None
-                # If offline StarDict found 0 hits for a single English word, run aspell spelling suggestion
-                # and automatically look up the top suggested correction!
+                # If offline StarDict found 0 exact hits for a single English word, suggest likely spellings only
                 if not res and StarDictManager.is_single_english_word(q):
-                    sugs = StarDictManager.suggest_spelling_sync(q, max_suggestions=6)
+                    sugs = StarDictManager.suggest_spelling_sync(q, max_suggestions=8)
                     if sugs:
-                        auto_w = sugs[0]
-                        res = self.dict_mgr.query_sync(auto_w, dict_names=sdcv_names)
-                        sp_info = (q, sugs, auto_w)
+                        sp_info = (q, sugs, None)
                 GLib.idle_add(merge_and_render, res, sp_info)
 
             threading.Thread(target=sdcv_worker, daemon=True).start()
@@ -2790,18 +2792,19 @@ class DictCalcWidget(Gtk.EventBox):
             title_word = query_word
             if spelling_info:
                 orig_w, sugs, auto_w = spelling_info
-                title_word = f"{orig_w} → {auto_w}"
-                others = [s for s in sugs[1:5]]
-                other_str = f"（其他：{' · '.join(others)}）" if others else ""
-                sp_banner = f"<i>💡 拼字建議：{html.escape(orig_w)} → <b>{html.escape(auto_w)}</b>{html.escape(other_str)}</i>"
+                if auto_w:
+                    title_word = f"{orig_w} → {auto_w}"
+                    others = [s for s in sugs[1:5]]
+                    other_str = f"（其他：{' · '.join(others)}）" if others else ""
+                    sp_banner = f"<i>💡 拼字建議：{html.escape(orig_w)} → <b>{html.escape(auto_w)}</b>{html.escape(other_str)}</i>"
 
             if not results:
                 if spelling_info:
                     orig_w, sugs, _aw = spelling_info
                     self._notify_dbus(
-                        f"❓ 查無「{orig_w}」— 拼字建議",
+                        f"❓ 查無「{orig_w}」— 可能拼法",
                         self._wrap_dbus_font(
-                            f"您是不是要找：\n<b>{html.escape('  ·  '.join(sugs))}</b>"
+                            f"您是不是要找：\n{html.escape('  ·  '.join(sugs))}"
                         ),
                         icon="accessories-dictionary",
                         timeout_sec=timeout_sec,
