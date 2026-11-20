@@ -1146,7 +1146,7 @@ class HimawariSatelliteView(Gtk.Box):
 
     TIMES_URL = "https://www.jma.go.jp/bosai/himawari/data/satimg/targetTimes_fd.json"
     TILE_URL = "https://www.jma.go.jp/bosai/himawari/data/satimg/{bt}/fd/{vt}/{band}/4/{x}/{y}.jpg"
-    BASE_URL = "https://a.basemaps.cartocdn.com/dark_nolabels/4/{x}/{y}.png"
+    BASE_URL = "https://cyberjapandata.gsi.go.jp/xyz/pale/4/{x}/{y}.png"
     LABEL_URL = "https://a.basemaps.cartocdn.com/dark_only_labels/4/{x}/{y}.png"
 
     ZOOM = 4
@@ -1178,8 +1178,12 @@ class HimawariSatelliteView(Gtk.Box):
 
         self._band = "B13/TBB"
         self._frames = []            # list of {"label": str, "surface": cairo.ImageSurface}
-        self._base_tiles = {}        # (x, y) -> GdkPixbuf
+        self._base_tiles = {}        # (x, y) -> GdkPixbuf (GSI pale)
         self._label_tiles = {}       # (x, y) -> GdkPixbuf
+        self._land_buf = None
+        self._land_surface = None    # 768x512 dark ocean/land silhouette under clouds
+        self._coast_buf = None
+        self._coast_surface = None   # 768x512 transparent bright yellow coastlines OVER clouds
         self._cur_idx = 0
         self._playing = True
         self._anim_timer_id = None
@@ -1347,20 +1351,75 @@ class HimawariSatelliteView(Gtk.Box):
         )
         self.canvas.queue_draw()
 
+    def _build_base_and_coastline_surfaces(self):
+        """
+        Extract pixel-exact water/land mask from the 6 cached GSI pale tiles (ocean has B-R >= 25),
+        producing:
+          1) _land_surface: dark navy ocean + dark slate land (drawn UNDER clouds)
+          2) _coast_surface: transparent overlay with crisp golden-yellow coastlines (drawn OVER clouds)
+        """
+        if not self._base_tiles:
+            return
+        w_tot, h_tot = self.IMG_W, self.IMG_H
+        water = bytearray(w_tot * h_tot)
+
+        for xi, tx in enumerate(self.X_RANGE):
+            for yi, ty in enumerate(self.Y_RANGE):
+                pb = self._base_tiles.get((tx, ty))
+                if pb is None:
+                    continue
+                tw, th = min(256, pb.get_width()), min(256, pb.get_height())
+                rs, nc = pb.get_rowstride(), pb.get_n_channels()
+                px = pb.get_pixels()
+                ox, oy = xi * 256, yi * 256
+                for y in range(th):
+                    r_off = y * rs
+                    w_off = (oy + y) * w_tot + ox
+                    for x in range(tw):
+                        i = r_off + x * nc
+                        if px[i + 2] - px[i] >= 25:
+                            water[w_off + x] = 1
+
+        # Cairo ARGB32 on little-endian stores bytes as [B, G, R, A] (premultiplied)
+        land_buf = bytearray(w_tot * h_tot * 4)
+        coast_buf = bytearray(w_tot * h_tot * 4)
+        ocean_bgra = b"\x22\x13\x09\xff"   # #091322 deep navy ocean
+        land_bgra = b"\x3c\x2b\x1c\xff"    # #1c2b3c slate land
+        coast_bgra = b"\x40\xd8\xf5\xf2"   # bright meteorological gold-yellow (#fde047 @ ~95% alpha)
+
+        for y in range(h_tot):
+            w_row = y * w_tot
+            b_row = w_row * 4
+            for x in range(w_tot):
+                is_w = water[w_row + x]
+                pos = b_row + x * 4
+                land_buf[pos:pos + 4] = ocean_bgra if is_w else land_bgra
+                if (x + 1 < w_tot and is_w != water[w_row + x + 1]) or (
+                    y + 1 < h_tot and is_w != water[w_row + w_tot + x]
+                ):
+                    coast_buf[pos:pos + 4] = coast_bgra
+
+        stride = cairo.ImageSurface.format_stride_for_width(cairo.FORMAT_ARGB32, w_tot)
+        self._land_buf = land_buf
+        self._land_surface = cairo.ImageSurface.create_for_data(
+            self._land_buf, cairo.FORMAT_ARGB32, w_tot, h_tot, stride
+        )
+        self._coast_buf = coast_buf
+        self._coast_surface = cairo.ImageSurface.create_for_data(
+            self._coast_buf, cairo.FORMAT_ARGB32, w_tot, h_tot, stride
+        )
+
     def _compose_frame_surface(self, cloud_tiles, band):
         surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, self.IMG_W, self.IMG_H)
         ctx = cairo.Context(surf)
         # Background ocean fill
-        ctx.set_source_rgb(0.06, 0.09, 0.14)
+        ctx.set_source_rgb(0.04, 0.07, 0.13)
         ctx.paint()
 
-        # Layer 1: Dark base map (clear land silhouettes for Taiwan, Japan, Philippines)
-        for xi, tx in enumerate(self.X_RANGE):
-            for yi, ty in enumerate(self.Y_RANGE):
-                pb = self._base_tiles.get((tx, ty))
-                if pb is not None:
-                    Gdk.cairo_set_source_pixbuf(ctx, pb, xi * 256.0, yi * 256.0)
-                    ctx.paint()
+        # Layer 1: Dark ocean / land silhouette under clouds
+        if self._land_surface is not None:
+            ctx.set_source_surface(self._land_surface, 0.0, 0.0)
+            ctx.paint()
 
         # Layer 2: JMA Himawari-9 cloud tiles
         ctx.save()
@@ -1371,7 +1430,7 @@ class HimawariSatelliteView(Gtk.Box):
                     pb = cloud_tiles.get((tx, ty))
                     if pb is not None:
                         Gdk.cairo_set_source_pixbuf(ctx, pb, xi * 256.0, yi * 256.0)
-                        ctx.paint_with_alpha(0.78)
+                        ctx.paint_with_alpha(0.80)
         else:
             # Infrared / Water Vapor / True Color: SCREEN keeps clouds bright & lets land show through dark ocean
             ctx.set_operator(cairo.OPERATOR_SCREEN)
@@ -1383,7 +1442,12 @@ class HimawariSatelliteView(Gtk.Box):
                         ctx.paint_with_alpha(0.95)
         ctx.restore()
 
-        # Layer 3: Transparent map labels
+        # Layer 3: Razor-sharp golden-yellow coastlines OVER clouds (Taiwan, Japan, Philippines, China)
+        if self._coast_surface is not None:
+            ctx.set_source_surface(self._coast_surface, 0.0, 0.0)
+            ctx.paint()
+
+        # Layer 4: Transparent map labels
         for xi, tx in enumerate(self.X_RANGE):
             for yi, ty in enumerate(self.Y_RANGE):
                 pb = self._label_tiles.get((tx, ty))
@@ -1488,6 +1552,8 @@ class HimawariSatelliteView(Gtk.Box):
                     pb = self._bytes_to_pixbuf(v)
                     if pb is not None:
                         self._label_tiles[k] = pb
+                if base_raw:
+                    self._build_base_and_coastline_surfaces()
                 return False
 
             if base_raw or label_raw:
