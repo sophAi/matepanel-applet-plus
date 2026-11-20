@@ -1754,7 +1754,7 @@ class DictCalcWidget(Gtk.EventBox):
         self.canvas.connect("button-press-event", self._on_button_press)
         self.root_box.pack_start(self.canvas, False, False, 0)
 
-        # 2. Pure Inline Panel Search/Calc Entry (click-to-type with request_focus + left scan icon + right-click menu)
+        # 2. Clean Inline Panel Search/Calc Entry (click-to-type with request_focus + right-click menu)
         self.panel_entry = Gtk.Entry()
         self.panel_entry.set_no_show_all(True)
         self.panel_entry.set_name("dict-calc-panel-entry")
@@ -1763,15 +1763,8 @@ class DictCalcWidget(Gtk.EventBox):
             self.entry_css_provider, Gtk.STYLE_PROVIDER_PRIORITY_USER
         )
         self.panel_entry.set_placeholder_text("查詞 / 算式...")
-        self.panel_entry.set_icon_from_icon_name(
-            Gtk.EntryIconPosition.PRIMARY, "edit-find-symbolic"
-        )
-        self.panel_entry.set_icon_tooltip_text(
-            Gtk.EntryIconPosition.PRIMARY, "點此開關滑鼠劃詞查詢 (Scan Selection)"
-        )
         self.panel_entry.connect("activate", self._on_panel_entry_activate)
         self.panel_entry.connect("button-press-event", self._on_panel_entry_button_press)
-        self.panel_entry.connect("icon-press", self._on_panel_entry_icon_press)
         self.panel_entry.connect("populate-popup", self._on_panel_entry_populate_popup)
         self.panel_entry.connect("key-press-event", self._on_panel_entry_key_press)
         self.root_box.pack_start(self.panel_entry, False, False, 0)
@@ -1783,6 +1776,8 @@ class DictCalcWidget(Gtk.EventBox):
         self._scan_poll_id = None
         self._scan_debounce_id = None
         self._scan_pending_retries = 0
+        self._btn1_was_down = False
+        self._last_mouse_select_ts = 0
         self.clipboard_main = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
         self.clipboard_primary = Gtk.Clipboard.get(Gdk.SELECTION_PRIMARY)
         self.clipboard_primary.connect("owner-change", self._on_primary_selection_changed)
@@ -1971,8 +1966,17 @@ class DictCalcWidget(Gtk.EventBox):
             self._scan_poll_id = None
             return False
         state = self._get_pointer_modifier_state()
-        # Wait until left mouse button is released so we never scan half-dragged text
+        now_us = GLib.get_monotonic_time()
+        # Track mouse button 1 drag -> release so keyboard-only Ctrl combos (e.g. tmux Ctrl+b)
+        # never misfire Scan Selection on stale PRIMARY text!
         if state & Gdk.ModifierType.BUTTON1_MASK:
+            self._btn1_was_down = True
+            return True
+        if self._btn1_was_down:
+            self._btn1_was_down = False
+            self._last_mouse_select_ts = now_us
+        # Only allow auto-scan within 1.5s of an actual mouse selection release / PRIMARY change
+        if (now_us - self._last_mouse_select_ts) > 1_500_000:
             return True
         if not self._is_scan_modifier_pressed(state):
             return True
@@ -1982,6 +1986,7 @@ class DictCalcWidget(Gtk.EventBox):
     def _on_primary_selection_changed(self, _clipboard, _event):
         if not self.config.get("scan_selection_enabled", False):
             return
+        self._last_mouse_select_ts = GLib.get_monotonic_time()
         # Debounce owner-change until mouse drag finishes (BUTTON1 released)
         if self._scan_debounce_id is not None:
             try:
@@ -2047,23 +2052,10 @@ class DictCalcWidget(Gtk.EventBox):
         self._apply_panel_layout()
 
     def _update_entry_icons(self):
-        scan_on = self.config.get("scan_selection_enabled", False)
-        if scan_on:
-            self.panel_entry.set_icon_from_icon_name(
-                Gtk.EntryIconPosition.PRIMARY, "edit-cut-symbolic"
-            )
-            self.panel_entry.set_icon_tooltip_text(
-                Gtk.EntryIconPosition.PRIMARY, "✂ 滑鼠劃詞查詢已開啟（點此關閉）"
-            )
-            self.panel_entry.set_placeholder_text("✂ 查詞 / 算式...")
-        else:
-            self.panel_entry.set_icon_from_icon_name(
-                Gtk.EntryIconPosition.PRIMARY, "edit-find-symbolic"
-            )
-            self.panel_entry.set_icon_tooltip_text(
-                Gtk.EntryIconPosition.PRIMARY, "🔎 點此開啟滑鼠劃詞查詢 (Scan Selection)"
-            )
-            self.panel_entry.set_placeholder_text("查詞 / 算式...")
+        # Keep the inline panel entry completely clean (no inner toggle icons; toggle Scan Selection via right-click menu)
+        self.panel_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.PRIMARY, None)
+        self.panel_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, None)
+        self.panel_entry.set_placeholder_text("查詞 / 算式...")
 
     def _sync_entry_visibility(self):
         if self.config.get("display_mode", "badge") == "panel_entry":
