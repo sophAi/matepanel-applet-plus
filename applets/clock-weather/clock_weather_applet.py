@@ -21,6 +21,7 @@ Features:
 """
 
 import calendar
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 import html
 import json
@@ -37,7 +38,7 @@ import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import Gdk, GLib, GObject, Gtk
+from gi.repository import Gdk, GdkPixbuf, GLib, GObject, Gtk
 import cairo
 
 try:
@@ -1131,6 +1132,478 @@ class WeatherAlertBubbleManager:
 
 
 # =============================================================================
+# 1.8 JMA Himawari-9 Western Pacific Animated Satellite Cloud Map (Free, No Key)
+# =============================================================================
+
+class HimawariSatelliteView(Gtk.Box):
+    """
+    Free, API-key-free Western Pacific (Taiwan, Japan, Philippines) animated satellite
+    cloud viewer powered by Japan Meteorological Agency (JMA) Himawari-9 tiles:
+      - Zoom z=4, x=12..14, y=6..7 (3x2 = 6 tiles -> 768x512 native landscape)
+      - Composites JMA cloud tiles over CartoDB dark base map + transparent labels
+      - Plays the latest 10 frames (every 30 min = past 4.5 hours), auto-pauses when hidden.
+    """
+
+    TIMES_URL = "https://www.jma.go.jp/bosai/himawari/data/satimg/targetTimes_fd.json"
+    TILE_URL = "https://www.jma.go.jp/bosai/himawari/data/satimg/{bt}/fd/{vt}/{band}/4/{x}/{y}.jpg"
+    BASE_URL = "https://a.basemaps.cartocdn.com/dark_nolabels/4/{x}/{y}.png"
+    LABEL_URL = "https://a.basemaps.cartocdn.com/dark_only_labels/4/{x}/{y}.png"
+
+    ZOOM = 4
+    X_RANGE = (12, 13, 14)   # 90°E .. 157.5°E (South China Sea -> Taiwan/PH/JP -> W. Pacific)
+    Y_RANGE = (6, 7)         # 0°N .. 41°N (Philippines -> Taiwan -> Honshu/Tokyo)
+    IMG_W = 256 * 3          # 768
+    IMG_H = 256 * 2          # 512
+
+    BANDS = [
+        ("B13/TBB", "紅外線雲圖 (日夜通用)"),
+        ("SND/ETC", "雲頂高度強化 (彩色對流)"),
+        ("B08/TBB", "水氣頻道 (大氣水氣)"),
+        ("REP/ETC", "真實色雲圖 (白天推薦)"),
+    ]
+
+    MARKERS = [
+        ("台北", 25.0330, 121.5654, (0.22, 0.96, 0.72)),
+        ("東京", 35.6762, 139.6503, (0.38, 0.80, 1.00)),
+        ("馬尼拉", 14.5995, 120.9842, (0.98, 0.75, 0.30)),
+    ]
+
+    def __init__(self, parent_widget):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.parent_widget = parent_widget
+        self.set_margin_top(6)
+        self.set_margin_bottom(6)
+        self.set_margin_start(6)
+        self.set_margin_end(6)
+
+        self._band = "B13/TBB"
+        self._frames = []            # list of {"label": str, "surface": cairo.ImageSurface}
+        self._base_tiles = {}        # (x, y) -> GdkPixbuf
+        self._label_tiles = {}       # (x, y) -> GdkPixbuf
+        self._cur_idx = 0
+        self._playing = True
+        self._anim_timer_id = None
+        self._loading = False
+        self._load_gen = 0
+        self._last_loaded_ts = None
+        self._syncing_scale = False
+
+        # Top Control Bar
+        ctrl = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+        self.btn_play = Gtk.Button(label="⏸ 暫停")
+        self.btn_play.connect("clicked", self._on_toggle_play)
+        ctrl.pack_start(self.btn_play, False, False, 0)
+
+        self.combo_band = Gtk.ComboBoxText()
+        for b_id, b_lbl in self.BANDS:
+            self.combo_band.append(b_id, b_lbl)
+        self.combo_band.set_active_id(self._band)
+        self.combo_band.connect("changed", self._on_band_changed)
+        ctrl.pack_start(self.combo_band, False, False, 0)
+
+        self.scale_frame = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 9.0, 1.0)
+        self.scale_frame.set_digits(0)
+        self.scale_frame.set_draw_value(False)
+        self.scale_frame.set_hexpand(True)
+        self.scale_frame.connect("value-changed", self._on_scale_changed)
+        ctrl.pack_start(self.scale_frame, True, True, 0)
+
+        self.lbl_time = Gtk.Label(xalign=1.0)
+        self.lbl_time.set_width_chars(18)
+        self.lbl_time.set_markup("<small><span foreground='#94a3b8'>尚未載入</span></small>")
+        ctrl.pack_start(self.lbl_time, False, False, 0)
+
+        self.btn_reload = Gtk.Button(label="🔄 更新")
+        self.btn_reload.connect("clicked", lambda *_: self.load_frames_async(force=True))
+        ctrl.pack_end(self.btn_reload, False, False, 0)
+
+        self.pack_start(ctrl, False, False, 0)
+
+        # Satellite Canvas
+        self.canvas = Gtk.DrawingArea()
+        self.canvas.set_size_request(760, 390)
+        self.canvas.set_hexpand(True)
+        self.canvas.set_vexpand(True)
+        self.canvas.connect("draw", self._on_draw)
+        self.pack_start(self.canvas, True, True, 0)
+
+        # Status / Attribution Footer
+        self.lbl_status = Gtk.Label(xalign=0.0)
+        self.lbl_status.set_markup(
+            "<small><span foreground='#94a3b8'>資料來源：日本氣象廳 JMA 向日葵 9 號 (Himawari-9，免費免 Key，每 10 分鐘更新) · 涵蓋台灣／日本／菲律賓</span></small>"
+        )
+        self.pack_start(self.lbl_status, False, False, 0)
+
+    @classmethod
+    def _latlon_to_px(cls, lat, lon):
+        n = 2 ** cls.ZOOM
+        x_tile = (lon + 180.0) / 360.0 * n
+        lat_rad = math.radians(lat)
+        y_tile = (1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0 * n
+        px = (x_tile - cls.X_RANGE[0]) * 256.0
+        py = (y_tile - cls.Y_RANGE[0]) * 256.0
+        return px, py
+
+    @staticmethod
+    def _fetch_bytes(url, timeout=8.0):
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (MatePanel-ClockWeather)"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read()
+
+    @staticmethod
+    def _bytes_to_pixbuf(raw_bytes):
+        if not raw_bytes:
+            return None
+        try:
+            loader = GdkPixbuf.PixbufLoader()
+            loader.write(raw_bytes)
+            loader.close()
+            return loader.get_pixbuf()
+        except Exception:
+            return None
+
+    def activate(self):
+        """Called when user switches to the Satellite tab."""
+        now_ts = datetime.now()
+        need_reload = (
+            not self._frames
+            or self._last_loaded_ts is None
+            or (now_ts - self._last_loaded_ts).total_seconds() >= 600
+        )
+        if need_reload and not self._loading:
+            self.load_frames_async(force=False)
+        elif self._frames and self._playing:
+            self._schedule_next_frame(650)
+
+    def deactivate(self):
+        """Called when user leaves the Satellite tab or closes the popup (0% idle CPU)."""
+        self._stop_anim()
+
+    def _stop_anim(self):
+        if self._anim_timer_id is not None:
+            try:
+                GLib.source_remove(self._anim_timer_id)
+            except Exception:
+                pass
+            self._anim_timer_id = None
+
+    def _schedule_next_frame(self, delay_ms=650):
+        self._stop_anim()
+        if not self._playing or len(self._frames) < 2:
+            return
+        self._anim_timer_id = GLib.timeout_add(int(delay_ms), self._on_anim_tick)
+
+    def _on_anim_tick(self):
+        self._anim_timer_id = None
+        if not self._playing or not self._frames:
+            return False
+        self._cur_idx = (self._cur_idx + 1) % len(self._frames)
+        self._sync_ui_to_frame()
+        # Pause slightly longer on the newest frame so user can inspect current clouds
+        delay = 1400 if self._cur_idx == len(self._frames) - 1 else 650
+        self._schedule_next_frame(delay)
+        return False
+
+    def _sync_ui_to_frame(self):
+        if not self._frames:
+            return
+        idx = max(0, min(self._cur_idx, len(self._frames) - 1))
+        self._cur_idx = idx
+        self._syncing_scale = True
+        try:
+            self.scale_frame.set_range(0.0, float(max(1, len(self._frames) - 1)))
+            self.scale_frame.set_value(float(idx))
+        finally:
+            self._syncing_scale = False
+        fr = self._frames[idx]
+        self.lbl_time.set_markup(
+            f"<small><b>{html.escape(fr['label'])}</b> ({idx + 1}/{len(self._frames)})</small>"
+        )
+        self.canvas.queue_draw()
+
+    def _on_toggle_play(self, *_args):
+        self._playing = not self._playing
+        self.btn_play.set_label("⏸ 暫停" if self._playing else "▶ 播放")
+        if self._playing:
+            self._schedule_next_frame(500)
+        else:
+            self._stop_anim()
+
+    def _on_band_changed(self, *_args):
+        new_band = self.combo_band.get_active_id() or "B13/TBB"
+        if new_band != self._band:
+            self._band = new_band
+            self.load_frames_async(force=True)
+
+    def _on_scale_changed(self, *_args):
+        if self._syncing_scale or not self._frames:
+            return
+        idx = max(0, min(len(self._frames) - 1, int(round(self.scale_frame.get_value()))))
+        self._cur_idx = idx
+        fr = self._frames[idx]
+        self.lbl_time.set_markup(
+            f"<small><b>{html.escape(fr['label'])}</b> ({idx + 1}/{len(self._frames)})</small>"
+        )
+        self.canvas.queue_draw()
+
+    def _compose_frame_surface(self, cloud_tiles, band):
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, self.IMG_W, self.IMG_H)
+        ctx = cairo.Context(surf)
+        # Background ocean fill
+        ctx.set_source_rgb(0.06, 0.09, 0.14)
+        ctx.paint()
+
+        # Layer 1: Dark base map (clear land silhouettes for Taiwan, Japan, Philippines)
+        for xi, tx in enumerate(self.X_RANGE):
+            for yi, ty in enumerate(self.Y_RANGE):
+                pb = self._base_tiles.get((tx, ty))
+                if pb is not None:
+                    Gdk.cairo_set_source_pixbuf(ctx, pb, xi * 256.0, yi * 256.0)
+                    ctx.paint()
+
+        # Layer 2: JMA Himawari-9 cloud tiles
+        ctx.save()
+        if band == "SND/ETC":
+            # Colorized cloud-top enhancement: alpha blend over base map
+            for xi, tx in enumerate(self.X_RANGE):
+                for yi, ty in enumerate(self.Y_RANGE):
+                    pb = cloud_tiles.get((tx, ty))
+                    if pb is not None:
+                        Gdk.cairo_set_source_pixbuf(ctx, pb, xi * 256.0, yi * 256.0)
+                        ctx.paint_with_alpha(0.78)
+        else:
+            # Infrared / Water Vapor / True Color: SCREEN keeps clouds bright & lets land show through dark ocean
+            ctx.set_operator(cairo.OPERATOR_SCREEN)
+            for xi, tx in enumerate(self.X_RANGE):
+                for yi, ty in enumerate(self.Y_RANGE):
+                    pb = cloud_tiles.get((tx, ty))
+                    if pb is not None:
+                        Gdk.cairo_set_source_pixbuf(ctx, pb, xi * 256.0, yi * 256.0)
+                        ctx.paint_with_alpha(0.95)
+        ctx.restore()
+
+        # Layer 3: Transparent map labels
+        for xi, tx in enumerate(self.X_RANGE):
+            for yi, ty in enumerate(self.Y_RANGE):
+                pb = self._label_tiles.get((tx, ty))
+                if pb is not None:
+                    Gdk.cairo_set_source_pixbuf(ctx, pb, xi * 256.0, yi * 256.0)
+                    ctx.paint_with_alpha(0.85)
+
+        # Layer 4: Crisp city reference pins (Taipei, Tokyo, Manila)
+        ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        ctx.set_font_size(12.0)
+        for name, lat, lon, rgb in self.MARKERS:
+            px, py = self._latlon_to_px(lat, lon)
+            ctx.new_sub_path()
+            ctx.arc(px, py, 3.6, 0, 2 * math.pi)
+            ctx.set_source_rgba(rgb[0], rgb[1], rgb[2], 1.0)
+            ctx.fill_preserve()
+            ctx.set_source_rgba(0.0, 0.0, 0.0, 0.9)
+            ctx.set_line_width(1.2)
+            ctx.stroke()
+
+            tx_p = px + 6.0
+            ty_p = py + 4.0
+            ctx.set_source_rgba(0.0, 0.0, 0.0, 0.85)
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ctx.move_to(tx_p + dx, ty_p + dy)
+                ctx.show_text(name)
+            ctx.set_source_rgba(rgb[0], rgb[1], rgb[2], 1.0)
+            ctx.move_to(tx_p, ty_p)
+            ctx.show_text(name)
+
+        return surf
+
+    def load_frames_async(self, force=False):
+        self._load_gen += 1
+        gen = self._load_gen
+        band = self._band
+        self._loading = True
+        self._stop_anim()
+        self._frames = []
+        self.btn_reload.set_sensitive(False)
+        self.lbl_status.set_markup("<small><span foreground='#38bdf8'>⏳ 正在向日本氣象廳 (JMA Himawari-9) 取得最新西太平洋雲圖時間清單...</span></small>")
+        self.canvas.queue_draw()
+
+        coords = [(tx, ty) for ty in self.Y_RANGE for tx in self.X_RANGE]
+        need_base = not self._base_tiles
+        need_labels = not self._label_tiles
+
+        def _worker():
+            try:
+                raw_times = self._fetch_bytes(self.TIMES_URL, timeout=8.0)
+                t_list = json.loads(raw_times.decode("utf-8", errors="replace"))
+                if not t_list:
+                    raise RuntimeError("JMA 未回傳可用時間點")
+                # Pick last 10 frames spaced 30 min apart (step=3 of 10-min intervals = past 4.5 hours)
+                picked = t_list[-28::3][-10:]
+                if picked[-1] != t_list[-1]:
+                    picked[-1] = t_list[-1]
+            except Exception as exc:
+                def _fail():
+                    if gen != self._load_gen:
+                        return False
+                    self._loading = False
+                    self.btn_reload.set_sensitive(True)
+                    self.lbl_status.set_markup(
+                        f"<small><span foreground='#f87171'>❌ 載入衛星雲圖失敗：{html.escape(str(exc))}</span></small>"
+                    )
+                    return False
+
+                GLib.idle_add(_fail)
+                return
+
+            # Download base map & transparent labels once (in parallel)
+            base_raw = {}
+            label_raw = {}
+            if need_base or need_labels:
+                with ThreadPoolExecutor(max_workers=6) as ex:
+                    futs = []
+                    if need_base:
+                        for tx, ty in coords:
+                            futs.append(("b", tx, ty, ex.submit(self._fetch_bytes, self.BASE_URL.format(x=tx, y=ty), 6.0)))
+                    if need_labels:
+                        for tx, ty in coords:
+                            futs.append(("l", tx, ty, ex.submit(self._fetch_bytes, self.LABEL_URL.format(x=tx, y=ty), 6.0)))
+                    for kind, tx, ty, fut in futs:
+                        try:
+                            data = fut.result()
+                            if kind == "b":
+                                base_raw[(tx, ty)] = data
+                            else:
+                                label_raw[(tx, ty)] = data
+                        except Exception:
+                            pass
+
+            def _install_base():
+                if gen != self._load_gen:
+                    return False
+                for k, v in base_raw.items():
+                    pb = self._bytes_to_pixbuf(v)
+                    if pb is not None:
+                        self._base_tiles[k] = pb
+                for k, v in label_raw.items():
+                    pb = self._bytes_to_pixbuf(v)
+                    if pb is not None:
+                        self._label_tiles[k] = pb
+                return False
+
+            if base_raw or label_raw:
+                GLib.idle_add(_install_base)
+
+            total = len(picked)
+            tz_local = ZoneInfo("Asia/Taipei")
+            for idx, item in enumerate(picked):
+                if gen != self._load_gen:
+                    return
+                bt = item["basetime"]
+                vt = item["validtime"]
+                try:
+                    dt_utc = datetime.strptime(vt, "%Y%m%d%H%M%S").replace(tzinfo=ZoneInfo("UTC"))
+                    label_str = dt_utc.astimezone(tz_local).strftime("%m/%d %H:%M TST")
+                except Exception:
+                    label_str = vt
+
+                cloud_raw = {}
+                with ThreadPoolExecutor(max_workers=6) as ex:
+                    futs = [
+                        (tx, ty, ex.submit(self._fetch_bytes, self.TILE_URL.format(bt=bt, vt=vt, band=band, x=tx, y=ty), 7.0))
+                        for tx, ty in coords
+                    ]
+                    for tx, ty, fut in futs:
+                        try:
+                            cloud_raw[(tx, ty)] = fut.result()
+                        except Exception:
+                            pass
+
+                def _push_frame(c_raw=cloud_raw, lbl=label_str, i_num=idx + 1):
+                    if gen != self._load_gen:
+                        return False
+                    c_pbs = {}
+                    for k, v in c_raw.items():
+                        pb = self._bytes_to_pixbuf(v)
+                        if pb is not None:
+                            c_pbs[k] = pb
+                    if c_pbs:
+                        surf = self._compose_frame_surface(c_pbs, band)
+                        self._frames.append({"label": lbl, "surface": surf})
+                        self._cur_idx = len(self._frames) - 1
+                        self._sync_ui_to_frame()
+                    if i_num < total:
+                        self.lbl_status.set_markup(
+                            f"<small><span foreground='#38bdf8'>⏳ 正在載入西太平洋衛星雲圖 ({i_num}/{total})...</span></small>"
+                        )
+                    else:
+                        self._loading = False
+                        self._last_loaded_ts = datetime.now()
+                        self.btn_reload.set_sensitive(True)
+                        self.lbl_status.set_markup(
+                            "<small><span foreground='#94a3b8'>✔ 日本氣象廳 JMA 向日葵 9 號 (Himawari-9) · 過去 4.5 小時動態雲圖 (每 30 分鐘一幀)</span></small>"
+                        )
+                        if self._playing and len(self._frames) >= 2:
+                            self._schedule_next_frame(900)
+                    return False
+
+                GLib.idle_add(_push_frame)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_draw(self, widget, ctx):
+        alloc = widget.get_allocation()
+        w, h = float(alloc.width), float(alloc.height)
+        draw_rounded_rect(ctx, 0.0, 0.0, w, h, 8.0)
+        ctx.set_source_rgb(0.06, 0.09, 0.14)
+        ctx.fill()
+
+        if not self._frames:
+            ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(14.0)
+            msg = "🛰️ 正在載入西太平洋即時衛星雲圖..." if self._loading else "點選上方「🔄 更新」載入西太平洋衛星雲圖"
+            ext = ctx.text_extents(msg)
+            ctx.set_source_rgba(0.70, 0.78, 0.88, 0.90)
+            ctx.move_to((w - ext.width) / 2.0 - ext.x_bearing, (h - ext.height) / 2.0 - ext.y_bearing)
+            ctx.show_text(msg)
+            return False
+
+        idx = max(0, min(self._cur_idx, len(self._frames) - 1))
+        fr = self._frames[idx]
+        surf = fr["surface"]
+        scale = min(w / float(self.IMG_W), h / float(self.IMG_H))
+        dw = self.IMG_W * scale
+        dh = self.IMG_H * scale
+        ox = (w - dw) / 2.0
+        oy = (h - dh) / 2.0
+
+        ctx.save()
+        draw_rounded_rect(ctx, ox, oy, dw, dh, 6.0)
+        ctx.clip()
+        ctx.translate(ox, oy)
+        ctx.scale(scale, scale)
+        ctx.set_source_surface(surf, 0.0, 0.0)
+        ctx.paint()
+        ctx.restore()
+
+        # Subtle timestamp overlay badge in bottom-left of image
+        lbl_txt = f"Himawari-9 · {fr['label']}"
+        ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        ctx.set_font_size(11.5)
+        ext = ctx.text_extents(lbl_txt)
+        bx = ox + 8.0
+        by = oy + dh - ext.height - 14.0
+        bw = ext.width + 14.0
+        bh = ext.height + 8.0
+        draw_rounded_rect(ctx, bx, by, bw, bh, 4.0)
+        ctx.set_source_rgba(0.05, 0.08, 0.13, 0.78)
+        ctx.fill()
+        ctx.set_source_rgba(0.92, 0.96, 1.0, 0.96)
+        ctx.move_to(bx + 7.0 - ext.x_bearing, by + 4.0 - ext.y_bearing)
+        ctx.show_text(lbl_txt)
+        return False
+
+
+# =============================================================================
 # 2. Interactive Weather Calendar & Detailed Forecast Dashboard Window
 # =============================================================================
 
@@ -1180,6 +1653,8 @@ class ClockWeatherPopupWindow(Gtk.Window):
         self._build_ui()
 
     def _hide_popup(self):
+        if hasattr(self, "sat_view") and self.sat_view is not None:
+            self.sat_view.deactivate()
         self.hide()
 
     def _on_delete_hide(self, *_args):
@@ -1193,11 +1668,25 @@ class ClockWeatherPopupWindow(Gtk.Window):
         return False
 
     def _build_ui(self):
+        outer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        outer_box.set_margin_top(6)
+        outer_box.set_margin_bottom(8)
+        outer_box.set_margin_start(8)
+        outer_box.set_margin_end(8)
+
+        self.main_notebook = Gtk.Notebook()
+        btn_close = Gtk.Button(label="✕ 關閉")
+        btn_close.set_tooltip_text("關閉視窗 (Esc)")
+        btn_close.connect("clicked", lambda *_: self._hide_popup())
+        btn_close.show()
+        self.main_notebook.set_action_widget(btn_close, Gtk.PackType.END)
+
+        # --- Tab 1: Weather Calendar & 7-Day Detailed Forecast ---
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        root.set_margin_top(10)
-        root.set_margin_bottom(10)
-        root.set_margin_start(12)
-        root.set_margin_end(12)
+        root.set_margin_top(8)
+        root.set_margin_bottom(6)
+        root.set_margin_start(8)
+        root.set_margin_end(8)
 
         # Top navigation bar
         nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -1211,15 +1700,10 @@ class ClockWeatherPopupWindow(Gtk.Window):
         self.month_lbl = Gtk.Label(xalign=0.0)
         self.month_lbl.set_margin_start(6)
 
-        btn_close = Gtk.Button(label="✕ 關閉")
-        btn_close.set_tooltip_text("關閉天氣月曆視窗 (Esc)")
-        btn_close.connect("clicked", lambda *_: self._hide_popup())
-
         nav.pack_start(btn_prev, False, False, 0)
         nav.pack_start(btn_today, False, False, 0)
         nav.pack_start(btn_next, False, False, 0)
         nav.pack_start(self.month_lbl, True, True, 0)
-        nav.pack_end(btn_close, False, False, 0)
         root.pack_start(nav, False, False, 0)
 
         # Main two-column split: Left = 7x6 Weather Calendar, Right = Selected Day Detailed Forecast
@@ -1267,8 +1751,30 @@ class ClockWeatherPopupWindow(Gtk.Window):
         footer_row.pack_end(self.btn_world_cities, False, False, 0)
         root.pack_start(footer_row, False, False, 0)
 
-        self.add(root)
+        self.main_notebook.append_page(root, Gtk.Label(label="📅 天氣月曆"))
+
+        # --- Tab 2: Western Pacific Animated Satellite Cloud Map (JMA Himawari-9) ---
+        self.sat_view = HimawariSatelliteView(self.parent_widget)
+        self.main_notebook.append_page(self.sat_view, Gtk.Label(label="🛰️ 西太平洋衛星雲圖"))
+        self.main_notebook.connect("switch-page", self._on_tab_switched)
+
+        outer_box.pack_start(self.main_notebook, True, True, 0)
+        self.add(outer_box)
         self.show_all()
+
+    def _on_tab_switched(self, _nb, _page, page_num):
+        if page_num == 1:
+            self.sat_view.activate()
+        else:
+            self.sat_view.deactivate()
+
+    def show_tab(self, page_index=0):
+        self.position_and_show()
+        self.main_notebook.set_current_page(int(page_index))
+        if int(page_index) == 1:
+            self.sat_view.activate()
+        else:
+            self.sat_view.deactivate()
 
     def _open_world_clock_popover(self, btn):
         pop = Gtk.Popover.new(btn)
@@ -2388,6 +2894,12 @@ class ClockWeatherWidget(Gtk.EventBox):
                 )
         return (0, 0, 1920, 1080)
 
+    def open_satellite_tab(self, *_args):
+        self.bubble_mgr.close_all()
+        if self.popup_win is None:
+            self.popup_win = ClockWeatherPopupWindow(self)
+        self.popup_win.show_tab(1)
+
     def toggle_popup_window(self, *_args):
         mode = self.config.get("detail_display_mode", "embedded")
         if mode == "custom_bubble":
@@ -3009,6 +3521,14 @@ def setup_applet_context_menu(applet, widget):
                 widget.toggle_popup_window,
             ),
             (
+                "OpenSatelliteAction",
+                Gtk.STOCK_NETWORK,
+                "西太平洋衛星雲圖 (_Satellite Cloud Map)",
+                None,
+                "開啟日本氣象廳向日葵 9 號西太平洋即時動態衛星雲圖",
+                widget.open_satellite_tab,
+            ),
+            (
                 "RefreshWeatherAction",
                 Gtk.STOCK_REFRESH,
                 "立即更新天氣 (_Refresh Weather)",
@@ -3071,6 +3591,7 @@ def setup_applet_context_menu(applet, widget):
 
     menu_xml = (
         '<menuitem name="OpenCalendar" action="OpenCalendarAction"/>'
+        '<menuitem name="OpenSatellite" action="OpenSatelliteAction"/>'
         '<menuitem name="ToggleBubbleMode" action="ToggleBubbleModeAction"/>'
         '<menuitem name="ToggleWeatherAlert" action="ToggleWeatherAlertAction"/>'
         '<menuitem name="RefreshWeather" action="RefreshWeatherAction"/>'
