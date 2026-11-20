@@ -117,6 +117,7 @@ DEFAULT_CONFIG = {
     "scan_modifier": "none",             # 劃詞觸發修飾鍵: "none", "ctrl", "alt", "shift"
     "google_translate_enabled": True,    # 句子/段落自動使用線上/本機翻譯 (雙向翻譯)
     "google_translate_fallback": True,   # 離線詞典查無短片語時自動 Fallback 至翻譯引擎
+    "translate_auto_copy": True,         # 翻譯引擎結果自動複製至系統剪貼簿 (可直接 Ctrl+V)
     "google_translate_target": "zh-TW",  # 外文翻譯目標語言 ("zh-TW", "zh-CN", "ja", "en")
     "google_translate_reverse": "en",    # 中文反向翻譯目標語言 ("en", "ja")
     "translate_engine": "gemini",        # "google", "gemini", "openai_compat", "deepl"
@@ -3022,6 +3023,15 @@ class DictCalcWidget(Gtk.EventBox):
                                     "definition": tr_txt,
                                 }
                             )
+                            if self.config.get("translate_auto_copy", True):
+                                tr_copy = tr_txt.strip()
+                                if tr_copy:
+                                    GLib.idle_add(
+                                        lambda s=seq, txt=tr_copy: (
+                                            self.copy_to_clipboard(txt) if s == self._query_seq else None,
+                                            False,
+                                        )[-1]
+                                    )
                         elif err_m:
                             items_out.append(
                                 {
@@ -3162,6 +3172,11 @@ class DictCalcWidget(Gtk.EventBox):
         if seq != self._query_seq:
             return False
 
+        copied_ok = False
+        if err is None and translated_text and translated_text.strip() and self.config.get("translate_auto_copy", True):
+            self.copy_to_clipboard(translated_text.strip())
+            copied_ok = True
+
         if use_dbus_tr:
             timeout_sec = int(self.config.get("dbus_popup_timeout_sec", 8))
             if err is not None or not translated_text:
@@ -3175,6 +3190,7 @@ class DictCalcWidget(Gtk.EventBox):
                 src_lbl = GoogleTranslator.lang_label(src_lang)
                 tgt_lbl = GoogleTranslator.lang_label(target_lang)
                 fb_tag = " · 自動切換" if is_fallback else ""
+                cp_tag = " · 已複製" if copied_ok else ""
                 short_orig = original_text.replace("\n", " ")
                 if len(short_orig) > 65:
                     short_orig = short_orig[:63] + "…"
@@ -3187,7 +3203,7 @@ class DictCalcWidget(Gtk.EventBox):
                     f"<small><span alpha='72%'><i>{html.escape(short_orig)}</i></span></small>"
                 )
                 self._notify_dbus(
-                    f"🌐 {engine_label} ({src_lbl} → {tgt_lbl}{fb_tag})",
+                    f"🌐 {engine_label} ({src_lbl} → {tgt_lbl}{fb_tag}{cp_tag})",
                     body,
                     icon="accessories-dictionary",
                     timeout_sec=timeout_sec,
@@ -3985,6 +4001,13 @@ class DictCalcWidget(Gtk.EventBox):
         chk_gt_fb.set_active(self.config.get("google_translate_fallback", True))
         tab_tr.pack_start(chk_gt_fb, False, False, 0)
 
+        chk_tr_auto_copy = Gtk.CheckButton(
+            label="📋 翻譯引擎結果自動存入系統剪貼簿 (可直接 Ctrl+V 貼上)"
+        )
+        chk_tr_auto_copy.set_margin_start(14)
+        chk_tr_auto_copy.set_active(self.config.get("translate_auto_copy", True))
+        tab_tr.pack_start(chk_tr_auto_copy, False, False, 0)
+
         gt_lang_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         gt_lang_box.set_margin_start(14)
         gt_lang_box.pack_start(Gtk.Label(label="外文翻譯目標：", xalign=0.0), False, False, 0)
@@ -4752,6 +4775,7 @@ class DictCalcWidget(Gtk.EventBox):
             self.config["calc_auto_copy"] = chk_auto_copy.get_active()
             self.config["google_translate_enabled"] = chk_gt_en.get_active()
             self.config["google_translate_fallback"] = chk_gt_fb.get_active()
+            self.config["translate_auto_copy"] = chk_tr_auto_copy.get_active()
             self.config["google_translate_target"] = combo_gt_tl.get_active_id() or "zh-TW"
             self.config["google_translate_reverse"] = combo_gt_rev.get_active_id() or "en"
             self.config["translate_engine"] = combo_tr_engine.get_active_id() or "google"
@@ -4993,6 +5017,7 @@ class DictCalcWidget(Gtk.EventBox):
             chk_auto_copy,
             chk_gt_en,
             chk_gt_fb,
+            chk_tr_auto_copy,
             chk_tr_fb_google,
             rb_badge,
             rb_entry,
