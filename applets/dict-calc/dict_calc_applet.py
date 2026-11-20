@@ -591,18 +591,88 @@ class GoogleTranslator:
                 last_err = f"Google 翻譯失敗：{exc}"
         return None, "auto", last_err or "Google 翻譯失敗"
 
-    def _translate_gemini(self, text, tl, api_key, model, timeout=12.0):
+    @classmethod
+    def list_gemini_models_sync(cls, api_key, timeout=8.0):
+        """Query Gemini `/v1beta/models` and return sorted text-capable models (newest flash-lite first)."""
+        api_key = (api_key or "").strip()
+        if not api_key:
+            return [], "請先輸入 Gemini API Key"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={urllib.parse.quote(api_key)}"
+        req = urllib.request.Request(url, headers={"User-Agent": "MatePanel-DictCalc/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError as exc:
+            return [], f"取得 Gemini 模型清單失敗 (HTTP {exc.code})"
+        except Exception as exc:
+            return [], f"取得 Gemini 模型清單失敗：{exc}"
+
+        skip_kw = ("image", "tts", "audio", "embedding", "aqa", "vision", "veo", "imagen", "robotics", "computer-use")
+        models = []
+        for m in data.get("models", []):
+            methods = m.get("supportedGenerationMethods") or []
+            if "generateContent" not in methods:
+                continue
+            raw_name = str(m.get("name", ""))
+            mid = raw_name.split("/", 1)[-1] if "/" in raw_name else raw_name
+            low = mid.lower()
+            if "gemini" not in low or any(k in low for k in skip_kw):
+                continue
+            models.append(mid)
+
+        def sort_key(mid):
+            low = mid.lower()
+            ver_m = re.search(r"gemini-(\d+)(?:\.(\d+))?", low)
+            ver = (int(ver_m.group(1)), int(ver_m.group(2) or 0)) if ver_m else (0, 0)
+            is_not_latest = 0 if low.endswith("-latest") else 1
+            is_flash_lite = 1 if "flash-lite" in low else 0
+            is_flash = 1 if "flash" in low else 0
+            is_stable = 0 if ("preview" in low or "exp" in low) else 1
+            return (is_not_latest, is_flash_lite, is_flash, is_stable, ver, mid)
+
+        models = sorted(set(models), key=sort_key, reverse=True)
+        return models, None
+
+    @classmethod
+    def list_openai_models_sync(cls, base_url, api_key, timeout=8.0):
+        """Query OpenAI-compatible `/models` endpoint (Groq / OpenRouter / Local Ollama)."""
+        base = (base_url or "https://api.groq.com/openai/v1").strip().rstrip("/")
+        if base.endswith("/chat/completions"):
+            base = base[:-len("/chat/completions")]
+        url = base + "/models"
+        is_local = ("127.0.0.1" in base) or ("localhost" in base)
+        api_key = (api_key or "").strip()
+        if not api_key and not is_local:
+            return [], "請先輸入 API Key（本機 Ollama 可留空）"
+        headers = {"User-Agent": "MatePanel-DictCalc/1.0"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError as exc:
+            return [], f"取得模型清單失敗 (HTTP {exc.code})"
+        except Exception as exc:
+            return [], f"取得模型清單失敗：{exc}"
+
+        skip_kw = ("whisper", "tts", "embed", "dall-e", "moderation", "guard", "audio", "speech")
+        items = data.get("data") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        models = []
+        for it in (items or []):
+            mid = str(it.get("id", "")) if isinstance(it, dict) else str(it)
+            if mid and not any(k in mid.lower() for k in skip_kw):
+                models.append(mid)
+        models = sorted(set(models))
+        return models, None
+
+    def _translate_gemini(self, text, tl, api_key, model, timeout=12.0, on_model_migrated=None):
         api_key = (api_key or "").strip()
         if not api_key:
             return None, "auto", "尚未設定 Gemini API Key"
         primary_model = (model or "gemini-3.1-flash-lite").strip()
-        # If an older/retired model (e.g. gemini-2.5-flash-lite) returns 404, auto-retry with gemini-3.1-flash-lite
-        models_to_try = [primary_model]
-        if primary_model != "gemini-3.1-flash-lite":
-            models_to_try.append("gemini-3.1-flash-lite")
 
-        last_err = None
-        for model_id in models_to_try:
+        def try_model(model_id):
             url = (
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
                 f"{urllib.parse.quote(model_id)}:generateContent?key={urllib.parse.quote(api_key)}"
@@ -630,8 +700,8 @@ class GoogleTranslator:
                     translated = "".join(str(p.get("text", "")) for p in parts).strip()
                     if translated:
                         src = "zh" if tl == "en" and any("\u4e00" <= c <= "\u9fff" for c in text) else "auto"
-                        return translated, src, None
-                last_err = "Gemini 未回傳譯文"
+                        return translated, src, None, 200
+                return None, "auto", "Gemini 未回傳譯文", 200
             except urllib.error.HTTPError as exc:
                 detail = ""
                 try:
@@ -639,17 +709,34 @@ class GoogleTranslator:
                     detail = str(err_j.get("error", {}).get("message", ""))[:120]
                 except Exception:
                     pass
-                last_err = f"Gemini HTTP 錯誤 ({exc.code})" + (f": {detail}" if detail else "")
-                if exc.code == 404 and model_id != "gemini-3.1-flash-lite":
-                    continue
-                break
+                return None, "auto", f"Gemini HTTP 錯誤 ({exc.code})" + (f": {detail}" if detail else ""), exc.code
             except urllib.error.URLError as exc:
-                last_err = f"Gemini 連線失敗：{exc.reason}"
-                break
+                return None, "auto", f"Gemini 連線失敗：{exc.reason}", 0
             except Exception as exc:
-                last_err = f"Gemini 錯誤：{exc}"
-                break
-        return None, "auto", last_err or "Gemini 翻譯失敗"
+                return None, "auto", f"Gemini 錯誤：{exc}", 0
+
+        tr, src, err, code = try_model(primary_model)
+        if err is None and tr:
+            return tr, src, None
+
+        # Self-healing on HTTP 404 (retired/deprecated model): dynamically discover latest available model
+        if code == 404:
+            avail, _ = self.list_gemini_models_sync(api_key, timeout=8.0)
+            candidates = [m for m in avail if m != primary_model][:3]
+            if not candidates and primary_model != "gemini-3.1-flash-lite":
+                candidates = ["gemini-3.1-flash-lite"]
+            for cand_id in candidates:
+                tr2, src2, err2, _code2 = try_model(cand_id)
+                if err2 is None and tr2:
+                    if on_model_migrated is not None:
+                        try:
+                            on_model_migrated(cand_id)
+                        except Exception:
+                            pass
+                    return tr2, src2, None
+                err = err2
+
+        return None, "auto", err or "Gemini 翻譯失敗"
 
     def _translate_openai_compat(self, text, tl, base_url, api_key, model, timeout=12.0):
         base = (base_url or "https://api.groq.com/openai/v1").strip().rstrip("/")
@@ -738,10 +825,10 @@ class GoogleTranslator:
         except Exception as exc:
             return None, "auto", f"DeepL 錯誤：{exc}"
 
-    def translate_sync(self, text, primary_tl="zh-TW", reverse_tl="en", config=None, timeout=8.0):
+    def translate_sync(self, text, primary_tl="zh-TW", reverse_tl="en", config=None, timeout=8.0, on_model_migrated=None):
         """
         Multi-engine synchronous translator (Google / Gemini / OpenAI-compat / DeepL)
-        with automatic fallback to Google Translate.
+        with automatic 404 model discovery and automatic fallback to Google Translate.
         Returns: (translated_text, detected_src_lang, target_lang, engine_label, error_msg)
         """
         cfg = config or {}
@@ -765,7 +852,12 @@ class GoogleTranslator:
         if engine == "gemini":
             eng_lbl = "Gemini"
             tr_text, src_lang, err = self._translate_gemini(
-                text, tl, cfg.get("gemini_api_key", ""), cfg.get("gemini_model", "gemini-3.1-flash-lite"), timeout=max(timeout, 12.0)
+                text,
+                tl,
+                cfg.get("gemini_api_key", ""),
+                cfg.get("gemini_model", "gemini-3.1-flash-lite"),
+                timeout=max(timeout, 12.0),
+                on_model_migrated=on_model_migrated,
             )
         elif engine == "openai_compat":
             base_u = cfg.get("openai_base_url", "https://api.groq.com/openai/v1")
@@ -2223,9 +2315,20 @@ class DictCalcWidget(Gtk.EventBox):
         reverse_tl = self.config.get("google_translate_reverse", "en")
         cfg_snapshot = dict(self.config)
 
+        def on_gemini_migrated(new_model_id):
+            def _save_new_model():
+                self.config["gemini_model"] = new_model_id
+                self._save_config()
+                return False
+            GLib.idle_add(_save_new_model)
+
         def tr_worker():
             translated, src_lang, tgt_lang, eng_lbl, err = self.translator.translate_sync(
-                text, primary_tl=primary_tl, reverse_tl=reverse_tl, config=cfg_snapshot
+                text,
+                primary_tl=primary_tl,
+                reverse_tl=reverse_tl,
+                config=cfg_snapshot,
+                on_model_migrated=on_gemini_migrated,
             )
             GLib.idle_add(
                 self._on_translate_done,
@@ -3072,13 +3175,24 @@ class DictCalcWidget(Gtk.EventBox):
         entry_gem_key.set_hexpand(True)
         entry_gem_key.set_placeholder_text("AIza...")
         entry_gem_key.set_text(self.config.get("gemini_api_key", ""))
-        entry_gem_model = Gtk.Entry()
-        entry_gem_model.set_hexpand(True)
-        entry_gem_model.set_text(self.config.get("gemini_model", "gemini-3.1-flash-lite"))
+        combo_gem_model = Gtk.ComboBoxText.new_with_entry()
+        combo_gem_model.set_hexpand(True)
+        entry_gem_model = combo_gem_model.get_child()
+        cur_gem_m = self.config.get("gemini_model", "gemini-3.1-flash-lite")
+        for m_opt in (cur_gem_m, "gemini-3.1-flash-lite", "gemini-3-flash-preview", "gemini-flash-lite-latest"):
+            if m_opt:
+                combo_gem_model.append_text(m_opt)
+        entry_gem_model.set_text(cur_gem_m)
+        btn_fetch_gem = Gtk.Button(label="🔄 載入模型")
+        btn_fetch_gem.set_tooltip_text("向 Gemini API 即時查詢您金鑰目前可用的文字模型清單")
+        gem_m_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        gem_m_box.set_hexpand(True)
+        gem_m_box.pack_start(combo_gem_model, True, True, 0)
+        gem_m_box.pack_start(btn_fetch_gem, False, False, 0)
         gem_grid.attach(Gtk.Label(label="API Key：", xalign=0.0), 0, 0, 1, 1)
         gem_grid.attach(entry_gem_key, 1, 0, 1, 1)
         gem_grid.attach(Gtk.Label(label="模型：", xalign=0.0), 0, 1, 1, 1)
-        gem_grid.attach(entry_gem_model, 1, 1, 1, 1)
+        gem_grid.attach(gem_m_box, 1, 1, 1, 1)
         gem_frame.add(gem_grid)
         tab_tr.pack_start(gem_frame, False, False, 0)
 
@@ -3109,15 +3223,26 @@ class DictCalcWidget(Gtk.EventBox):
         entry_oai_key.set_hexpand(True)
         entry_oai_key.set_placeholder_text("gsk_... (本機 Ollama 可留空)")
         entry_oai_key.set_text(self.config.get("openai_api_key", ""))
-        entry_oai_model = Gtk.Entry()
-        entry_oai_model.set_hexpand(True)
-        entry_oai_model.set_text(self.config.get("openai_model", "llama-3.3-70b-versatile"))
+        combo_oai_model = Gtk.ComboBoxText.new_with_entry()
+        combo_oai_model.set_hexpand(True)
+        entry_oai_model = combo_oai_model.get_child()
+        cur_oai_m = self.config.get("openai_model", "llama-3.3-70b-versatile")
+        for m_opt in (cur_oai_m, "llama-3.3-70b-versatile", "qwen/qwen3-32b", "qwen2.5:7b"):
+            if m_opt:
+                combo_oai_model.append_text(m_opt)
+        entry_oai_model.set_text(cur_oai_m)
+        btn_fetch_oai = Gtk.Button(label="🔄 載入模型")
+        btn_fetch_oai.set_tooltip_text("向此 OpenAI 相容端點即時查詢可用模型清單")
+        oai_m_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        oai_m_box.set_hexpand(True)
+        oai_m_box.pack_start(combo_oai_model, True, True, 0)
+        oai_m_box.pack_start(btn_fetch_oai, False, False, 0)
         oai_grid.attach(Gtk.Label(label="Base URL：", xalign=0.0), 0, 0, 1, 1)
         oai_grid.attach(entry_oai_url, 1, 0, 1, 1)
         oai_grid.attach(Gtk.Label(label="API Key：", xalign=0.0), 0, 1, 1, 1)
         oai_grid.attach(entry_oai_key, 1, 1, 1, 1)
         oai_grid.attach(Gtk.Label(label="模型：", xalign=0.0), 0, 2, 1, 1)
-        oai_grid.attach(entry_oai_model, 1, 2, 1, 1)
+        oai_grid.attach(oai_m_box, 1, 2, 1, 1)
         oai_vbox.pack_start(oai_grid, False, False, 0)
         oai_frame.add(oai_vbox)
         tab_tr.pack_start(oai_frame, False, False, 0)
@@ -3459,6 +3584,75 @@ class DictCalcWidget(Gtk.EventBox):
             entry_oai_key.set_visibility(vis)
             entry_dl_key.set_visibility(vis)
 
+        def on_fetch_gemini_models(*_):
+            apply_tab1()
+            key_s = entry_gem_key.get_text().strip()
+            btn_fetch_gem.set_sensitive(False)
+            lbl_tr_test_out.set_markup("<small>⏳ 正在向 Gemini API 查詢可用模型清單...</small>")
+
+            def _w():
+                models, err_m = GoogleTranslator.list_gemini_models_sync(key_s)
+
+                def _done():
+                    btn_fetch_gem.set_sensitive(True)
+                    if err_m or not models:
+                        lbl_tr_test_out.set_markup(
+                            f"<small><span foreground='#f87171'>❌ {html.escape(str(err_m or '查無可用模型'))}</span></small>"
+                        )
+                        return False
+                    cur_txt = entry_gem_model.get_text().strip()
+                    combo_gem_model.remove_all()
+                    for m_id in models:
+                        combo_gem_model.append_text(m_id)
+                    if cur_txt in models:
+                        entry_gem_model.set_text(cur_txt)
+                    else:
+                        entry_gem_model.set_text(models[0])
+                        apply_tab1()
+                    lbl_tr_test_out.set_markup(
+                        f"<small><span foreground='#34d399'>✔ 已載入 {len(models)} 個可用 Gemini 模型</span>（推薦：{html.escape(models[0])}）</small>"
+                    )
+                    return False
+
+                GLib.idle_add(_done)
+
+            threading.Thread(target=_w, daemon=True).start()
+
+        def on_fetch_oai_models(*_):
+            apply_tab1()
+            url_s = entry_oai_url.get_text().strip()
+            key_s = entry_oai_key.get_text().strip()
+            btn_fetch_oai.set_sensitive(False)
+            lbl_tr_test_out.set_markup("<small>⏳ 正在查詢 OpenAI 相容端點可用模型清單...</small>")
+
+            def _w():
+                models, err_m = GoogleTranslator.list_openai_models_sync(url_s, key_s)
+
+                def _done():
+                    btn_fetch_oai.set_sensitive(True)
+                    if err_m or not models:
+                        lbl_tr_test_out.set_markup(
+                            f"<small><span foreground='#f87171'>❌ {html.escape(str(err_m or '查無可用模型'))}</span></small>"
+                        )
+                        return False
+                    cur_txt = entry_oai_model.get_text().strip()
+                    combo_oai_model.remove_all()
+                    for m_id in models:
+                        combo_oai_model.append_text(m_id)
+                    if cur_txt in models:
+                        entry_oai_model.set_text(cur_txt)
+                    else:
+                        entry_oai_model.set_text(models[0])
+                        apply_tab1()
+                    lbl_tr_test_out.set_markup(
+                        f"<small><span foreground='#34d399'>✔ 已載入 {len(models)} 個可用模型</span>（下拉選單即可切換）</small>"
+                    )
+                    return False
+
+                GLib.idle_add(_done)
+
+            threading.Thread(target=_w, daemon=True).start()
+
         def on_test_translate_clicked(*_):
             apply_tab1()
             sample = entry_tr_test.get_text().strip() or "Hello world, how are you today?"
@@ -3468,9 +3662,17 @@ class DictCalcWidget(Gtk.EventBox):
             p_tl = cfg_snap.get("google_translate_target", "zh-TW")
             r_tl = cfg_snap.get("google_translate_reverse", "en")
 
+            def _on_mig(new_m):
+                def _upd():
+                    entry_gem_model.set_text(new_m)
+                    self.config["gemini_model"] = new_m
+                    self._save_config()
+                    return False
+                GLib.idle_add(_upd)
+
             def _t_worker():
                 tr_txt, src_l, tgt_l, eng_l, err_m = self.translator.translate_sync(
-                    sample, primary_tl=p_tl, reverse_tl=r_tl, config=cfg_snap
+                    sample, primary_tl=p_tl, reverse_tl=r_tl, config=cfg_snap, on_model_migrated=_on_mig
                 )
 
                 def _done():
@@ -3513,6 +3715,8 @@ class DictCalcWidget(Gtk.EventBox):
         btn_oai_ollama.connect("clicked", lambda *_: apply_oai_preset("http://127.0.0.1:11434/v1", "qwen2.5:7b"))
         btn_oai_or.connect("clicked", lambda *_: apply_oai_preset("https://openrouter.ai/api/v1", "google/gemma-3-27b-it:free"))
         chk_show_keys.connect("toggled", on_toggle_show_keys)
+        btn_fetch_gem.connect("clicked", on_fetch_gemini_models)
+        btn_fetch_oai.connect("clicked", on_fetch_oai_models)
         btn_tr_test.connect("clicked", on_test_translate_clicked)
         for ent_tr in (entry_gem_key, entry_gem_model, entry_oai_url, entry_oai_key, entry_oai_model, entry_dl_key):
             ent_tr.connect("changed", apply_tab1)
