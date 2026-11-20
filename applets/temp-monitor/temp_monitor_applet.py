@@ -964,11 +964,11 @@ class TempMonitorWidget(Gtk.EventBox):
 
         ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
         if hide_title:
-            # Scheme B: Ultra-large centered digits (no title, no ° symbol) with dynamic width clamp
-            val_size = max(10.0, bh * 0.74)
+            # Large centered temperature with ° symbol (no CPU/GPU header) + dynamic width clamp
+            val_size = max(10.0, bh * 0.64)
             ctx.set_font_size(val_size)
             v_ext = ctx.text_extents(val_str)
-            max_w = max(8.0, inner_w - 2.0)
+            max_w = max(8.0, inner_w - 2.5)
             if v_ext.width > max_w and v_ext.width > 0:
                 val_size *= max_w / v_ext.width
                 ctx.set_font_size(val_size)
@@ -1008,8 +1008,8 @@ class TempMonitorWidget(Gtk.EventBox):
 
         badges = []
 
-        # Scheme B: remove ° symbol and hide CPU/GPU titles for maximum temperature digit size
-        cpu_val_str = "OFF" if not enabled else ("--" if cpu_avg is None else f"{int(round(cpu_avg))}")
+        # Large centered temperature with ° symbol (CPU/GPU titles hidden, distinguished by badge colors)
+        cpu_val_str = "OFF" if not enabled else ("--°" if cpu_avg is None else f"{int(round(cpu_avg))}°")
         cpu_side_bars = None
         if layout == "compact":
             _, cl_border, _, _, cl_lvl = self._get_pct_colors(cpu_load, enabled, base_hue="cyan")
@@ -1031,7 +1031,7 @@ class TempMonitorWidget(Gtk.EventBox):
         )
         badges.append(("CPU", cpu_val_str, self._get_temp_colors(cpu_avg, enabled), cpu_side_bars, True, cpu_custom))
 
-        gpu_val_str = "OFF" if not enabled else ("--" if gpu_avg is None else f"{int(round(gpu_avg))}")
+        gpu_val_str = "OFF" if not enabled else ("--°" if gpu_avg is None else f"{int(round(gpu_avg))}°")
         gpu_side_bars = None
         if layout == "compact":
             _, u_border, _, _, u_lvl = self._get_pct_colors(gpu_util, enabled, base_hue="cyan")
