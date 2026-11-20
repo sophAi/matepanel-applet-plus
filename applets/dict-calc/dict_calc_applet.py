@@ -661,9 +661,9 @@ class DictCalcPopupWindow(Gtk.Window):
         fs = int(self.parent_widget.config.get("result_font_size", 11))
         self.tag_dict_hdr = buf.create_tag(
             "dict_hdr",
-            weight=700,
+            weight=800,
             foreground="#38bdf8",
-            size_points=fs + 1.5,
+            size_points=fs + 2.0,
             pixels_above_lines=8,
             pixels_below_lines=3,
         )
@@ -892,6 +892,11 @@ class DictCalcWidget(Gtk.EventBox):
 
         # 2. Pure Inline Panel Search/Calc Entry (click-to-type with request_focus + integrated icons & popup menu)
         self.panel_entry = Gtk.Entry()
+        self.panel_entry.set_name("dict-calc-panel-entry")
+        self.entry_css_provider = Gtk.CssProvider()
+        self.panel_entry.get_style_context().add_provider(
+            self.entry_css_provider, Gtk.STYLE_PROVIDER_PRIORITY_USER
+        )
         self.panel_entry.set_placeholder_text("查詞 / 算式...")
         self.panel_entry.set_icon_from_icon_name(
             Gtk.EntryIconPosition.PRIMARY, "edit-find-symbolic"
@@ -1112,12 +1117,59 @@ class DictCalcWidget(Gtk.EventBox):
             self.panel_entry.hide()
             self.canvas.show()
 
+    def _apply_entry_css(self):
+        """Apply badge_bg_style, custom_font_color, and text_shadow directly to the inline Gtk.Entry via GTK3 CSS."""
+        bg_style = self.config.get("badge_bg_style", "dark")
+        font_mode = self.config.get("font_color_mode", "dynamic")
+        custom_hex = self.config.get("custom_font_color", "#ffffff")
+        shadow_on = bool(self.config.get("text_shadow", False))
+
+        if bg_style == "dark":
+            bg_css = "background-color: rgba(24, 34, 52, 0.90); border: 1px solid rgba(72, 184, 250, 0.78);"
+            default_fg = "#f0f6ff"
+        elif bg_style == "light":
+            bg_css = "background-color: rgba(242, 245, 250, 0.92); border: 1px solid rgba(56, 130, 210, 0.78);"
+            default_fg = "#111827"
+        else:  # transparent
+            bg_css = "background-color: transparent; background-image: none; border: 1px solid rgba(72, 184, 250, 0.75); box-shadow: none;"
+            default_fg = "#ffffff"
+
+        fg_hex = custom_hex if font_mode == "custom" else default_fg
+        fg_rgb = hex_to_rgb(fg_hex, default=(1.0, 1.0, 1.0))
+        shadow_css = ""
+        if shadow_on:
+            sh_col = "rgba(0, 0, 0, 0.88)" if rgb_luminance(fg_rgb) > 0.45 else "rgba(255, 255, 255, 0.88)"
+            shadow_css = f"text-shadow: 0 0 2px {sh_col}, 1px 1px 1px {sh_col};"
+        else:
+            shadow_css = "text-shadow: none;"
+
+        css_str = (
+            f"#dict-calc-panel-entry {{\n"
+            f"  {bg_css}\n"
+            f"  color: {fg_hex};\n"
+            f"  caret-color: {fg_hex};\n"
+            f"  border-radius: 4px;\n"
+            f"  padding-top: 1px;\n"
+            f"  padding-bottom: 1px;\n"
+            f"  min-height: 0px;\n"
+            f"  {shadow_css}\n"
+            f"}}\n"
+            f"#dict-calc-panel-entry image {{\n"
+            f"  color: {fg_hex};\n"
+            f"}}\n"
+        )
+        try:
+            self.entry_css_provider.load_from_data(css_str.encode("utf-8"))
+        except Exception:
+            pass
+
     def _apply_panel_layout(self):
         h = max(24, self.panel_size)
         bw = max(34, int(h * 1.25))
         self.canvas.set_size_request(bw, h)
         entry_w = max(90, min(320, int(self.config.get("panel_entry_width", 170))))
         self.panel_entry.set_size_request(entry_w, max(20, h - 4))
+        self._apply_entry_css()
         self._sync_entry_visibility()
         self.canvas.queue_draw()
 
@@ -1283,15 +1335,17 @@ class DictCalcWidget(Gtk.EventBox):
                 # Format concise summary for D-Bus notification bubble (top 2 dictionaries, capped lines)
                 lines = []
                 for item in results[:2]:
-                    lines.append(f"【{item['dict']}】 {item['word']}")
-                    def_lines = [ln.strip() for ln in item["definition"].splitlines() if ln.strip()]
+                    d_esc = html.escape(item["dict"])
+                    w_esc = html.escape(item["word"])
+                    lines.append(f"<b>【{d_esc}】</b> <b>{w_esc}</b>")
+                    def_lines = [html.escape(ln.strip()) for ln in item["definition"].splitlines() if ln.strip()]
                     lines.extend(def_lines[:6])
                     lines.append("")
                 if len(results) > 2:
-                    lines.append(f"…（另有 {len(results) - 2} 套詞典命中）")
+                    lines.append(f"<i>…（另有 {len(results) - 2} 套詞典命中）</i>")
                 body = "\n".join(lines).strip()
-                if len(body) > 650:
-                    body = body[:647] + "…"
+                if len(body) > 750:
+                    body = body[:747] + "…"
                 self.dbus_notifier.show(
                     f"📖 {query_word}",
                     body,
