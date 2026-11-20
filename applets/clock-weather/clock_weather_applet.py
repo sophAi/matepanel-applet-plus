@@ -41,6 +41,14 @@ gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gdk, GdkPixbuf, GLib, GObject, Gtk
 import cairo
 
+_COMMON_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "common"))
+if _COMMON_DIR not in sys.path:
+    sys.path.insert(0, _COMMON_DIR)
+try:
+    from taskwarrior_shared import TaskwarriorCalendarPane
+except Exception:
+    TaskwarriorCalendarPane = None
+
 try:
     gi.require_version("MatePanelApplet", "4.0")
     from gi.repository import MatePanelApplet
@@ -1935,6 +1943,15 @@ class ClockWeatherPopupWindow(Gtk.Window):
         # --- Tab 2: Western Pacific Animated Satellite Cloud Map (JMA Himawari-9) ---
         self.sat_view = HimawariSatelliteView(self.parent_widget)
         self.main_notebook.append_page(self.sat_view, Gtk.Label(label="🛰️ 西太平洋衛星雲圖"))
+
+        # --- Tab 3: Shared Taskwarrior Calendar & Date Editor (No Pomodoro) ---
+        self.tw_pane = None
+        if TaskwarriorCalendarPane is not None:
+            self.tw_pane = TaskwarriorCalendarPane(
+                font_size_cb=lambda: self.parent_widget.config.get("calendar_font_size", 11)
+            )
+            self.main_notebook.append_page(self.tw_pane, Gtk.Label(label="✅ 待辦月曆"))
+
         self.main_notebook.connect("switch-page", self._on_tab_switched)
 
         outer_box.pack_start(self.main_notebook, True, True, 0)
@@ -1946,14 +1963,21 @@ class ClockWeatherPopupWindow(Gtk.Window):
             self.sat_view.activate()
         else:
             self.sat_view.deactivate()
+        if page_num == 2 and self.tw_pane is not None:
+            self.tw_pane.reload_tasks()
 
     def show_tab(self, page_index=0):
         self.position_and_show()
-        self.main_notebook.set_current_page(int(page_index))
-        if int(page_index) == 1:
+        idx = int(page_index)
+        if idx >= self.main_notebook.get_n_pages():
+            idx = 0
+        self.main_notebook.set_current_page(idx)
+        if idx == 1:
             self.sat_view.activate()
         else:
             self.sat_view.deactivate()
+        if idx == 2 and self.tw_pane is not None:
+            self.tw_pane.reload_tasks()
 
     def _open_world_clock_popover(self, btn):
         pop = Gtk.Popover.new(btn)
@@ -3079,6 +3103,12 @@ class ClockWeatherWidget(Gtk.EventBox):
             self.popup_win = ClockWeatherPopupWindow(self)
         self.popup_win.show_tab(1)
 
+    def open_taskwarrior_tab(self, *_args):
+        self.bubble_mgr.close_all()
+        if self.popup_win is None:
+            self.popup_win = ClockWeatherPopupWindow(self)
+        self.popup_win.show_tab(2)
+
     def toggle_popup_window(self, *_args):
         mode = self.config.get("detail_display_mode", "embedded")
         if mode == "custom_bubble":
@@ -3708,6 +3738,14 @@ def setup_applet_context_menu(applet, widget):
                 widget.open_satellite_tab,
             ),
             (
+                "OpenTaskCalendarAction",
+                Gtk.STOCK_EDIT,
+                "Taskwarrior 待辦月曆 (_Task Calendar)",
+                None,
+                "開啟精簡版 Taskwarrior 月曆與日期任務編輯分頁",
+                widget.open_taskwarrior_tab,
+            ),
+            (
                 "RefreshWeatherAction",
                 Gtk.STOCK_REFRESH,
                 "立即更新天氣 (_Refresh Weather)",
@@ -3771,6 +3809,7 @@ def setup_applet_context_menu(applet, widget):
     menu_xml = (
         '<menuitem name="OpenCalendar" action="OpenCalendarAction"/>'
         '<menuitem name="OpenSatellite" action="OpenSatelliteAction"/>'
+        '<menuitem name="OpenTaskCalendar" action="OpenTaskCalendarAction"/>'
         '<menuitem name="ToggleBubbleMode" action="ToggleBubbleModeAction"/>'
         '<menuitem name="ToggleWeatherAlert" action="ToggleWeatherAlertAction"/>'
         '<menuitem name="RefreshWeather" action="RefreshWeatherAction"/>'
