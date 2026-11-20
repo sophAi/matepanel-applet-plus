@@ -306,8 +306,12 @@ class CustomBubbleWindow(Gtk.Window):
         self.show_all()
 
     def start_timer(self, timeout_sec):
-        self._timeout_sec = max(1, int(timeout_sec))
         self._cancel_timer()
+        if timeout_sec is None or int(timeout_sec) <= 0:
+            # Pinned mode: never auto-dismiss (click bubble or press Esc to close)
+            self._timeout_sec = 0
+            return
+        self._timeout_sec = max(1, int(timeout_sec))
         self._timeout_id = GLib.timeout_add(self._timeout_sec * 1000, self._on_timeout)
 
     def _cancel_timer(self):
@@ -320,7 +324,7 @@ class CustomBubbleWindow(Gtk.Window):
 
     def _on_timeout(self):
         self._timeout_id = None
-        if not self._hovered:
+        if not self._hovered and self._timeout_sec > 0:
             self.dismiss()
         return False
 
@@ -331,7 +335,8 @@ class CustomBubbleWindow(Gtk.Window):
 
     def _on_leave(self, *_args):
         self._hovered = False
-        self.start_timer(max(2, min(self._timeout_sec, 4)))
+        if self._timeout_sec > 0:
+            self.start_timer(max(2, min(self._timeout_sec, 4)))
         return False
 
     def _on_click(self, *_args):
@@ -1738,6 +1743,8 @@ class DictCalcWidget(Gtk.EventBox):
         self.active_menu = None
         self._bound_hotkeys = []
         self._last_scanned_text = ""
+        self._last_bubble_items = []
+        self._last_result_was_bubble = False
         self._query_seq = 0
 
         # Container supporting both 'badge' mode and 'panel_entry' inline search box mode
@@ -2202,6 +2209,10 @@ class DictCalcWidget(Gtk.EventBox):
         mi_mode.connect("activate", lambda *_: self.toggle_result_output_mode())
         menu.prepend(mi_mode)
 
+        mi_last = Gtk.MenuItem(label="📌 顯示上次查詢結果 (不自動關閉)")
+        mi_last.connect("activate", lambda *_: self.show_last_query_result())
+        menu.prepend(mi_last)
+
         menu.show_all()
 
     def _on_panel_entry_activate(self, entry):
@@ -2239,7 +2250,10 @@ class DictCalcWidget(Gtk.EventBox):
         mon_bottom = min(geo.y + geo.height, wa.y + wa.height)
         return (mon_left, mon_top, mon_right, mon_bottom)
 
-    def _notify_dbus_batch(self, items, timeout_sec=None):
+    def _notify_dbus_batch(self, items, timeout_sec=None, record_last=True):
+        if record_last and items:
+            self._last_bubble_items = list(items)
+            self._last_result_was_bubble = True
         t_sec = int(self.config.get("dbus_popup_timeout_sec", 8)) if timeout_sec is None else int(timeout_sec)
         mon_bounds = self._get_active_monitor_bounds()
         return self.bubble_mgr.show_batch(
@@ -2255,8 +2269,25 @@ class DictCalcWidget(Gtk.EventBox):
             timeout_sec=t_sec,
         )
 
-    def _notify_dbus(self, summary, body, icon="accessories-dictionary", timeout_sec=None):
-        return self._notify_dbus_batch([(summary, body, icon)], timeout_sec=timeout_sec)
+    def _notify_dbus(self, summary, body, icon="accessories-dictionary", timeout_sec=None, record_last=True):
+        return self._notify_dbus_batch([(summary, body, icon)], timeout_sec=timeout_sec, record_last=record_last)
+
+    def show_last_query_result(self, *_args):
+        """Re-display the most recent query result pinned (no auto-dismiss countdown)."""
+        if self._last_result_was_bubble and self._last_bubble_items:
+            # timeout_sec=0 pins the bubble indefinitely until clicked or Esc pressed
+            self._notify_dbus_batch(self._last_bubble_items, timeout_sec=0, record_last=False)
+        elif self.popup_win is not None:
+            self.popup_win.position_and_show(near_pointer=False)
+        elif self._last_bubble_items:
+            self._notify_dbus_batch(self._last_bubble_items, timeout_sec=0, record_last=False)
+        else:
+            self._notify_dbus(
+                "📌 尚無上次查詢紀錄",
+                "請先查詢單字、句子或算式。",
+                timeout_sec=3,
+                record_last=False,
+            )
 
     def execute_query(self, raw_text, near_pointer=False, keep_panel_focus=False, source="panel"):
         """
@@ -2575,6 +2606,7 @@ class DictCalcWidget(Gtk.EventBox):
                     timeout_sec=timeout_sec,
                 )
         else:
+            self._last_result_was_bubble = False
             win = self._ensure_popup_window()
             win.show_translate_result(
                 original_text,
@@ -2688,6 +2720,7 @@ class DictCalcWidget(Gtk.EventBox):
                     timeout_sec=timeout_sec,
                 )
         else:
+            self._last_result_was_bubble = False
             win = self._ensure_popup_window()
             win.show_dict_results(query_word, results, near_pointer=near_pointer)
 
@@ -4068,6 +4101,14 @@ def setup_applet_context_menu(applet, widget):
     action_group.add_actions(
         [
             (
+                "ShowLastResultAction",
+                Gtk.STOCK_REVERT_TO_SAVED,
+                "顯示上次查詢結果 (不自動關閉) (_Last Result)",
+                None,
+                "重新顯示最近一次的查詢或翻譯結果，且不會自動倒數關閉",
+                widget.show_last_query_result,
+            ),
+            (
                 "ToggleOutputModeAction",
                 Gtk.STOCK_REFRESH,
                 "切換氣泡框 / 無焦點視窗顯示 (_Toggle Output Mode)",
@@ -4111,6 +4152,7 @@ def setup_applet_context_menu(applet, widget):
     )
 
     menu_xml = (
+        '<menuitem name="ShowLastResult" action="ShowLastResultAction"/>'
         '<menuitem name="ToggleOutputMode" action="ToggleOutputModeAction"/>'
         '<menuitem name="ScanNow" action="ScanNowAction"/>'
         '<menuitem name="ToggleScan" action="ToggleScanAction"/>'
