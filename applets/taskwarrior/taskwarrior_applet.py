@@ -79,6 +79,7 @@ DEFAULT_CONFIG = {
     "pomo_border_color": "#f43f5e",      # 番茄鐘方塊框線顏色
     "pomo_bg_opacity": 92,               # 番茄鐘方塊底色不透明度 (0..100%)
     "text_shadow": False,                # 文字高對比描邊陰影
+    "show_hover_tooltip": True,          # 滑鼠懸停圖示時顯示詳細資訊 (Tooltip)
     "completed_limit": 20,               # 下拉選單最近已完成任務顯示筆數
 }
 
@@ -1638,6 +1639,11 @@ class TaskwarriorWidget(Gtk.EventBox):
         if count > 5:
             lines.append(f"  <small>...及其他 {count - 5} 筆待辦任務</small>")
         lines.append("<small>左鍵: 月曆看板/選單 | 中鍵: 番茄鐘開始/暫停/繼續 | 右鍵: 選單與偏好設定</small>")
+        if not self.config.get("show_hover_tooltip", True):
+            self.set_tooltip_markup(None)
+            self.set_has_tooltip(False)
+            return
+        self.set_has_tooltip(True)
         self.set_tooltip_markup("\n".join(lines))
 
     def _resolve_panel_text_rgb(self, level, default_rgb):
@@ -2993,6 +2999,10 @@ class TaskwarriorWidget(Gtk.EventBox):
         chk_shadow.set_active(self.config.get("text_shadow", False))
         outer.pack_start(chk_shadow, False, False, 0)
 
+        chk_hover_tip = Gtk.CheckButton(label="滑鼠懸停面板圖示時顯示詳細資訊 (Tooltip)")
+        chk_hover_tip.set_active(self.config.get("show_hover_tooltip", True))
+        outer.pack_start(chk_hover_tip, False, False, 0)
+
         def rgba_to_hex(rgba):
             r = max(0, min(255, int(round(rgba.red * 255))))
             g = max(0, min(255, int(round(rgba.green * 255))))
@@ -3035,6 +3045,7 @@ class TaskwarriorWidget(Gtk.EventBox):
             else:
                 self.config["badge_bg_style"] = "transparent"
             self.config["text_shadow"] = chk_shadow.get_active()
+            self.config["show_hover_tooltip"] = chk_hover_tip.get_active()
             if self.pomo_phase == "idle":
                 self.pomo_total_sec = self.config["pomo_work_min"] * 60
                 self.pomo_remaining_sec = self.pomo_total_sec
@@ -3083,6 +3094,7 @@ class TaskwarriorWidget(Gtk.EventBox):
             rb_bg_light,
             rb_bg_trans,
             chk_shadow,
+            chk_hover_tip,
         ):
             w_ctrl.connect("toggled", apply_changes)
         for sp_ctrl in (

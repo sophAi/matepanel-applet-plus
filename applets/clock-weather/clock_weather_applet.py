@@ -74,6 +74,7 @@ DEFAULT_CONFIG = {
     "custom_font_color": "#ffffff",      # 自訂面板字形顏色
     "font_opacity": 100,                 # 面板文字不透明度 (10..100%)
     "text_shadow": False,                # 面板文字高對比描邊陰影
+    "show_hover_tooltip": True,          # 滑鼠懸停圖示時顯示詳細資訊 (Tooltip)
     "detail_display_mode": "embedded",   # "embedded" (完整視窗) | "custom_bubble" (精簡月曆 RGBA 氣泡框)
     "bubble_position": "top_right",      # top_left / top_center / top_right / center / bottom_left / bottom_right
     "bubble_offset_x": 0,                # 氣泡水平偏移 (px)
@@ -498,15 +499,23 @@ class CustomCalendarBubbleWindow(Gtk.Window):
         root.set_margin_start(12)
         root.set_margin_end(12)
 
-        # Compact Header Row (◀ 今天 ▶  YYYY年MM月 📍城市  ✕)
+        # Compact Header Row (◀ 今 ▶  YYYY年MM月 📍城市  ✕)
         nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        btn_prev = Gtk.Button(label="◀")
-        btn_today = Gtk.Button(label="今")
-        btn_next = Gtk.Button(label="▶")
-        btn_close = Gtk.Button(label="✕")
-        for b in (btn_prev, btn_today, btn_next, btn_close):
+
+        def _make_nav_btn(txt, tip):
+            b = Gtk.Button()
             b.set_relief(Gtk.ReliefStyle.NONE)
             b.set_can_focus(False)
+            b.set_tooltip_text(tip)
+            lb = Gtk.Label()
+            lb.set_markup(f"<span foreground='{html.escape(self._fg_hex)}'><b>{html.escape(txt)}</b></span>")
+            b.add(lb)
+            return b
+
+        btn_prev = _make_nav_btn("◀", "上個月")
+        btn_today = _make_nav_btn("今", "回到本月")
+        btn_next = _make_nav_btn("▶", "下個月")
+        btn_close = _make_nav_btn("✕", "關閉氣泡框")
         btn_prev.connect("clicked", lambda *_: self._shift_month(-1))
         btn_today.connect("clicked", lambda *_: self._jump_today())
         btn_next.connect("clicked", lambda *_: self._shift_month(1))
@@ -1852,6 +1861,11 @@ class ClockWeatherWidget(Gtk.EventBox):
             pm_bits.append(f"PM10：<b>{pm10:.1f}</b>")
         lines.append(f"• 空氣品質：{' · '.join(pm_bits)} μg/m³")
         lines.append(f"<small>更新：{html.escape(upd)} | 左鍵：開啟天氣月曆 | 中鍵：更新天氣 | 右鍵：設定</small>")
+        if not self.config.get("show_hover_tooltip", True):
+            self.set_tooltip_markup(None)
+            self.set_has_tooltip(False)
+            return
+        self.set_has_tooltip(True)
         self.set_tooltip_markup("\n".join(lines))
 
     def _draw_styled_text(self, ctx, x, y, text, rgb):
@@ -2284,6 +2298,9 @@ class ClockWeatherWidget(Gtk.EventBox):
         )
         pfs_row.pack_start(chk_panel_fs_auto, False, False, 0)
         pfs_row.pack_start(spin_panel_fs, False, False, 0)
+        chk_hover_tip = Gtk.CheckButton(label="懸停圖示顯示資訊")
+        chk_hover_tip.set_active(self.config.get("show_hover_tooltip", True))
+        pfs_row.pack_end(chk_hover_tip, False, False, 0)
         outer.pack_start(pfs_row, False, False, 0)
 
         # --- Tab 2: Calendar Mode & Custom RGBA Bubble Settings ---
@@ -2429,6 +2446,7 @@ class ClockWeatherWidget(Gtk.EventBox):
             self.config["font_opacity"] = fop_v
             lbl_font_op.set_text(f"{fop_v}%")
             self.config["text_shadow"] = chk_shadow.get_active()
+            self.config["show_hover_tooltip"] = chk_hover_tip.get_active()
             self.config["bubble_timeout_sec"] = int(spin_b_timeout.get_value_as_int())
             self.config["bubble_position"] = combo_b_pos.get_active_id() or "top_right"
             self.config["bubble_offset_x"] = int(spin_b_ox.get_value_as_int())
@@ -2553,7 +2571,7 @@ class ClockWeatherWidget(Gtk.EventBox):
             sp.connect("value-changed", apply_all)
         for w in (
             chk_w_icon, chk_w_temp, chk_aqi, chk_date, chk_wd, chk_24h,
-            chk_panel_fs_auto, chk_world, rb_fc_dyn, rb_fc_cus, chk_shadow,
+            chk_panel_fs_auto, chk_world, rb_fc_dyn, rb_fc_cus, chk_shadow, chk_hover_tip,
         ):
             w.connect("toggled", apply_all)
 

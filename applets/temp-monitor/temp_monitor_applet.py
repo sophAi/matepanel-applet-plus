@@ -66,6 +66,7 @@ DEFAULT_CONFIG = {
     "gpu_border_color": "#38bdf8",      # GPU 方塊框線顏色
     "gpu_bg_opacity": 92,               # GPU 方塊底色不透明度 (0..100%)
     "text_shadow": False,               # 為面板字形加上對比描邊陰影
+    "show_hover_tooltip": True,         # 滑鼠懸停圖示時顯示詳細資訊 (Tooltip)
     "show_other_sensors": True,         # 在選單中顯示 NVMe / 主機板 / 風扇等其他感測器
     "cpu_avg_cores_only": True,         # True: 僅平均實體核心 Core 0..N; False: 包含 Package id
     "warn_temp_c": 55.0,                # 中度負載溫度閾值 (°C)
@@ -835,6 +836,11 @@ class TempMonitorWidget(Gtk.EventBox):
             mem_str = "已關閉" if not enabled else "N/A"
 
         status_str = f"啟用中 (每 {interval} 秒更新)" if enabled else "已暫停監控"
+        if not self.config.get("show_hover_tooltip", True):
+            self.set_tooltip_markup(None)
+            self.set_has_tooltip(False)
+            return
+        self.set_has_tooltip(True)
         self.set_tooltip_markup(
             f"<b>CPU / GPU 溫度與負載監控 Plus</b>\n"
             f"• CPU 平均溫度: <b>{cpu_str}</b>\n"
@@ -1796,6 +1802,10 @@ class TempMonitorWidget(Gtk.EventBox):
         chk_shadow.set_active(self.config.get("text_shadow", False))
         outer.pack_start(chk_shadow, False, False, 0)
 
+        chk_hover_tip = Gtk.CheckButton(label="滑鼠懸停面板圖示時顯示詳細資訊 (Tooltip)")
+        chk_hover_tip.set_active(self.config.get("show_hover_tooltip", True))
+        outer.pack_start(chk_hover_tip, False, False, 0)
+
         outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
         # Section 5: Calculation & Thresholds
@@ -1904,6 +1914,7 @@ class TempMonitorWidget(Gtk.EventBox):
             else:
                 self.config["badge_bg_style"] = "transparent"
             self.config["text_shadow"] = chk_shadow.get_active()
+            self.config["show_hover_tooltip"] = chk_hover_tip.get_active()
             self.config["cpu_avg_cores_only"] = chk_cores_only.get_active()
             self.config["show_other_sensors"] = chk_other.get_active()
             self.config["warn_temp_c"] = float(spin_warn.get_value())
@@ -1961,6 +1972,7 @@ class TempMonitorWidget(Gtk.EventBox):
             rb_bg_light,
             rb_bg_trans,
             chk_shadow,
+            chk_hover_tip,
             chk_cores_only,
             chk_other,
         ):

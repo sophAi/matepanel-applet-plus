@@ -147,6 +147,7 @@ DEFAULT_CONFIG = {
     "badge_border_color": "#48b8fa",     # 自訂方塊/輸入框外框顏色
     "badge_bg_opacity": 90,              # 背景不透明度 (0=完全透明 ~ 100=完全不透明)
     "text_shadow": False,                # 面板文字描邊陰影
+    "show_hover_tooltip": True,          # 滑鼠懸停圖示時顯示詳細資訊 (Tooltip)
 }
 
 
@@ -3337,6 +3338,11 @@ class DictCalcWidget(Gtk.EventBox):
         return False
 
     def _update_tooltip(self):
+        if not self.config.get("show_hover_tooltip", True):
+            self.set_tooltip_markup(None)
+            self.set_has_tooltip(False)
+            return
+        self.set_has_tooltip(True)
         scan_on = self.config.get("scan_selection_enabled", False)
         mod_map = {"none": "純反白", "ctrl": "按住 Ctrl", "alt": "按住 Alt", "shift": "按住 Shift"}
         mod_txt = mod_map.get(self.config.get("scan_modifier", "ctrl"), "Ctrl")
@@ -3717,6 +3723,10 @@ class DictCalcWidget(Gtk.EventBox):
         chk_shadow = Gtk.CheckButton(label="啟用面板文字高對比描邊陰影")
         chk_shadow.set_active(self.config.get("text_shadow", False))
         tab1.pack_start(chk_shadow, False, False, 0)
+
+        chk_hover_tip = Gtk.CheckButton(label="滑鼠懸停面板圖示時顯示詳細資訊 (Tooltip)")
+        chk_hover_tip.set_active(self.config.get("show_hover_tooltip", True))
+        tab1.pack_start(chk_hover_tip, False, False, 0)
 
         tab1_scroll = Gtk.ScrolledWindow()
         tab1_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -4750,6 +4760,7 @@ class DictCalcWidget(Gtk.EventBox):
             self.config["badge_bg_opacity"] = bg_op
             lbl_bg_alpha.set_text(f"{bg_op}%")
             self.config["text_shadow"] = chk_shadow.get_active()
+            self.config["show_hover_tooltip"] = chk_hover_tip.get_active()
             self.config["vocab_record_enabled"] = chk_vocab_rec.get_active()
             self.config["vocab_epub_layout"] = combo_epub_layout.get_active_id() or "per_word"
             self._save_config()
@@ -4956,6 +4967,7 @@ class DictCalcWidget(Gtk.EventBox):
             rb_col_dyn,
             rb_col_cus,
             chk_shadow,
+            chk_hover_tip,
             chk_vocab_rec,
         ):
             w_c.connect("toggled", apply_tab1)
