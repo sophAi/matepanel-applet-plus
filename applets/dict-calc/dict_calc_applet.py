@@ -1262,24 +1262,28 @@ class StarDictManager:
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
 
-    def query_sync(self, word, dict_names=None, timeout=6.0):
+    def query_sync(self, word, dict_names=None, timeout=6.0, exact=True):
         """
-        Query StarDict via `sdcv -n -j`.
+        Query StarDict via `sdcv -n -j [-e]`.
+        Uses `--exact-search` (`-e`) by default so misspelled words do NOT flood with unrelated
+        fuzzy matches and instead cleanly trigger aspell spelling suggestions.
         Returns list of [{'dict': str, 'word': str, 'definition': str}]
         """
         w = word.strip()
         if not w:
             return []
-        cmd = [self.SDCV_BIN, "-n", "-j"]
-        custom_dir = os.path.expanduser(self.root_dir) if self.root_dir else ""
-        if custom_dir and os.path.isdir(custom_dir):
-            cmd.extend(["-2", custom_dir, "-x"])
-        if dict_names:
-            for dn in dict_names:
-                cmd.extend(["-u", dn])
-        cmd.append(w)
 
-        try:
+        def _run_sdcv(target_word):
+            cmd = [self.SDCV_BIN, "-n", "-j"]
+            if exact:
+                cmd.append("-e")
+            custom_dir = os.path.expanduser(self.root_dir) if self.root_dir else ""
+            if custom_dir and os.path.isdir(custom_dir):
+                cmd.extend(["-2", custom_dir, "-x"])
+            if dict_names:
+                for dn in dict_names:
+                    cmd.extend(["-u", dn])
+            cmd.append(target_word)
             proc = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -1291,7 +1295,6 @@ class StarDictManager:
             out = proc.stdout.strip()
             if not out:
                 return []
-            # sdcv -j outputs a JSON array (sometimes prefixed by non-JSON lines if warnings occur)
             idx_bracket = out.find("[")
             if idx_bracket < 0:
                 return []
@@ -1299,15 +1302,20 @@ class StarDictManager:
             results = []
             for it in items:
                 d_name = it.get("dict", "Unknown")
-                w_res = it.get("word", w)
+                w_res = it.get("word", target_word)
                 defn = self.clean_definition(it.get("definition", ""))
                 if defn:
                     results.append({"dict": d_name, "word": w_res, "definition": defn})
-            # Sort returned entries strictly according to user's dictionary priority order
             if dict_names:
                 order_map = {name: i for i, name in enumerate(dict_names)}
                 results.sort(key=lambda r: order_map.get(r["dict"], 999999))
             return results
+
+        try:
+            res = _run_sdcv(w)
+            if not res and w != w.lower():
+                res = _run_sdcv(w.lower())
+            return res
         except Exception:
             return []
 
@@ -2276,22 +2284,13 @@ class DictCalcWidget(Gtk.EventBox):
         self.set_result_output_mode("window" if cur == "dbus_popup" else "dbus_popup")
 
     def _on_panel_entry_populate_popup(self, _entry, menu):
-        """Integrate Applet controls (Output mode switch, Scan Selection, Preferences) into Entry right-click menu."""
-        menu.prepend(Gtk.SeparatorMenuItem())
+        """Replace default Gtk.Entry context menu items (Cut/Copy/Paste/Delete/Emoji) with clean Applet controls."""
+        for child in list(menu.get_children()):
+            menu.remove(child)
 
-        mi_prefs = Gtk.MenuItem(label="⚙️ 偏好設定與詞典順位管理...")
-        mi_prefs.connect("activate", lambda *_: self.show_preferences_dialog())
-        menu.prepend(mi_prefs)
-
-        scan_on = self.config.get("scan_selection_enabled", False)
-        mi_scan_chk = Gtk.CheckMenuItem(label="✂ 啟用滑鼠劃詞查詢 (Scan Selection)")
-        mi_scan_chk.set_active(scan_on)
-        mi_scan_chk.connect("toggled", lambda w: self.set_scan_selection_enabled(w.get_active()))
-        menu.prepend(mi_scan_chk)
-
-        mi_scan_now = Gtk.MenuItem(label="🔎 立即查詢反白文字 (Scan Now)")
-        mi_scan_now.connect("activate", lambda *_: self.trigger_scan_selection_now())
-        menu.prepend(mi_scan_now)
+        mi_last = Gtk.MenuItem(label="📌 顯示上次查詢結果 (不自動關閉)")
+        mi_last.connect("activate", lambda *_: self.show_last_query_result())
+        menu.append(mi_last)
 
         is_bubble = self.config.get("result_output_mode", "window") == "dbus_popup"
         mi_mode = Gtk.MenuItem(
@@ -2300,11 +2299,25 @@ class DictCalcWidget(Gtk.EventBox):
             else "💬 切換為氣泡框顯示 (目前：無焦點視窗)"
         )
         mi_mode.connect("activate", lambda *_: self.toggle_result_output_mode())
-        menu.prepend(mi_mode)
+        menu.append(mi_mode)
 
-        mi_last = Gtk.MenuItem(label="📌 顯示上次查詢結果 (不自動關閉)")
-        mi_last.connect("activate", lambda *_: self.show_last_query_result())
-        menu.prepend(mi_last)
+        menu.append(Gtk.SeparatorMenuItem())
+
+        mi_scan_now = Gtk.MenuItem(label="🔎 立即查詢反白文字 (Scan Now)")
+        mi_scan_now.connect("activate", lambda *_: self.trigger_scan_selection_now())
+        menu.append(mi_scan_now)
+
+        scan_on = self.config.get("scan_selection_enabled", False)
+        mi_scan_chk = Gtk.CheckMenuItem(label="✂ 啟用滑鼠劃詞查詢 (Scan Selection)")
+        mi_scan_chk.set_active(scan_on)
+        mi_scan_chk.connect("toggled", lambda w: self.set_scan_selection_enabled(w.get_active()))
+        menu.append(mi_scan_chk)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        mi_prefs = Gtk.MenuItem(label="⚙️ 偏好設定與詞典順位管理...")
+        mi_prefs.connect("activate", lambda *_: self.show_preferences_dialog())
+        menu.append(mi_prefs)
 
         menu.show_all()
 
