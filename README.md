@@ -17,11 +17,20 @@ Custom MATE Panel Applets collection and development repository for Linux deskto
 
 ---
 
-## 2. Taskwarrior 任務管理 & 番茄鐘 Plus (`TaskwarriorApplet`)
+## 2. Taskwarrior 任務管理、番茄鐘 & 桌面嵌入式月曆 (`TaskwarriorApplet` / `taskwarrior_desktop_widget.py`)
 
-事件驅動（`Gio.FileMonitor` 監聽 `~/.task`）的 MATE 面板 Taskwarrior 任務管理與番茄鐘倒數小程式：
-- **雙欄式互動月曆任務看板**：左側 7×6 彩色月曆（含到期任務微縮標題與歷史已完成任務 `✓` 歸檔），右側當日任務與未排程待辦操作清單，支援偏好設定調整月曆字型大小。
-- **整合番茄鐘專注計時器**：支援 25 分鐘專注 / 5 分鐘休息與自訂循環次數，提供開始、暫停、繼續、重新計時、切換階段、桌面通知與面板大字體倒數圖示自動切換。
+事件驅動（`Gio.FileMonitor` 監聽 `~/.task`，`0.0%` 閒置 CPU）的 MATE 面板 Taskwarrior 任務管理、番茄鐘倒數小程式與桌面嵌入式月曆：
+- **雙欄式互動月曆任務看板**：左側 7×6 彩色月曆（含到期任務微縮標題與歷史已完成任務 `✓` 歸檔），右側當日任務與未排程待辦操作清單，支援偏好設定調整月曆字型大小與月曆紅頂風格 `TASK` 面板方塊。
+- **整合番茄鐘專注計時器與倒數提示音效**：
+  - 支援自訂專注工作時間（預設 25 分鐘）、中場休息時間（預設 5 分鐘）與循環次數，提供開始、暫停、繼續、重新計時、切換階段、桌面通知與面板大字體倒數圖示自動切換。
+  - **三段階段提示音效與音量控制**：專注完成、5 分鐘中場休息結束、全部循環完成皆會播放區分提示音效；偏好設定「🍅 番茄鐘」分頁內建音效開關、音量滑桿（`0%～100%`）與即時試聽按鈕。
+- **Taskwarrior 桌面嵌入式互動月曆（`taskwarrior_desktop_widget.py`）**：
+  - 無邊框 RGBA 透明視窗平貼於桌布上方、所有一般視窗下方（`keep_below` + `stick` + `skip_taskbar/pager`，相容 MATE + Compiz + Caja），與 Taskwarrior Applet／CLI 即時同步。
+  - **單一 7×6 月曆整合任務膠囊**：所有待辦與已完成任務直接顯示於日期格內；點擊任務膠囊即可直接編輯／完成／刪除，點擊日期空白處開啟當日清單與快速新增。
+  - **每筆任務獨立自訂顏色**：新增／編輯視窗提供 8 色快速色塊、`Gtk.ColorButton` 任意選色與 `↺ 自動` 重置（獨立儲存於 `~/.config/matepanel-applet-plus/task-colors.json`，不污染 Taskwarrior 資料庫，文字依背景亮度自動切換深淺高對比色）。
+  - **日期列 7 天天氣預報與今日 AQI 圓點**：直接共用 `ClockWeatherApplet` 的 `~/.config/matepanel-applet-plus/weather-cache.json`（零額外 API 請求），於日期格上方置中顯示桌面主題天氣圖示、高低溫、Cairo 向量水滴降雨機率與今日 US AQI 圓點。
+  - **一鍵收合為桌面小圖示**：點擊右上角 `—` 按鈕可隱藏主月曆並收合為 `58×58` 可拖曳 RGBA 迷你日曆圖示（附即時待辦數徽章），徹底釋放桌面空間操作檔案；單擊圖示立即還原原本位置與大小。
+  - **完整外觀自訂**：支援整體／日期格子透明度、字型大小、文字陰影，以及「今日背景／邊框」、「本月日期背景」、「非本月日期背景」獨立配色設定。
 
 ---
 
@@ -33,10 +42,11 @@ Custom MATE Panel Applets collection and development repository for Linux deskto
 - **極速離線 StarDict 查詢 (`sdcv -n -j -e`)**：
   - 支援自訂 StarDict 詞典根目錄（預設 `/usr/share/stardict/dic`）與一鍵重新掃描，單次查詢 1～8 套詞典僅 ~7 ms、零常駐索引記憶體。
   - **三情境獨立詞典管理**：在偏好設定「📚 詞典管理」中，分別針對 **🪟 無焦點查詢視窗**、**💬 氣泡框**、**✂ Scan Selection 劃詞** 獨立設定啟用詞典、拖曳／按鈕順位排序，並可將 **4 套線上翻譯引擎作為虛擬詞典** 混搭排入順位（離線詞典先即時顯示、線上翻譯並行漸進回填）。
-- **離線 `aspell` 單字拼寫建議 (~2.4 ms)**：
+- **離線 `aspell` 單字拼寫建議與字元差異上色 (~2.4 ms)**：
   - 輸入拼錯的單一英文單字時，使用 `sdcv -e` 精確比對並自動呼叫 `/usr/bin/aspell` 提示可能正確拼法，同時**停用線上翻譯引擎**避免覆蓋，並自動將第 1 順位建議單字填入面板輸入框（按 `Enter` 即可查詢）。
+  - 透過 `difflib.SequenceMatcher` 逐字元比對原字與建議拼法，於氣泡框與精簡結果視窗中以高對比粗體色（自動依底色亮度切換深／亮綠）醒目標示差異字母。
 - **多引擎雙向智慧翻譯（零外部套件依賴）**：
-  - 智慧分流：單字／短片語優先查離線 StarDict；句子／段落（最高 2,000 字元、支援多行）自動切換翻譯引擎並雙向翻譯（外文 → 繁體中文 / 中文 → 英文）。
+  - 智慧分流：單字／短片語優先查離線 StarDict；句子／段落（最高 2,000 字元、支援多行）自動切換翻譯引擎並雙向翻譯（外文 → 繁體中文 / 中文 → 英文），並支援**翻譯結果自動複製到系統剪貼簿（`Ctrl+V` 直接貼上）**。
   - 支援 **Google 翻譯（免 Key）**、**Gemini API Free（Google AI Studio，含 `HTTP 404` 自動探索最新模型自癒）**、**OpenAI 相容端點（Groq / OpenRouter / 本機 Ollama）**、**DeepL API Free/Pro**。
   - 偏好設定「🌐 翻譯引擎」內建 **🔄 載入可用模型下拉選單**、**🔔 立即測試翻譯** 與失敗自動降級備援回 Google 翻譯。
 - **自繪無焦點 RGBA 圓角氣泡框 & 無焦點結果視窗**：
@@ -56,11 +66,11 @@ Custom MATE Panel Applets collection and development repository for Linux deskto
 ## 4. 月曆、時鐘與天氣預報 Plus (`ClockWeatherApplet`)
 
 取代 MATE Panel 內建時鐘、月曆與天氣的小程式（零外部套件依賴、精準每分鐘重繪 `0.0%` 閒置 CPU）：
-- **桌面主題天氣圖示 + 簡潔時鐘**：自動採用當前桌面 GTK Icon Theme 天氣圖示（晴天、多雲、陰天、霧氣、陣雨、雷雨、降雪等），顯示即時溫度、日期／星期與 `HH:MM`（不顯示秒數），並支援自訂底色、外框色、背景透明度、字色與描邊陰影。
-- **7 天互動天氣月曆 + 點擊詳細預測（Open-Meteo 免 API Key）**：
-  - 預設城市為 **台北**（偏好設定內建台灣主要城市快選與全球城市搜尋）。
-  - 左側 7×6 月曆於「今日起往後一週」的日期格內直接嵌入桌面主題天氣圖示、高低溫與降雨機率；點選任一天即於右側 0ms 切換詳細預報（即時氣溫／體感／PM2.5／AQI、日出日落與每 3 小時逐時氣溫與降雨機率條）。
-  - 底部可選顯示多時區世界時鐘。
+- **桌面主題天氣圖示 + 簡潔時鐘**：自動採用當前桌面 GTK Icon Theme 天氣圖示（晴天、多雲、陰天、霧氣、陣雨、雷雨、降雪等），顯示即時溫度、日期／星期與 `HH:MM`（不顯示秒數），並支援無框線面板、字型大小／不透明度調整與天氣變化提醒氣泡。
+- **三合一無焦點 RGBA 彈出氣泡框**：
+  - **📅 天氣月曆（Open-Meteo 免 API Key）**：預設城市為 **台北**（內建台灣主要城市快選與全球城市搜尋）；左側 7×6 月曆於未來 7 天嵌入天氣圖示、高低溫、Cairo 向量水滴降雨機率與今日 AQI 色條，右側即時顯示詳細預報、每 3 小時逐時預測與可選世界時鐘。
+  - **🛰️ 衛星雲圖**：內建日本氣象廳向日葵九號（Himawari-9）西太平洋動態衛星雲圖（`SND/ETC` 色調強化等圖層），自動疊加高對比金黃色海岸線與本地快取。
+  - **✅ 待辦月曆**：與 `TaskwarriorApplet` 共用即時同步模組，於天氣氣泡框內直接檢視、新增、編輯與完成 Taskwarrior 待辦任務。
 
 ---
 
@@ -97,6 +107,11 @@ Custom MATE Panel Applets collection and development repository for Linux deskto
 ./install.sh reload temp    # 僅重載「CPU/GPU 溫度監控 Plus」
 ./install.sh reload task    # 僅重載「Taskwarrior 任務管理 Plus」
 
-# 4. 從系統 MATE Panel 移除註冊
+# 4. 安裝 / 重載 / 移除「Taskwarrior 桌面嵌入式互動月曆」（免 sudo）
+./install.sh install-desktop    # 建立開機自啟並立即啟動桌面月曆
+./install.sh reload-desktop     # 更新程式碼後重新啟動桌面月曆
+./install.sh uninstall-desktop  # 移除開機自啟並停止桌面月曆
+
+# 5. 從系統 MATE Panel 移除註冊
 ./install.sh uninstall
 ```

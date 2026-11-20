@@ -30,6 +30,7 @@ import html
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 
@@ -63,6 +64,8 @@ DEFAULT_CONFIG = {
     "pomo_break_min": 5,                 # 番茄鐘中場休息時間 (分鐘，預設 5)
     "pomo_cycles": 4,                    # 番茄鐘循環次數設定 (預設 4 個循環)
     "pomo_sync_task_start": True,        # 綁定任務啟動番茄鐘時同步執行 task start / stop
+    "pomo_sound_enabled": True,          # 番茄鐘專注 / 中場休息倒數完畢時播放提示音效
+    "pomo_sound_volume": 80,             # 番茄鐘提示音效音量 (0..100%)
     "left_click_action": "calendar",     # "calendar" (開啟雙欄月曆任務看板) or "menu" (開啟傳統下拉快速選單)
     "calendar_show_completed": True,     # 在月曆格子與右側清單中顯示歷史已完成任務 (依 end 完成日期對應)
     "calendar_font_size": 16,            # 月曆看板基準字型大小 (pt/px, 範圍 8..22)
@@ -94,12 +97,83 @@ DEFAULT_CONFIG = {
 }
 
 
-def send_desktop_notification(title, body, urgent=False):
-    """Send desktop notification via notify-send and system bell."""
+POMO_SOUND_DIRS = (
+    "/usr/share/sounds/freedesktop/stereo",
+    "/usr/share/sounds/ubuntu/stereo",
+)
+
+POMO_SOUND_CANDIDATES = {
+    "work_done": ("complete.oga", "bell.oga", "message.oga"),
+    "break_done": ("bell.oga", "message-new-instant.oga", "complete.oga"),
+    "all_done": ("alarm-clock-elapsed.oga", "complete.oga", "bell.oga"),
+}
+
+POMO_CANBERRA_EVENTS = {
+    "work_done": "complete",
+    "break_done": "bell",
+    "all_done": "alarm-clock-elapsed",
+}
+
+
+def _find_pomo_sound_file(kind):
+    candidates = POMO_SOUND_CANDIDATES.get(kind, POMO_SOUND_CANDIDATES["work_done"])
+    for d in POMO_SOUND_DIRS:
+        for fname in candidates:
+            p = os.path.join(d, fname)
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+def play_pomo_sound(kind="work_done", volume_pct=80):
+    """Play a non-blocking Pomodoro chime with adjustable volume (0..100%)."""
+    try:
+        vol = max(0, min(100, int(round(float(volume_pct)))))
+    except (TypeError, ValueError):
+        vol = 80
+    if vol <= 0:
+        return
+
+    sound_path = _find_pomo_sound_file(kind)
+    try:
+        if sound_path and shutil.which("paplay"):
+            pa_vol = int(round(65536 * (vol / 100.0)))
+            subprocess.Popen(
+                ["paplay", f"--volume={pa_vol}", sound_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
+        if sound_path and shutil.which("pw-play"):
+            subprocess.Popen(
+                ["pw-play", "--volume", f"{vol / 100.0:.2f}", sound_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
+        if shutil.which("canberra-gtk-play"):
+            ev = POMO_CANBERRA_EVENTS.get(kind, "complete")
+            subprocess.Popen(
+                ["canberra-gtk-play", "-i", ev],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
+    except Exception:
+        pass
     try:
         Gdk.beep()
     except Exception:
         pass
+
+
+def send_desktop_notification(title, body, urgent=False, beep=True):
+    """Send desktop notification via notify-send and optional system bell."""
+    if beep:
+        try:
+            Gdk.beep()
+        except Exception:
+            pass
     try:
         urg = "critical" if urgent else "normal"
         subprocess.Popen(
@@ -1208,31 +1282,42 @@ class TaskwarriorWidget(Gtk.EventBox):
         max_c = max(1, int(self.config.get("pomo_cycles", 4)))
         w_min = max(1, int(self.config.get("pomo_work_min", 25)))
         b_min = max(1, int(self.config.get("pomo_break_min", 5)))
+        sound_on = bool(self.config.get("pomo_sound_enabled", True))
+        sound_vol = max(0, min(100, int(self.config.get("pomo_sound_volume", 80))))
         t_note = f"（任務：{self.pomo_task_desc}）" if self.pomo_task_desc else ""
 
         if self.pomo_phase == "work":
-            # Work finished -> automatically start 5-minute Break!
+            # Work finished -> play chime & automatically start Break!
+            if sound_on:
+                play_pomo_sound("work_done", sound_vol)
             send_desktop_notification(
                 f"🍅 番茄鐘專注完成！(循環 {self.pomo_current_cycle}/{max_c})",
                 f"已完成 {w_min} 分鐘專注工作{t_note}。\n現在自動進入 {b_min} 分鐘中場休息倒數！",
                 urgent=False,
+                beep=not sound_on,
             )
             self.pomo_start_break()
         elif self.pomo_phase == "break":
-            # Break finished -> check if more cycles remain
+            # Break finished -> play chime & check if more cycles remain
             if self.pomo_current_cycle < max_c:
+                if sound_on:
+                    play_pomo_sound("break_done", sound_vol)
                 self.pomo_current_cycle += 1
                 send_desktop_notification(
                     f"☕ 休息結束！開始第 {self.pomo_current_cycle}/{max_c} 循環專注",
                     f"中場休息 {b_min} 分鐘結束，自動進入下一輪 {w_min} 分鐘專注工作{t_note}！",
                     urgent=False,
+                    beep=not sound_on,
                 )
                 self.pomo_start_work(reset_cycles=False)
             else:
+                if sound_on:
+                    play_pomo_sound("all_done", sound_vol)
                 send_desktop_notification(
                     f"🎉 恭喜完成全部 {max_c} 個番茄鐘循環！",
                     f"已完成設定的 {max_c} 輪番茄鐘專注與休息循環{t_note}！",
                     urgent=True,
+                    beep=not sound_on,
                 )
                 self.pomo_stop()
 
@@ -2672,6 +2757,39 @@ class TaskwarriorWidget(Gtk.EventBox):
         chk_pomo_sync.set_active(self.config.get("pomo_sync_task_start", True))
         tab_pomo.pack_start(chk_pomo_sync, False, False, 0)
 
+        chk_pomo_sound = Gtk.CheckButton(
+            label="🔔 專注工作與中場休息倒數完畢時播放提示音效"
+        )
+        chk_pomo_sound.set_margin_start(14)
+        chk_pomo_sound.set_active(self.config.get("pomo_sound_enabled", True))
+        tab_pomo.pack_start(chk_pomo_sound, False, False, 0)
+
+        pomo_vol_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        pomo_vol_box.set_margin_start(32)
+        pomo_vol_box.pack_start(Gtk.Label(label="提示音效音量：", xalign=0.0), False, False, 0)
+        pomo_vol_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 100.0, 5.0)
+        pomo_vol_scale.set_digits(0)
+        pomo_vol_scale.set_draw_value(False)
+        pomo_vol_scale.set_size_request(150, -1)
+        pomo_vol_init = max(0, min(100, int(self.config.get("pomo_sound_volume", 80))))
+        pomo_vol_scale.set_value(float(pomo_vol_init))
+        lbl_pomo_vol = Gtk.Label(label=f"{pomo_vol_init}%")
+        lbl_pomo_vol.set_width_chars(4)
+        btn_test_work_snd = Gtk.Button(label="🔊 試聽專注結束")
+        btn_test_work_snd.connect(
+            "clicked", lambda *_: play_pomo_sound("work_done", int(round(pomo_vol_scale.get_value())))
+        )
+        btn_test_brk_snd = Gtk.Button(label="🔔 試聽休息結束")
+        btn_test_brk_snd.connect(
+            "clicked", lambda *_: play_pomo_sound("break_done", int(round(pomo_vol_scale.get_value())))
+        )
+        pomo_vol_box.pack_start(pomo_vol_scale, True, True, 0)
+        pomo_vol_box.pack_start(lbl_pomo_vol, False, False, 0)
+        pomo_vol_box.pack_start(btn_test_work_snd, False, False, 0)
+        pomo_vol_box.pack_start(btn_test_brk_snd, False, False, 0)
+        pomo_vol_box.set_sensitive(chk_pomo_sound.get_active())
+        tab_pomo.pack_start(pomo_vol_box, False, False, 0)
+
         # Section 3: Panel Display Mode (Tab 1)
         sec1_lbl = Gtk.Label(xalign=0.0)
         sec1_lbl.set_markup("<b>2. 面板任務標題與到期警戒設定</b>")
@@ -2911,6 +3029,11 @@ class TaskwarriorWidget(Gtk.EventBox):
             self.config["pomo_break_min"] = max(1, int(spin_b_min.get_value_as_int()))
             self.config["pomo_cycles"] = max(1, int(spin_cycles.get_value_as_int()))
             self.config["pomo_sync_task_start"] = chk_pomo_sync.get_active()
+            self.config["pomo_sound_enabled"] = chk_pomo_sound.get_active()
+            p_vol = max(0, min(100, int(round(pomo_vol_scale.get_value()))))
+            self.config["pomo_sound_volume"] = p_vol
+            lbl_pomo_vol.set_text(f"{p_vol}%")
+            pomo_vol_box.set_sensitive(chk_pomo_sound.get_active())
             self.config["display_mode"] = "badge" if rb_badge.get_active() else "badge_text"
             self.config["max_title_chars"] = int(spin_maxc.get_value_as_int())
             self.config["due_soon_days"] = int(spin_duesoon.get_value_as_int())
@@ -2997,11 +3120,13 @@ class TaskwarriorWidget(Gtk.EventBox):
         )
 
         pomo_mode_combo.connect("changed", apply_changes)
+        pomo_vol_scale.connect("value-changed", apply_changes)
         for w_ctrl in (
             rb_lc_cal,
             rb_lc_menu,
             chk_cal_comp,
             chk_pomo_sync,
+            chk_pomo_sound,
             rb_badge,
             rb_text,
             chk_due_panel,

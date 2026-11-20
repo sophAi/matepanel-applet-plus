@@ -38,20 +38,40 @@ from taskwarrior_shared import TaskwarriorBackend
 
 CONFIG_DIR = os.path.expanduser("~/.config/matepanel-applet-plus")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "taskwarrior-desktop.json")
+TASK_COLORS_PATH = os.path.join(CONFIG_DIR, "task-colors.json")
+WEATHER_CACHE_PATH = os.path.join(CONFIG_DIR, "weather-cache.json")
+
+TASK_COLOR_PRESETS = [
+    ("#dc2626", "紅"),
+    ("#ea580c", "橘"),
+    ("#ca8a04", "黃"),
+    ("#16a34a", "綠"),
+    ("#0891b2", "青"),
+    ("#2563eb", "藍"),
+    ("#9333ea", "紫"),
+    ("#db2777", "粉"),
+]
 
 DEFAULT_CONFIG = {
     "x": 80,
     "y": 60,
     "width": 940,
     "height": 620,
+    "mini_x": None,
+    "mini_y": None,
     "locked": False,
     "bg_color": "#0f172a",
     "bg_opacity": 58,           # 0..100% 整體背景透明度
     "cell_opacity": 42,         # 0..100% 日期格子底色透明度
+    "today_bg_color": "#1a5c4d",        # 今日日期背景顏色
+    "today_border_color": "#38e0a6",    # 今日日期邊框顏色
+    "cur_month_bg_color": "#141f2e",    # 本月日期背景顏色
+    "other_month_bg_color": "#0d141f",  # 非本月日期背景顏色
     "fg_color": "#f1f5f9",      # 文字顏色
     "text_shadow": True,        # 透明背景時文字陰影增強可讀性
     "font_size": 11,            # 9..18
     "show_completed": True,     # 在日期格子內顯示已完成任務
+    "show_weather": True,       # 在日期列顯示 7 天天氣預報
     "due_soon_days": 3,
 }
 
@@ -74,6 +94,76 @@ def hex_to_rgb(hex_str, default=(0.06, 0.09, 0.16)):
         return default
 
 
+def rgb_luminance(rgb):
+    return 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+
+
+def aqi_to_rgb(aqi):
+    """Map US AQI value to RGB tuple matching clock_weather_applet.py."""
+    if aqi is None:
+        return None
+    try:
+        v = int(round(float(aqi)))
+    except (TypeError, ValueError):
+        return None
+    if v <= 50:
+        return hex_to_rgb("#34d399")
+    if v <= 100:
+        return hex_to_rgb("#fbbf24")
+    if v <= 150:
+        return hex_to_rgb("#fb923c")
+    if v <= 200:
+        return hex_to_rgb("#f87171")
+    return hex_to_rgb("#c084fc")
+
+
+def wmo_to_icon_name(code):
+    """Map WMO weather code (0..99) to standard freedesktop/MATE icon theme name."""
+    try:
+        c = int(code)
+    except (TypeError, ValueError):
+        return "weather-few-clouds"
+    if c == 0:
+        return "weather-clear"
+    if c in (1, 2):
+        return "weather-few-clouds"
+    if c == 3:
+        return "weather-overcast"
+    if c in (45, 48):
+        return "weather-fog"
+    if c in (51, 53, 55, 56, 57, 61, 80):
+        return "weather-showers-scattered"
+    if c in (63, 65, 66, 67, 81, 82):
+        return "weather-showers"
+    if c in (71, 73, 75, 77, 85, 86):
+        return "weather-snow"
+    if c in (95, 96, 99):
+        return "weather-storm"
+    return "weather-few-clouds"
+
+
+def draw_raindrop(ctx, cx, cy, size, shadow=True):
+    """Draw a crisp vector teardrop at center (cx, cy) with height `size` (no emoji font needed)."""
+    h = float(size)
+    w = h * 0.68
+    top_y = cy - h * 0.50
+    bot_y = cy + h * 0.50
+    mid_y = cy + h * 0.14
+    ctx.new_sub_path()
+    ctx.move_to(cx, top_y)
+    ctx.curve_to(cx + w * 0.55, mid_y - h * 0.12, cx + w * 0.55, bot_y, cx, bot_y)
+    ctx.curve_to(cx - w * 0.55, bot_y, cx - w * 0.55, mid_y - h * 0.12, cx, top_y)
+    ctx.close_path()
+    if shadow:
+        ctx.save()
+        ctx.set_source_rgba(0.0, 0.0, 0.0, 0.65)
+        ctx.set_line_width(1.4)
+        ctx.stroke_preserve()
+        ctx.restore()
+    ctx.set_source_rgba(0.44, 0.85, 1.0, 0.96)
+    ctx.fill()
+
+
 def draw_rounded_rect(ctx, x, y, w, h, r):
     r = min(r, w / 2.0, h / 2.0)
     ctx.new_sub_path()
@@ -82,6 +172,192 @@ def draw_rounded_rect(ctx, x, y, w, h, r):
     ctx.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
     ctx.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
     ctx.close_path()
+
+
+class MiniDesktopIconWindow(Gtk.Window):
+    """Compact 58x58 RGBA desktop icon shown when the main calendar is minimized."""
+
+    ICON_SIZE = 58
+
+    def __init__(self, parent_cal):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        self.parent_cal = parent_cal
+        self.set_title("Taskwarrior Desktop Icon")
+        self.set_decorated(False)
+        self.set_keep_below(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_resizable(False)
+        self.stick()
+        self.set_default_size(self.ICON_SIZE, self.ICON_SIZE)
+        self.set_size_request(self.ICON_SIZE, self.ICON_SIZE)
+
+        screen = self.get_screen()
+        if screen is not None:
+            visual = screen.get_rgba_visual()
+            if visual is not None and screen.is_composited():
+                self.set_visual(visual)
+        self.set_app_paintable(True)
+
+        self._press_root = None
+        self._win_origin = None
+        self._dragging = False
+
+        self.canvas = Gtk.DrawingArea()
+        self.canvas.set_size_request(self.ICON_SIZE, self.ICON_SIZE)
+        self.canvas.set_tooltip_text("點擊還原 Taskwarrior 桌面月曆（按住拖曳可移動，右鍵開啟選單）")
+        self.canvas.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+        )
+        self.canvas.connect("draw", self._on_draw)
+        self.canvas.connect("button-press-event", self._on_press)
+        self.canvas.connect("motion-notify-event", self._on_motion)
+        self.canvas.connect("button-release-event", self._on_release)
+        self.add(self.canvas)
+
+    def _assert_desktop_layer(self):
+        self.set_keep_below(True)
+        self.stick()
+        return False
+
+    def _on_press(self, _w, event):
+        if event.button == 1:
+            self._press_root = (float(event.x_root), float(event.y_root))
+            self._win_origin = self.get_position()
+            self._dragging = False
+            return True
+        if event.button == 3:
+            menu = Gtk.Menu()
+            items = [
+                ("📅 還原完整桌面月曆", self.parent_cal.restore_from_mini),
+                ("＋ 新增任務...", lambda *_: self.parent_cal._open_add_dialog(date.today())),
+                (None, None),
+                ("✕ 關閉桌面月曆", lambda *_: Gtk.main_quit()),
+            ]
+            for lbl, cb in items:
+                if lbl is None:
+                    menu.append(Gtk.SeparatorMenuItem())
+                else:
+                    mi = Gtk.MenuItem(label=lbl)
+                    mi.connect("activate", cb)
+                    menu.append(mi)
+            menu.show_all()
+            menu.popup_at_pointer(event)
+            return True
+        return False
+
+    def _on_motion(self, _w, event):
+        if self._press_root is None or self._win_origin is None:
+            return False
+        if not (event.state & Gdk.ModifierType.BUTTON1_MASK):
+            return False
+        dx = float(event.x_root) - self._press_root[0]
+        dy = float(event.y_root) - self._press_root[1]
+        if not self._dragging and math.hypot(dx, dy) > 5.0:
+            self._dragging = True
+        if self._dragging:
+            self.move(int(round(self._win_origin[0] + dx)), int(round(self._win_origin[1] + dy)))
+        return True
+
+    def _on_release(self, _w, event):
+        if event.button != 1 or self._press_root is None:
+            return False
+        was_drag = self._dragging
+        self._press_root = None
+        self._win_origin = None
+        self._dragging = False
+        if was_drag:
+            px, py = self.get_position()
+            self.parent_cal.config["mini_x"] = int(px)
+            self.parent_cal.config["mini_y"] = int(py)
+            self.parent_cal._save_config()
+        else:
+            self.parent_cal.restore_from_mini()
+        return True
+
+    def _on_draw(self, _widget, ctx):
+        w = float(self.ICON_SIZE)
+        h = float(self.ICON_SIZE)
+        ctx.save()
+        ctx.set_operator(cairo.OPERATOR_SOURCE)
+        ctx.set_source_rgba(0.0, 0.0, 0.0, 0.0)
+        ctx.paint()
+        ctx.set_operator(cairo.OPERATOR_OVER)
+
+        # Card geometry (leaves space for subtle shadow & top-right pending badge)
+        cx, cy, cw, ch = 4.0, 6.0, w - 10.0, h - 10.0
+        hdr_h = 15.0
+
+        # Subtle drop shadow
+        draw_rounded_rect(ctx, cx + 1.0, cy + 2.0, cw, ch, 8.0)
+        ctx.set_source_rgba(0.0, 0.0, 0.0, 0.35)
+        ctx.fill()
+
+        # Calendar card body
+        draw_rounded_rect(ctx, cx, cy, cw, ch, 8.0)
+        ctx.set_source_rgba(0.11, 0.16, 0.24, 0.94)
+        ctx.fill()
+
+        # Calendar top red header strip (clipped to card rounded rect)
+        ctx.save()
+        draw_rounded_rect(ctx, cx, cy, cw, ch, 8.0)
+        ctx.clip()
+        ctx.rectangle(cx, cy, cw, hdr_h)
+        ctx.set_source_rgba(0.86, 0.15, 0.15, 0.98)
+        ctx.fill()
+        ctx.restore()
+
+        # Crisp card border using configured today_border_color
+        bd_rgb = hex_to_rgb(self.parent_cal.config.get("today_border_color", "#38e0a6"), default=(0.22, 0.88, 0.65))
+        draw_rounded_rect(ctx, cx, cy, cw, ch, 8.0)
+        ctx.set_source_rgba(bd_rgb[0], bd_rgb[1], bd_rgb[2], 0.92)
+        ctx.set_line_width(1.3)
+        ctx.stroke()
+
+        # Header text: month
+        today = date.today()
+        m_txt = f"{today.month}月"
+        ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        ctx.set_font_size(9.5)
+        m_ext = ctx.text_extents(m_txt)
+        ctx.set_source_rgba(1.0, 1.0, 1.0, 0.98)
+        ctx.move_to(cx + (cw - m_ext.width) / 2.0 - m_ext.x_bearing, cy + (hdr_h - m_ext.height) / 2.0 - m_ext.y_bearing)
+        ctx.show_text(m_txt)
+
+        # Body text: big today day number
+        d_txt = str(today.day)
+        ctx.set_font_size(20.0)
+        d_ext = ctx.text_extents(d_txt)
+        body_y = cy + hdr_h
+        body_h = ch - hdr_h
+        ctx.set_source_rgba(0.96, 0.98, 1.0, 0.98)
+        ctx.move_to(cx + (cw - d_ext.width) / 2.0 - d_ext.x_bearing, body_y + (body_h - d_ext.height) / 2.0 - d_ext.y_bearing)
+        ctx.show_text(d_txt)
+
+        # Top-right pending count badge
+        n_pending = len(self.parent_cal.pending_tasks)
+        if n_pending > 0:
+            b_txt = "99+" if n_pending > 99 else str(n_pending)
+            ctx.set_font_size(8.5)
+            b_ext = ctx.text_extents(b_txt)
+            bw = max(16.0, b_ext.width + 7.0)
+            bh = 15.0
+            bx = w - bw - 1.0
+            by = 1.0
+            draw_rounded_rect(ctx, bx, by, bw, bh, bh / 2.0)
+            ctx.set_source_rgba(0.06, 0.56, 0.88, 0.98)
+            ctx.fill_preserve()
+            ctx.set_source_rgba(1.0, 1.0, 1.0, 0.90)
+            ctx.set_line_width(1.0)
+            ctx.stroke()
+            ctx.set_source_rgba(1.0, 1.0, 1.0, 1.0)
+            ctx.move_to(bx + (bw - b_ext.width) / 2.0 - b_ext.x_bearing, by + (bh - b_ext.height) / 2.0 - b_ext.y_bearing)
+            ctx.show_text(b_txt)
+
+        ctx.restore()
+        return False
 
 
 class TaskwarriorDesktopCalendar(Gtk.Window):
@@ -100,6 +376,10 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         self.stick()
 
         self.config = self._load_config()
+        self.task_colors = self._load_task_colors()
+        self.weather_data = self._load_weather_cache()
+        self.icon_theme = Gtk.IconTheme.get_default()
+        self._icon_cache = {}
         self.prefs_win = None
 
         today = date.today()
@@ -117,7 +397,11 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
 
         self._file_monitor = None
         self._monitor_debounce_id = None
+        self._config_monitor = None
+        self._config_debounce_id = None
         self._geom_save_id = None
+        self._is_minimized = False
+        self.mini_win = None
 
         # Enable RGBA transparency
         screen = self.get_screen()
@@ -142,6 +426,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         self.move(x, y)
 
         self._start_file_monitor()
+        self._start_config_monitor()
         self.reload_tasks()
         self.show_all()
         # Re-assert desktop layer hints after map (Compiz friendly)
@@ -172,7 +457,55 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         except Exception:
             pass
 
+    def _load_task_colors(self):
+        if os.path.exists(TASK_COLORS_PATH):
+            try:
+                with open(TASK_COLORS_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return {str(k): str(v) for k, v in data.items() if isinstance(v, str) and v.startswith("#")}
+            except Exception:
+                pass
+        return {}
+
+    def _save_task_colors(self):
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(TASK_COLORS_PATH, "w", encoding="utf-8") as f:
+                json.dump(self.task_colors, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _load_weather_cache(self):
+        if os.path.exists(WEATHER_CACHE_PATH):
+            try:
+                with open(WEATHER_CACHE_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+        return {}
+
+    def _get_weather_pixbuf(self, icon_name, size):
+        key = (icon_name, int(size))
+        if key in self._icon_cache:
+            return self._icon_cache[key]
+        pb = None
+        if self.icon_theme is not None:
+            for name in (icon_name, "weather-few-clouds", "weather-overcast"):
+                try:
+                    pb = self.icon_theme.load_icon(name, int(size), Gtk.IconLookupFlags.FORCE_SIZE)
+                    if pb is not None:
+                        break
+                except Exception:
+                    pb = None
+        self._icon_cache[key] = pb
+        return pb
+
     def _on_configure(self, _w, event):
+        if self._is_minimized or not self.get_visible():
+            return False
         if self._geom_save_id is not None:
             try:
                 GLib.source_remove(self._geom_save_id)
@@ -181,6 +514,8 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
 
         def _commit():
             self._geom_save_id = None
+            if self._is_minimized or not self.get_visible():
+                return False
             px, py = self.get_position()
             pw, ph = self.get_size()
             self.config["x"] = int(px)
@@ -243,15 +578,19 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         self.btn_prefs = _make_btn("⚙", "外觀與位置設定")
         self.btn_prefs.connect("clicked", self.show_preferences_dialog)
 
+        self.btn_mini = _make_btn("—", "縮小為桌面小圖示（方便操作桌面檔案）")
+        self.btn_mini.connect("clicked", self.minimize_to_icon)
+
         self._nav_buttons = [
             self.btn_prev, self.btn_today, self.btn_next,
-            self.btn_unsched, self.btn_add, self.btn_undo, self.btn_lock, self.btn_prefs,
+            self.btn_unsched, self.btn_add, self.btn_undo, self.btn_lock, self.btn_prefs, self.btn_mini,
         ]
 
         nav.pack_start(self.btn_prev, False, False, 0)
         nav.pack_start(self.btn_today, False, False, 0)
         nav.pack_start(self.btn_next, False, False, 0)
         nav.pack_start(self.month_lbl, True, True, 0)
+        nav.pack_end(self.btn_mini, False, False, 0)
         nav.pack_end(self.btn_prefs, False, False, 0)
         nav.pack_end(self.btn_lock, False, False, 0)
         nav.pack_end(self.btn_undo, False, False, 0)
@@ -324,6 +663,34 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
     def _on_debounced_reload(self):
         self._monitor_debounce_id = None
         self.reload_tasks()
+        return False
+
+    def _start_config_monitor(self):
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            gfile = Gio.File.new_for_path(CONFIG_DIR)
+            mon = gfile.monitor_directory(Gio.FileMonitorFlags.NONE, None)
+            mon.connect("changed", self._on_config_dir_changed)
+            self._config_monitor = mon
+        except Exception:
+            self._config_monitor = None
+
+    def _on_config_dir_changed(self, _mon, f, _other, _ev_type):
+        bname = f.get_basename() if f is not None else ""
+        if bname not in ("weather-cache.json", "task-colors.json"):
+            return
+        if self._config_debounce_id is not None:
+            try:
+                GLib.source_remove(self._config_debounce_id)
+            except Exception:
+                pass
+        self._config_debounce_id = GLib.timeout_add(250, self._on_debounced_config_reload)
+
+    def _on_debounced_config_reload(self):
+        self._config_debounce_id = None
+        self.weather_data = self._load_weather_cache()
+        self.task_colors = self._load_task_colors()
+        self.cal_canvas.queue_draw()
         return False
 
     def reload_tasks(self):
@@ -400,6 +767,51 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         self._style_nav_labels()
         self.queue_draw()
         self.cal_canvas.queue_draw()
+        if self.mini_win is not None and self.mini_win.get_visible():
+            self.mini_win.canvas.queue_draw()
+
+    def minimize_to_icon(self, *_args):
+        if self._is_minimized:
+            return
+        px, py = self.get_position()
+        pw, ph = self.get_size()
+        self.config["x"] = int(px)
+        self.config["y"] = int(py)
+        self.config["width"] = int(pw)
+        self.config["height"] = int(ph)
+        self._save_config()
+
+        self._is_minimized = True
+        if self.mini_win is None:
+            self.mini_win = MiniDesktopIconWindow(self)
+
+        mx = self.config.get("mini_x")
+        my = self.config.get("mini_y")
+        if mx is None or my is None:
+            mx = max(0, int(px) + int(pw) - MiniDesktopIconWindow.ICON_SIZE)
+            my = max(0, int(py))
+
+        self.hide()
+        self.mini_win.move(int(mx), int(my))
+        self.mini_win.show_all()
+        self.mini_win.canvas.queue_draw()
+        GLib.idle_add(self.mini_win._assert_desktop_layer)
+
+    def restore_from_mini(self, *_args):
+        if not self._is_minimized:
+            return
+        if self.mini_win is not None:
+            self.mini_win.hide()
+        w = max(520, int(self.config.get("width", 940)))
+        h = max(380, int(self.config.get("height", 620)))
+        x = int(self.config.get("x", 80))
+        y = int(self.config.get("y", 60))
+        self._is_minimized = False
+        self.resize(w, h)
+        self.move(x, y)
+        self.show_all()
+        self._refresh_view()
+        GLib.idle_add(self._assert_desktop_layer)
 
     # =========================================================================
     # Cairo RGBA Drawing (Background + Full 7x6 Calendar with Inline Task Pills)
@@ -462,9 +874,17 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         alloc = widget.get_allocation()
         w, h = float(alloc.width), float(alloc.height)
         fg_rgb = hex_to_rgb(self.config.get("fg_color", "#f1f5f9"), default=(0.95, 0.96, 0.98))
+        today_bg_rgb = hex_to_rgb(self.config.get("today_bg_color", "#1a5c4d"), default=(0.10, 0.36, 0.30))
+        today_bd_rgb = hex_to_rgb(self.config.get("today_border_color", "#38e0a6"), default=(0.22, 0.88, 0.65))
+        cur_m_bg_rgb = hex_to_rgb(self.config.get("cur_month_bg_color", "#141f2e"), default=(0.08, 0.12, 0.18))
+        other_m_bg_rgb = hex_to_rgb(self.config.get("other_month_bg_color", "#0d141f"), default=(0.05, 0.08, 0.12))
         cell_a = max(0.0, min(1.0, float(self.config.get("cell_opacity", 42)) / 100.0))
         base_fs = float(max(9, min(18, int(self.config.get("font_size", 11)))))
         show_comp = bool(self.config.get("show_completed", True))
+        show_weather = bool(self.config.get("show_weather", True))
+        use_shadow = bool(self.config.get("text_shadow", True))
+        daily_map = (self.weather_data or {}).get("daily_by_date") or {}
+        today_aqi_rgb = aqi_to_rgb(((self.weather_data or {}).get("current") or {}).get("us_aqi"))
 
         header_h = max(24.0, base_fs * 2.1)
         grid_x = 2.0
@@ -510,22 +930,22 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
             # Date cell background
             draw_rounded_rect(ctx, cx, cy, cw, ch, 6.0)
             if is_today:
-                ctx.set_source_rgba(0.10, 0.36, 0.30, max(0.28, cell_a * 0.95))
+                ctx.set_source_rgba(today_bg_rgb[0], today_bg_rgb[1], today_bg_rgb[2], max(0.28, cell_a * 0.95))
             elif is_cur_m:
-                ctx.set_source_rgba(0.08, 0.12, 0.18, cell_a)
+                ctx.set_source_rgba(cur_m_bg_rgb[0], cur_m_bg_rgb[1], cur_m_bg_rgb[2], cell_a)
             else:
-                ctx.set_source_rgba(0.05, 0.08, 0.12, cell_a * 0.45)
+                ctx.set_source_rgba(other_m_bg_rgb[0], other_m_bg_rgb[1], other_m_bg_rgb[2], cell_a * 0.45)
             ctx.fill_preserve()
 
             if is_today:
-                ctx.set_source_rgba(0.22, 0.88, 0.65, 0.95)
+                ctx.set_source_rgba(today_bd_rgb[0], today_bd_rgb[1], today_bd_rgb[2], 0.95)
                 ctx.set_line_width(1.6)
             else:
                 ctx.set_source_rgba(fg_rgb[0], fg_rgb[1], fg_rgb[2], 0.16 if is_cur_m else 0.07)
                 ctx.set_line_width(0.8)
             ctx.stroke()
 
-            # Top row inside cell: Day number (left) + count badge (right)
+            # Top row inside cell: Day number (left) + 7-day weather (middle-right) + count badge (far right)
             ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
             ctx.set_font_size(base_fs)
             if is_today:
@@ -536,15 +956,131 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
                 d_rgb, d_a = (0.98, 0.60, 0.54), 0.96
             else:
                 d_rgb, d_a = fg_rgb, 0.95
-            self._draw_text(ctx, cx + 5.0, cy + base_fs + 2.5, str(d_obj.day), d_rgb, d_a)
+            day_txt = str(d_obj.day)
+            day_ext = ctx.text_extents(day_txt)
+            self._draw_text(ctx, cx + 5.0, cy + base_fs + 2.5, day_txt, d_rgb, d_a)
+            left_end = cx + 5.0 + max(day_ext.width, day_ext.x_advance) + 4.0
 
+            right_limit = cx + cw - 4.0
             total_items = len(p_list) + len(c_list)
             if total_items > 0:
                 cnt_s = str(len(p_list)) if p_list else f"✓{len(c_list)}"
                 ctx.set_font_size(max(8.0, base_fs - 2.0))
                 cext = ctx.text_extents(cnt_s)
                 c_rgb = (0.38, 0.80, 1.0) if p_list else (0.30, 0.84, 0.58)
-                self._draw_text(ctx, cx + cw - cext.width - 5.0 - cext.x_bearing, cy + base_fs + 2.0, cnt_s, c_rgb, 0.90)
+                cnt_x = cx + cw - cext.width - 5.0 - cext.x_bearing
+                self._draw_text(ctx, cnt_x, cy + base_fs + 2.0, cnt_s, c_rgb, 0.90)
+                right_limit = cnt_x - 4.0
+
+            # 7-day weather info beside day number (shared cache, adaptive to cell width)
+            if show_weather:
+                day_fc = daily_map.get(d_str)
+                if isinstance(day_fc, dict):
+                    avail_w = right_limit - left_end
+                    ico_sz = max(13, min(17, int(round(base_fs + 3.0))))
+                    if avail_w >= ico_sz:
+                        w_fs = max(7.5, base_fs - 2.5)
+                        ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+                        ctx.set_font_size(w_fs)
+
+                        tmax = day_fc.get("t_max")
+                        tmin = day_fc.get("t_min")
+                        temp_s = ""
+                        if tmax is not None and tmin is not None:
+                            temp_s = f"{int(round(float(tmax)))}°/{int(round(float(tmin)))}°"
+                        elif tmax is not None:
+                            temp_s = f"{int(round(float(tmax)))}°"
+                        temp_ext = ctx.text_extents(temp_s) if temp_s else None
+                        temp_w = (temp_ext.width + 2.0) if temp_ext else 0.0
+
+                        pop = day_fc.get("precip_prob")
+                        pop_s = f"{int(round(float(pop)))}%" if pop is not None else ""
+                        pop_ext = ctx.text_extents(pop_s) if pop_s else None
+                        drop_sz = max(7.0, w_fs * 0.95)
+                        drop_w = drop_sz * 0.72
+                        rain_w = (drop_w + 1.5 + pop_ext.width + 2.5) if pop_ext else 0.0
+
+                        ico_name = wmo_to_icon_name(day_fc.get("code"))
+                        pb = self._get_weather_pixbuf(ico_name, ico_sz)
+                        has_ico = pb is not None
+                        ico_w = float(ico_sz) if has_ico else 0.0
+
+                        has_aqi = is_today and (today_aqi_rgb is not None)
+                        aqi_r = max(3.2, min(4.6, base_fs * 0.34))
+                        aqi_w = (aqi_r * 2.0 + 3.0) if has_aqi else 0.0
+
+                        # Decide what fits cleanly: full (icon+temp+rain[+aqi]) -> icon+temp[+aqi] -> icon[+aqi]
+                        draw_rain = False
+                        draw_temp = False
+                        draw_aqi = False
+                        full_w = ico_w + (2.0 if has_ico and temp_s else 0.0) + temp_w + (2.0 if (has_ico or temp_s) and pop_s else 0.0) + rain_w
+                        mid_w = ico_w + (2.0 if has_ico and temp_s else 0.0) + temp_w
+                        if pop_s and temp_s and (full_w + aqi_w) <= avail_w:
+                            draw_temp = True
+                            draw_rain = True
+                            draw_aqi = has_aqi
+                            block_w = full_w + aqi_w
+                        elif pop_s and temp_s and full_w <= avail_w:
+                            draw_temp = True
+                            draw_rain = True
+                            block_w = full_w
+                        elif temp_s and (mid_w + aqi_w) <= avail_w:
+                            draw_temp = True
+                            draw_aqi = has_aqi
+                            block_w = mid_w + aqi_w
+                        elif temp_s and mid_w <= avail_w:
+                            draw_temp = True
+                            block_w = mid_w
+                        elif has_ico and (ico_w + aqi_w) <= avail_w:
+                            draw_aqi = has_aqi
+                            block_w = ico_w + aqi_w
+                        elif has_ico and ico_w <= avail_w:
+                            block_w = ico_w
+                        else:
+                            block_w = 0.0
+
+                        if block_w > 0.0:
+                            ideal_x = cx + (cw - block_w) / 2.0
+                            wx = max(left_end, min(right_limit - block_w, ideal_x))
+                            w_alpha = 0.94 if is_cur_m else 0.45
+                            top_mid_y = cy + (base_fs + 5.0) / 2.0
+                            text_base_y = cy + base_fs + 2.0
+
+                            if has_ico:
+                                ctx.save()
+                                Gdk.cairo_set_source_pixbuf(ctx, pb, wx, max(cy + 1.0, top_mid_y - ico_sz / 2.0))
+                                ctx.paint_with_alpha(w_alpha)
+                                ctx.restore()
+                                wx += ico_w + 2.0
+
+                            if draw_temp and temp_s:
+                                t_rgb = (0.98, 0.86, 0.54) if is_today else fg_rgb
+                                self._draw_text(ctx, wx - temp_ext.x_bearing, text_base_y, temp_s, t_rgb, w_alpha * 0.92)
+                                wx += temp_w + 2.0
+
+                            if draw_rain and pop_s:
+                                ctx.save()
+                                if not is_cur_m:
+                                    ctx.push_group()
+                                draw_raindrop(ctx, wx + drop_w * 0.5, top_mid_y + 0.5, drop_sz, shadow=use_shadow)
+                                if not is_cur_m:
+                                    ctx.pop_group_to_source()
+                                    ctx.paint_with_alpha(0.45)
+                                ctx.restore()
+                                wx += drop_w + 1.5
+                                self._draw_text(ctx, wx - pop_ext.x_bearing, text_base_y, pop_s, (0.50, 0.88, 1.0), w_alpha * 0.95)
+                                wx += pop_ext.width + 2.5
+
+                            if draw_aqi and today_aqi_rgb is not None:
+                                ctx.save()
+                                ctx.arc(wx + aqi_r, top_mid_y + 0.5, aqi_r, 0, 2 * math.pi)
+                                if use_shadow:
+                                    ctx.set_source_rgba(0.0, 0.0, 0.0, 0.65)
+                                    ctx.set_line_width(1.2)
+                                    ctx.stroke_preserve()
+                                ctx.set_source_rgba(today_aqi_rgb[0], today_aqi_rgb[1], today_aqi_rgb[2], 0.98)
+                                ctx.fill()
+                                ctx.restore()
 
             # Inline Task Pills directly inside the date cell!
             combined = [(t, False) for t in p_list] + [(t, True) for t in c_list]
@@ -566,7 +1102,20 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
             for t, is_comp in combined[:draw_slots]:
                 px = cx + 3.5
                 pw = cw - 7.0
-                if is_comp:
+                custom_hex = self.task_colors.get(t.get("uuid", ""))
+                txt_rgb = (1.0, 1.0, 1.0)
+                if custom_hex:
+                    cr, cg, cb = hex_to_rgb(custom_hex, default=(0.09, 0.45, 0.72))
+                    p_bg = (cr, cg, cb, 0.68 if is_comp else 0.90)
+                    if rgb_luminance((cr, cg, cb)) > 0.62:
+                        txt_rgb = (0.06, 0.08, 0.12)
+                    if is_comp:
+                        label_txt = "✓ " + str(t.get("description", ""))
+                    else:
+                        pri = t.get("priority", "")
+                        pri_pfx = f"[{pri}] " if pri else ""
+                        label_txt = pri_pfx + str(t.get("description", ""))
+                elif is_comp:
                     p_bg = (0.06, 0.44, 0.32, 0.72)
                     label_txt = "✓ " + str(t.get("description", ""))
                 else:
@@ -588,7 +1137,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
                 disp = self._truncate_text(ctx, label_txt, max(12.0, pw - 8.0))
                 ext = ctx.text_extents(disp)
                 ty = cur_y + (pill_h - ext.height) / 2.0 - ext.y_bearing
-                ctx.set_source_rgba(1.0, 1.0, 1.0, 0.78 if is_comp else 0.98)
+                ctx.set_source_rgba(txt_rgb[0], txt_rgb[1], txt_rgb[2], 0.80 if is_comp else 0.98)
                 ctx.move_to(px + 4.0 - ext.x_bearing, ty)
                 ctx.show_text(disp)
 
@@ -759,6 +1308,71 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         row.pack_end(btn_del, False, False, 0)
         return row
 
+    def _build_color_picker_row(self, initial_hex=""):
+        """Build a compact per-task color selector: 8 presets + Gtk.ColorButton + Auto reset."""
+        state = {"hex": initial_hex or ""}
+        outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+
+        preset_btns = []
+        cbtn = Gtk.ColorButton()
+        cbtn.set_tooltip_text("自訂任意顏色")
+
+        lbl_mode = Gtk.Label()
+        lbl_mode.set_width_chars(5)
+        lbl_mode.set_xalign(0.0)
+
+        def rgba_to_hex(rgba):
+            r = max(0, min(255, int(round(rgba.red * 255))))
+            g = max(0, min(255, int(round(rgba.green * 255))))
+            b = max(0, min(255, int(round(rgba.blue * 255))))
+            return f"#{r:02x}{g:02x}{b:02x}"
+
+        def refresh_visuals():
+            cur = (state["hex"] or "").lower()
+            for hx, btn in preset_btns:
+                is_sel = cur == hx.lower()
+                border = "2px solid #ffffff" if is_sel else "1px solid rgba(255,255,255,0.28)"
+                css = (
+                    f"button {{ background-image: none; background-color: {hx}; "
+                    f"border: {border}; border-radius: 4px; padding: 0; "
+                    f"min-width: 22px; min-height: 22px; }}"
+                )
+                prov = Gtk.CssProvider()
+                prov.load_from_data(css.encode("utf-8"))
+                btn.get_style_context().add_provider(prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            rgba = Gdk.RGBA()
+            if cur and rgba.parse(cur):
+                cbtn.set_rgba(rgba)
+                lbl_mode.set_markup(f"<span foreground='{cur}'><b>●</b></span> 自訂")
+            else:
+                rgba.parse("#2563eb")
+                cbtn.set_rgba(rgba)
+                lbl_mode.set_text("自動")
+
+        for hx, name in TASK_COLOR_PRESETS:
+            b = Gtk.Button()
+            b.set_tooltip_text(f"快速選色：{name} ({hx})")
+            b.set_size_request(22, 22)
+            b.connect("clicked", lambda _w, h=hx: (state.__setitem__("hex", h), refresh_visuals()))
+            preset_btns.append((hx, b))
+            outer.pack_start(b, False, False, 0)
+
+        def _on_color_set(_w):
+            state["hex"] = rgba_to_hex(cbtn.get_rgba())
+            refresh_visuals()
+
+        cbtn.connect("color-set", _on_color_set)
+        outer.pack_start(cbtn, False, False, 2)
+
+        btn_auto = Gtk.Button(label="↺ 自動")
+        btn_auto.set_tooltip_text("恢復依到期日與優先級自動上色")
+        btn_auto.connect("clicked", lambda *_: (state.__setitem__("hex", ""), refresh_visuals()))
+        outer.pack_start(btn_auto, False, False, 0)
+        outer.pack_start(lbl_mode, False, False, 2)
+
+        refresh_visuals()
+        return outer, (lambda: state["hex"])
+
     def _open_add_dialog(self, default_date):
         dlg = Gtk.Dialog(title="新增 Taskwarrior 任務", transient_for=None, flags=Gtk.DialogFlags.MODAL)
         dlg.set_position(Gtk.WindowPosition.CENTER)
@@ -789,9 +1403,17 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         e_due = Gtk.Entry()
         e_due.set_text(default_date.strftime("%Y-%m-%d"))
         e_due.set_placeholder_text("YYYY-MM-DD（留空不設到期日）")
+        color_row, get_color_hex = self._build_color_picker_row("")
 
         for ri, (lt, wc) in enumerate(
-            [("任務標題：", e_desc), ("專案：", e_proj), ("優先級：", c_pri), ("標籤：", e_tags), ("到期日：", e_due)]
+            [
+                ("任務標題：", e_desc),
+                ("專案：", e_proj),
+                ("優先級：", c_pri),
+                ("標籤：", e_tags),
+                ("到期日：", e_due),
+                ("標籤顏色：", color_row),
+            ]
         ):
             grid.attach(Gtk.Label(label=lt, xalign=0.0), 0, ri, 1, 1)
             grid.attach(wc, 1, ri, 1, 1)
@@ -801,7 +1423,9 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         e_desc.grab_focus()
         if dlg.run() == Gtk.ResponseType.OK:
             desc = e_desc.get_text().strip()
+            chosen_hex = get_color_hex()
             if desc:
+                before_uuids = {t.get("uuid", "") for t in self.pending_tasks if t.get("uuid")}
                 tags = [t.strip().lstrip("+") for t in e_tags.get_text().replace(",", " ").split() if t.strip()]
                 TaskwarriorBackend.add_task_structured(
                     description=desc,
@@ -811,6 +1435,22 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
                     due=e_due.get_text().strip(),
                 )
                 self.reload_tasks()
+                if chosen_hex:
+                    new_tasks = [t for t in self.pending_tasks if t.get("uuid") and t.get("uuid") not in before_uuids]
+                    target_uuid = ""
+                    if len(new_tasks) == 1:
+                        target_uuid = new_tasks[0].get("uuid", "")
+                    elif new_tasks:
+                        for nt in new_tasks:
+                            if str(nt.get("description", "")).strip() == desc:
+                                target_uuid = nt.get("uuid", "")
+                                break
+                        if not target_uuid:
+                            target_uuid = new_tasks[-1].get("uuid", "")
+                    if target_uuid:
+                        self.task_colors[target_uuid] = chosen_hex
+                        self._save_task_colors()
+                        self.cal_canvas.queue_draw()
         dlg.destroy()
 
     def _open_edit_dialog(self, task, is_completed=False):
@@ -832,6 +1472,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         area.set_margin_start(14)
         area.set_margin_end(14)
 
+        uuid_str = task.get("uuid", "")
         grid = Gtk.Grid(column_spacing=10, row_spacing=8)
         e_desc = Gtk.Entry()
         e_desc.set_hexpand(True)
@@ -854,18 +1495,33 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         e_due.set_text(str(task.get("_due_date") or ""))
         e_due.set_placeholder_text("YYYY-MM-DD（留空清除到期日）")
 
+        color_row, get_color_hex = self._build_color_picker_row(self.task_colors.get(uuid_str, ""))
+
         for ri, (lt, wc) in enumerate(
-            [("任務標題：", e_desc), ("專案：", e_proj), ("優先級：", c_pri), ("標籤：", e_tags), ("到期日：", e_due)]
+            [
+                ("任務標題：", e_desc),
+                ("專案：", e_proj),
+                ("優先級：", c_pri),
+                ("標籤：", e_tags),
+                ("到期日：", e_due),
+                ("標籤顏色：", color_row),
+            ]
         ):
             grid.attach(Gtk.Label(label=lt, xalign=0.0), 0, ri, 1, 1)
             grid.attach(wc, 1, ri, 1, 1)
 
         area.pack_start(grid, True, True, 0)
         dlg.show_all()
-        uuid_str = task.get("uuid", "")
         resp = dlg.run()
         if resp == Gtk.ResponseType.OK:
             desc = e_desc.get_text().strip()
+            chosen_hex = get_color_hex()
+            if uuid_str:
+                if chosen_hex:
+                    self.task_colors[uuid_str] = chosen_hex
+                else:
+                    self.task_colors.pop(uuid_str, None)
+                self._save_task_colors()
             if desc:
                 TaskwarriorBackend.modify_task_structured(
                     uuid_str=uuid_str,
@@ -876,7 +1532,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
                     due=e_due.get_text().strip(),
                     orig_tags=task.get("tags") or [],
                 )
-                self.reload_tasks()
+            self.reload_tasks()
         elif resp == RESP_DONE:
             if is_completed:
                 TaskwarriorBackend.restore_task(uuid_str)
@@ -884,6 +1540,9 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
                 TaskwarriorBackend.mark_done(uuid_str)
             self.reload_tasks()
         elif resp == RESP_DEL:
+            if uuid_str and uuid_str in self.task_colors:
+                self.task_colors.pop(uuid_str, None)
+                self._save_task_colors()
             TaskwarriorBackend.delete_task(uuid_str)
             self.reload_tasks()
         dlg.destroy()
@@ -901,6 +1560,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
             ("↩ 復原上一步 (Undo)", self._on_undo),
             (None, None),
             ("🔓 解鎖拖曳與縮放" if self.config.get("locked") else "🔒 鎖定桌面位置", self._on_toggle_lock),
+            ("— 縮小為桌面小圖示", self.minimize_to_icon),
             ("⚙ 外觀與位置設定...", self.show_preferences_dialog),
             (None, None),
             ("✕ 關閉桌面月曆", lambda *_: Gtk.main_quit()),
@@ -951,14 +1611,29 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
             b = max(0, min(255, int(round(rgba.blue * 255))))
             return f"#{r:02x}{g:02x}{b:02x}"
 
-        col_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        col_grid = Gtk.Grid(column_spacing=10, row_spacing=6)
         bg_btn = make_cbtn("bg_color", "#0f172a")
         fg_btn = make_cbtn("fg_color", "#f1f5f9")
-        col_row.pack_start(Gtk.Label(label="背景底色：", xalign=0.0), False, False, 0)
-        col_row.pack_start(bg_btn, False, False, 0)
-        col_row.pack_start(Gtk.Label(label="文字顏色：", xalign=0.0), False, False, 0)
-        col_row.pack_start(fg_btn, False, False, 0)
-        box.pack_start(col_row, False, False, 0)
+        today_bg_btn = make_cbtn("today_bg_color", "#1a5c4d")
+        today_bd_btn = make_cbtn("today_border_color", "#38e0a6")
+        cur_m_bg_btn = make_cbtn("cur_month_bg_color", "#141f2e")
+        other_m_bg_btn = make_cbtn("other_month_bg_color", "#0d141f")
+
+        col_grid.attach(Gtk.Label(label="整體背景底色：", xalign=0.0), 0, 0, 1, 1)
+        col_grid.attach(bg_btn, 1, 0, 1, 1)
+        col_grid.attach(Gtk.Label(label="文字顏色：", xalign=0.0), 2, 0, 1, 1)
+        col_grid.attach(fg_btn, 3, 0, 1, 1)
+
+        col_grid.attach(Gtk.Label(label="今日背景顏色：", xalign=0.0), 0, 1, 1, 1)
+        col_grid.attach(today_bg_btn, 1, 1, 1, 1)
+        col_grid.attach(Gtk.Label(label="今日邊框顏色：", xalign=0.0), 2, 1, 1, 1)
+        col_grid.attach(today_bd_btn, 3, 1, 1, 1)
+
+        col_grid.attach(Gtk.Label(label="本月日期背景：", xalign=0.0), 0, 2, 1, 1)
+        col_grid.attach(cur_m_bg_btn, 1, 2, 1, 1)
+        col_grid.attach(Gtk.Label(label="非本月日期背景：", xalign=0.0), 2, 2, 1, 1)
+        col_grid.attach(other_m_bg_btn, 3, 2, 1, 1)
+        box.pack_start(col_grid, False, False, 0)
 
         op_row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         scale_bg_op = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 100.0, 2.0)
@@ -1000,6 +1675,10 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         fs_row.pack_start(chk_comp, False, False, 0)
         box.pack_start(fs_row, False, False, 0)
 
+        chk_weather = Gtk.CheckButton(label="在日期列顯示 7 天天氣預報（共用天氣小工具快取）")
+        chk_weather.set_active(self.config.get("show_weather", True))
+        box.pack_start(chk_weather, False, False, 0)
+
         chk_lock = Gtk.CheckButton(label="🔒 鎖定桌面位置與大小（取消勾選即可拖曳頂部移動、右下角縮放）")
         chk_lock.set_active(self.config.get("locked", False))
         box.pack_start(chk_lock, False, False, 0)
@@ -1007,6 +1686,10 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         def apply_all(*_):
             self.config["bg_color"] = rgba_to_hex(bg_btn.get_rgba())
             self.config["fg_color"] = rgba_to_hex(fg_btn.get_rgba())
+            self.config["today_bg_color"] = rgba_to_hex(today_bg_btn.get_rgba())
+            self.config["today_border_color"] = rgba_to_hex(today_bd_btn.get_rgba())
+            self.config["cur_month_bg_color"] = rgba_to_hex(cur_m_bg_btn.get_rgba())
+            self.config["other_month_bg_color"] = rgba_to_hex(other_m_bg_btn.get_rgba())
             bo = int(round(scale_bg_op.get_value()))
             co = int(round(scale_cell_op.get_value()))
             self.config["bg_opacity"] = bo
@@ -1016,16 +1699,17 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
             self.config["font_size"] = int(spin_fs.get_value_as_int())
             self.config["text_shadow"] = chk_shadow.get_active()
             self.config["show_completed"] = chk_comp.get_active()
+            self.config["show_weather"] = chk_weather.get_active()
             self.config["locked"] = chk_lock.get_active()
             self._save_config()
             self._refresh_view()
 
-        bg_btn.connect("color-set", apply_all)
-        fg_btn.connect("color-set", apply_all)
+        for cb in (bg_btn, fg_btn, today_bg_btn, today_bd_btn, cur_m_bg_btn, other_m_bg_btn):
+            cb.connect("color-set", apply_all)
         scale_bg_op.connect("value-changed", apply_all)
         scale_cell_op.connect("value-changed", apply_all)
         spin_fs.connect("value-changed", apply_all)
-        for c in (chk_shadow, chk_comp, chk_lock):
+        for c in (chk_shadow, chk_comp, chk_weather, chk_lock):
             c.connect("toggled", apply_all)
 
         btn_close = Gtk.Button(label="關閉")
@@ -1044,6 +1728,21 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         if self._file_monitor is not None:
             try:
                 self._file_monitor.cancel()
+            except Exception:
+                pass
+        if self._config_debounce_id is not None:
+            try:
+                GLib.source_remove(self._config_debounce_id)
+            except Exception:
+                pass
+        if self._config_monitor is not None:
+            try:
+                self._config_monitor.cancel()
+            except Exception:
+                pass
+        if self.mini_win is not None:
+            try:
+                self.mini_win.destroy()
             except Exception:
                 pass
         Gtk.main_quit()

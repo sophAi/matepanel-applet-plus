@@ -28,6 +28,7 @@ Features:
 import ast
 from collections import OrderedDict
 import datetime
+import difflib
 import glob
 import html
 import json
@@ -1392,6 +1393,43 @@ class StarDictManager:
             return []
 
 
+def diff_spelling_segments(orig_word, suggestion):
+    """
+    Compare `orig_word` against `suggestion` (case-insensitive) using difflib.SequenceMatcher.
+    Returns a list of (text_chunk, is_diff) tuples preserving `suggestion`'s original casing.
+    Adjacent diff chunks (insert/replace) are merged for clean highlighting.
+    """
+    orig_l = (orig_word or "").lower()
+    sug = suggestion or ""
+    sug_l = sug.lower()
+    if not sug:
+        return []
+    sm = difflib.SequenceMatcher(None, orig_l, sug_l)
+    merged = []
+    for tag, _i1, _i2, j1, j2 in sm.get_opcodes():
+        if j1 == j2:
+            continue
+        chunk = sug[j1:j2]
+        is_diff = tag != "equal"
+        if merged and merged[-1][1] == is_diff:
+            merged[-1] = (merged[-1][0] + chunk, is_diff)
+        else:
+            merged.append((chunk, is_diff))
+    return merged
+
+
+def format_spelling_diff_markup(orig_word, suggestion, diff_color="#047857"):
+    """Format a spelling suggestion as Pango markup with differing characters highlighted."""
+    parts = []
+    for chunk, is_diff in diff_spelling_segments(orig_word, suggestion):
+        esc = html.escape(chunk)
+        if is_diff:
+            parts.append(f"<span foreground='{diff_color}' weight='bold'>{esc}</span>")
+        else:
+            parts.append(esc)
+    return "".join(parts)
+
+
 class VocabHistoryManager:
     """
     Lightweight vocabulary history store for traditional StarDict dictionary lookups,
@@ -1956,6 +1994,12 @@ class DictCalcPopupWindow(Gtk.Window):
             size_points=fs,
             pixels_below_lines=2,
         )
+        self.tag_spell_diff = buf.create_tag(
+            "spell_diff",
+            weight=700,
+            foreground="#10b981",
+            size_points=fs,
+        )
         self.tag_muted = buf.create_tag(
             "muted",
             foreground="#94a3b8",
@@ -1967,6 +2011,7 @@ class DictCalcPopupWindow(Gtk.Window):
         self.tag_dict_hdr.set_property("size-points", fs + 1.5)
         self.tag_word.set_property("size-points", fs + 1.0)
         self.tag_body.set_property("size-points", fs)
+        self.tag_spell_diff.set_property("size-points", fs)
         self.tag_muted.set_property("size-points", max(8.5, fs - 1.0))
 
     def _update_status_footer(self, extra_msg=""):
@@ -2113,11 +2158,15 @@ class DictCalcPopupWindow(Gtk.Window):
                     f"💡 您是不是要找以下拼法？（輸入框已自動填入「{top_sug}」，按 Enter 即可查詢）\n",
                     self.tag_word,
                 )
-                buf.insert_with_tags(
-                    buf.get_end_iter(),
-                    "  • " + "\n  • ".join(sugs) + "\n",
-                    self.tag_body,
-                )
+                for sug in sugs:
+                    buf.insert_with_tags(buf.get_end_iter(), "  • ", self.tag_body)
+                    for chunk, is_diff in diff_spelling_segments(orig_w, sug):
+                        buf.insert_with_tags(
+                            buf.get_end_iter(),
+                            chunk,
+                            self.tag_spell_diff if is_diff else self.tag_body,
+                        )
+                    buf.insert_with_tags(buf.get_end_iter(), "\n", self.tag_body)
                 self._update_status_footer(f"查無「{orig_w}」：輸入框已填入「{top_sug}」，按 Enter 查詢")
             else:
                 buf.insert_with_tags(
@@ -3291,12 +3340,19 @@ class DictCalcWidget(Gtk.EventBox):
                 if spelling_info:
                     orig_w, sugs, _aw = spelling_info
                     top_sug = sugs[0] if sugs else ""
+                    bg_rgb = hex_to_rgb(self.config.get("dbus_popup_bg_color", "#fffbe6"), default=(1.0, 0.98, 0.90))
+                    bg_lum = 0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2]
+                    diff_hex = "#047857" if bg_lum > 0.58 else "#34d399"
+                    sugs_markup = "  ·  ".join(
+                        format_spelling_diff_markup(orig_w, s, diff_hex) for s in sugs
+                    )
+                    top_markup = format_spelling_diff_markup(orig_w, top_sug, diff_hex) if top_sug else ""
                     self._notify_dbus(
                         f"❓ 查無「{orig_w}」— 可能拼法",
                         self._wrap_dbus_font(
-                            f"您是不是要找：\n{html.escape('  ·  '.join(sugs))}\n"
+                            f"您是不是要找：\n{sugs_markup}\n"
                             f"<span alpha='45%'>────────────────────</span>\n"
-                            f"<small><span alpha='75%'>輸入框已自動填入「{html.escape(top_sug)}」，按 Enter 即可查詢</span></small>"
+                            f"<small><span alpha='75%'>輸入框已自動填入「{top_markup}」，按 Enter 即可查詢</span></small>"
                         ),
                         icon="accessories-dictionary",
                         timeout_sec=timeout_sec,
