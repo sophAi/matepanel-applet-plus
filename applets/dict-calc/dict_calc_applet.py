@@ -2563,20 +2563,9 @@ class DictCalcWidget(Gtk.EventBox):
             )
             return
 
-        if sdcv_names:
-            def sdcv_worker():
-                res = self.dict_mgr.query_sync(q, dict_names=sdcv_names)
-                sp_info = None
-                # If offline StarDict found 0 exact hits for a single English word, suggest likely spellings only
-                if not res and StarDictManager.is_single_english_word(q):
-                    sugs = StarDictManager.suggest_spelling_sync(q, max_suggestions=8)
-                    if sugs:
-                        sp_info = (q, sugs, None)
-                GLib.idle_add(merge_and_render, res, sp_info)
-
-            threading.Thread(target=sdcv_worker, daemon=True).start()
-
-        if virtual_tr_names:
+        def launch_virtual_translators():
+            if not virtual_tr_names:
+                return
             primary_tl = self.config.get("google_translate_target", "zh-TW")
             reverse_tl = self.config.get("google_translate_reverse", "en")
             cfg_snapshot = dict(self.config)
@@ -2623,6 +2612,46 @@ class DictCalcWidget(Gtk.EventBox):
                     GLib.idle_add(merge_and_render, items_out)
 
                 threading.Thread(target=v_worker, daemon=True).start()
+
+        # For a single English word, run fast (~15-30ms) offline sdcv + aspell check BEFORE
+        # launching online translation engines (Gemini/OpenAI/Google/DeepL) so misspelled words
+        # show ONLY aspell suggestions and never get overwritten by translation engines!
+        if not is_sentence and StarDictManager.is_single_english_word(q):
+            def gated_english_worker():
+                res = self.dict_mgr.query_sync(q, dict_names=sdcv_names) if sdcv_names else []
+                sp_info = None
+                if not res:
+                    sugs = StarDictManager.suggest_spelling_sync(q, max_suggestions=8)
+                    if sugs:
+                        sp_info = (q, sugs, None)
+
+                def _after_check():
+                    if seq != self._query_seq:
+                        return False
+                    if sp_info is not None:
+                        # Misspelled single English word: suppress all online translation engines!
+                        state["pending"] = 1
+                        merge_and_render([], spelling_info=sp_info)
+                        return False
+                    # Valid word (or proper noun not flagged by aspell): show offline hits & start translators
+                    if sdcv_names:
+                        merge_and_render(res, spelling_info=None)
+                    launch_virtual_translators()
+                    return False
+
+                GLib.idle_add(_after_check)
+
+            threading.Thread(target=gated_english_worker, daemon=True).start()
+            return
+
+        if sdcv_names:
+            def sdcv_worker():
+                res = self.dict_mgr.query_sync(q, dict_names=sdcv_names)
+                GLib.idle_add(merge_and_render, res, None)
+
+            threading.Thread(target=sdcv_worker, daemon=True).start()
+
+        launch_virtual_translators()
 
     def _start_google_translate(
         self,
