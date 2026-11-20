@@ -469,7 +469,19 @@ class CustomCalendarBubbleWindow(Gtk.Window):
 
     WEEKDAYS_ZH = ["一", "二", "三", "四", "五", "六", "日"]
 
-    def __init__(self, parent_widget, bg_hex, fg_hex, bg_opacity, font_size, on_close_cb=None):
+    def __init__(
+        self,
+        parent_widget,
+        bg_hex,
+        fg_hex,
+        bg_opacity,
+        font_size,
+        mon_bounds=(0, 0, 1920, 1080),
+        position="top_right",
+        offset_x=0,
+        offset_y=36,
+        on_close_cb=None,
+    ):
         super().__init__(type=Gtk.WindowType.POPUP)
         self.set_decorated(False)
         self.set_accept_focus(False)
@@ -482,6 +494,10 @@ class CustomCalendarBubbleWindow(Gtk.Window):
 
         self.parent_widget = parent_widget
         self._on_close_cb = on_close_cb
+        self._mon_bounds = mon_bounds
+        self._position = position
+        self._offset_x = int(offset_x)
+        self._offset_y = int(offset_y)
         self._bg_rgb = hex_to_rgb(bg_hex, default=(0.094, 0.133, 0.204))
         self._bg_alpha = max(0.0, min(1.0, float(bg_opacity) / 100.0))
         self._fg_hex = fg_hex or "#f0f6ff"
@@ -490,6 +506,7 @@ class CustomCalendarBubbleWindow(Gtk.Window):
         self._timeout_id = None
         self._timeout_sec = 12
         self._hovered = False
+        self._active_tab = "calendar"
 
         today = date.today()
         self.view_year = today.year
@@ -519,9 +536,6 @@ class CustomCalendarBubbleWindow(Gtk.Window):
         root.set_margin_start(12)
         root.set_margin_end(12)
 
-        # Compact Header Row (◀ 今 ▶  YYYY年MM月 📍城市  ✕)
-        nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-
         def _make_nav_btn(txt, tip):
             b = Gtk.Button()
             b.set_relief(Gtk.ReliefStyle.NONE)
@@ -532,14 +546,44 @@ class CustomCalendarBubbleWindow(Gtk.Window):
             b.add(lb)
             return b
 
+        # Top Tab Bar: [📅 天氣月曆]  [🛰️ 西太平洋衛星雲圖]          [✕]
+        tab_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self._lbl_tab_cal = Gtk.Label()
+        self._btn_tab_cal = Gtk.Button()
+        self._btn_tab_cal.set_relief(Gtk.ReliefStyle.NONE)
+        self._btn_tab_cal.set_can_focus(False)
+        self._btn_tab_cal.add(self._lbl_tab_cal)
+        self._btn_tab_cal.connect("clicked", lambda *_: self.switch_tab("calendar"))
+
+        self._lbl_tab_sat = Gtk.Label()
+        self._btn_tab_sat = Gtk.Button()
+        self._btn_tab_sat.set_relief(Gtk.ReliefStyle.NONE)
+        self._btn_tab_sat.set_can_focus(False)
+        self._btn_tab_sat.add(self._lbl_tab_sat)
+        self._btn_tab_sat.connect("clicked", lambda *_: self.switch_tab("satellite"))
+
+        btn_close = _make_nav_btn("✕", "關閉氣泡框")
+        btn_close.connect("clicked", lambda *_: self.dismiss())
+
+        tab_bar.pack_start(self._btn_tab_cal, False, False, 0)
+        tab_bar.pack_start(self._btn_tab_sat, False, False, 0)
+        tab_bar.pack_end(btn_close, False, False, 0)
+        root.pack_start(tab_bar, False, False, 0)
+
+        # Stack holding Page 1 (Compact Calendar) and Page 2 (Full Satellite Cloud Map)
+        self.stack = Gtk.Stack()
+        self.stack.set_homogeneous(False)
+        self.stack.set_transition_type(Gtk.StackTransitionType.NONE)
+
+        # --- Page 1: Compact 7x6 Weather Calendar ---
+        cal_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         btn_prev = _make_nav_btn("◀", "上個月")
         btn_today = _make_nav_btn("今", "回到本月")
         btn_next = _make_nav_btn("▶", "下個月")
-        btn_close = _make_nav_btn("✕", "關閉氣泡框")
         btn_prev.connect("clicked", lambda *_: self._shift_month(-1))
         btn_today.connect("clicked", lambda *_: self._jump_today())
         btn_next.connect("clicked", lambda *_: self._shift_month(1))
-        btn_close.connect("clicked", lambda *_: self.dismiss())
 
         self.hdr_lbl = Gtk.Label(xalign=0.0)
         self.hdr_lbl.set_margin_start(4)
@@ -549,17 +593,82 @@ class CustomCalendarBubbleWindow(Gtk.Window):
         nav.pack_start(btn_today, False, False, 0)
         nav.pack_start(btn_next, False, False, 0)
         nav.pack_start(self.hdr_lbl, True, True, 0)
-        nav.pack_end(btn_close, False, False, 0)
-        root.pack_start(nav, False, False, 0)
+        cal_page.pack_start(nav, False, False, 0)
 
-        # Compact 7x6 Weather Calendar Canvas
         self.cal_canvas = Gtk.DrawingArea()
         self.cal_canvas.set_size_request(448, 326)
         self.cal_canvas.connect("draw", self._on_draw_calendar)
-        root.pack_start(self.cal_canvas, True, True, 0)
+        cal_page.pack_start(self.cal_canvas, True, True, 0)
+        self.stack.add_named(cal_page, "calendar")
 
+        # --- Page 2: Full Western Pacific Satellite Cloud Map (Scheme B) ---
+        self.sat_view = HimawariSatelliteView(self.parent_widget, canvas_size=(660, 380))
+        self.stack.add_named(self.sat_view, "satellite")
+
+        root.pack_start(self.stack, True, True, 0)
         self.add(root)
+        self._update_tab_labels()
         self.show_all()
+
+    def _update_tab_labels(self):
+        fg = html.escape(self._fg_hex)
+        if self._active_tab == "calendar":
+            self._lbl_tab_cal.set_markup(f"<span foreground='{fg}'><b><u>📅 天氣月曆</u></b></span>")
+            self._lbl_tab_sat.set_markup(f"<span foreground='{fg}' alpha='65%'>🛰️ 西太平洋衛星雲圖</span>")
+        else:
+            self._lbl_tab_cal.set_markup(f"<span foreground='{fg}' alpha='65%'>📅 天氣月曆</span>")
+            self._lbl_tab_sat.set_markup(f"<span foreground='{fg}'><b><u>🛰️ 西太平洋衛星雲圖</u></b></span>")
+
+    def reposition(self, target_w, target_h):
+        mon_l, mon_t, mon_r, mon_b = self._mon_bounds
+        mon_w = max(240, mon_r - mon_l)
+        mon_h = max(200, mon_b - mon_t)
+        pad = 12
+        bw = min(int(target_w), mon_w - pad * 2)
+        bh = min(int(target_h), mon_h - pad * 2)
+        self.resize(bw, bh)
+
+        pos = self._position
+        ox, oy = self._offset_x, self._offset_y
+        if pos == "top_left":
+            px = mon_l + pad + ox
+            py = mon_t + oy
+        elif pos == "top_center":
+            px = mon_l + (mon_w - bw) // 2 + ox
+            py = mon_t + oy
+        elif pos == "center":
+            px = mon_l + (mon_w - bw) // 2 + ox
+            py = mon_t + (mon_h - bh) // 2 + oy
+        elif pos == "bottom_left":
+            px = mon_l + pad + ox
+            py = mon_b - bh - oy
+        elif pos == "bottom_right":
+            px = mon_r - bw - pad + ox
+            py = mon_b - bh - oy
+        else:  # top_right
+            px = mon_r - bw - pad + ox
+            py = mon_t + oy
+
+        px = max(mon_l + pad, min(px, mon_r - bw - pad))
+        py = max(mon_t + pad, min(py, mon_b - bh - pad))
+        self.move(int(px), int(py))
+
+    def switch_tab(self, name):
+        if name == self._active_tab:
+            return
+        self._active_tab = name
+        self.stack.set_visible_child_name(name)
+        self._update_tab_labels()
+        if name == "satellite":
+            self._cancel_timer()
+            self.reposition(690, 475)
+            self.sat_view.activate()
+        else:
+            self.sat_view.deactivate()
+            self.reposition(472, 396)
+            if self._timeout_sec > 0 and not self._hovered:
+                self.start_timer(self._timeout_sec)
+        self.queue_draw()
 
     def _compute_month_cells(self):
         cal = calendar.Calendar(firstweekday=0)
@@ -630,7 +739,7 @@ class CustomCalendarBubbleWindow(Gtk.Window):
 
     def _on_leave(self, *_args):
         self._hovered = False
-        if self._timeout_sec > 0:
+        if self._active_tab == "calendar" and self._timeout_sec > 0:
             self.start_timer(max(2, min(self._timeout_sec, 4)))
         return False
 
@@ -642,6 +751,8 @@ class CustomCalendarBubbleWindow(Gtk.Window):
 
     def dismiss(self):
         self._cancel_timer()
+        if hasattr(self, "sat_view") and self.sat_view is not None:
+            self.sat_view.deactivate()
         if self._on_close_cb is not None:
             cb = self._on_close_cb
             self._on_close_cb = None
@@ -840,46 +951,19 @@ class CustomBubbleManager:
         timeout_sec=12,
     ):
         self.close_all()
-        mon_l, mon_t, mon_r, mon_b = mon_bounds
-        mon_w = max(240, mon_r - mon_l)
-        mon_h = max(200, mon_b - mon_t)
-        pad = 12
-
         win = CustomCalendarBubbleWindow(
             parent_widget=parent_widget,
             bg_hex=bg_color,
             fg_hex=fg_color,
             bg_opacity=bg_opacity,
             font_size=font_size,
+            mon_bounds=mon_bounds,
+            position=position,
+            offset_x=offset_x,
+            offset_y=offset_y,
             on_close_cb=self._on_closed,
         )
-        _, nat = win.get_preferred_size()
-        bw = max(460, min(nat.width, mon_w - pad * 2))
-        bh = max(360, min(nat.height, mon_h - pad * 2))
-        win.resize(bw, bh)
-
-        if position == "top_left":
-            px = mon_l + pad + offset_x
-            py = mon_t + offset_y
-        elif position == "top_center":
-            px = mon_l + (mon_w - bw) // 2 + offset_x
-            py = mon_t + offset_y
-        elif position == "center":
-            px = mon_l + (mon_w - bw) // 2 + offset_x
-            py = mon_t + (mon_h - bh) // 2 + offset_y
-        elif position == "bottom_left":
-            px = mon_l + pad + offset_x
-            py = mon_b - bh - offset_y
-        elif position == "bottom_right":
-            px = mon_r - bw - pad + offset_x
-            py = mon_b - bh - offset_y
-        else:  # top_right
-            px = mon_r - bw - pad + offset_x
-            py = mon_t + offset_y
-
-        px = max(mon_l + pad, min(px, mon_r - bw - pad))
-        py = max(mon_t + pad, min(py, mon_b - bh - pad))
-        win.move(int(px), int(py))
+        win.reposition(472, 396)
         win.show_all()
         win.start_timer(timeout_sec)
         self._win = win
@@ -1168,7 +1252,16 @@ class HimawariSatelliteView(Gtk.Box):
         ("馬尼拉", 14.5995, 120.9842, (0.98, 0.75, 0.30)),
     ]
 
-    def __init__(self, parent_widget):
+    # Shared cache across both Full Window and Compact RGBA Bubble (zero duplicate downloads)
+    _SHARED_BASE_TILES = {}
+    _SHARED_LABEL_TILES = {}
+    _SHARED_LAND_BUF = None
+    _SHARED_LAND_SURFACE = None
+    _SHARED_COAST_BUF = None
+    _SHARED_COAST_SURFACE = None
+    _SHARED_FRAMES_BY_BAND = {}
+
+    def __init__(self, parent_widget, canvas_size=(760, 390)):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.parent_widget = parent_widget
         self.set_margin_top(6)
@@ -1178,12 +1271,12 @@ class HimawariSatelliteView(Gtk.Box):
 
         self._band = "SND/ETC"
         self._frames = []            # list of {"label": str, "surface": cairo.ImageSurface}
-        self._base_tiles = {}        # (x, y) -> GdkPixbuf (GSI pale)
-        self._label_tiles = {}       # (x, y) -> GdkPixbuf
-        self._land_buf = None
-        self._land_surface = None    # 768x512 dark ocean/land silhouette under clouds
-        self._coast_buf = None
-        self._coast_surface = None   # 768x512 transparent bright yellow coastlines OVER clouds
+        self._base_tiles = self._SHARED_BASE_TILES
+        self._label_tiles = self._SHARED_LABEL_TILES
+        self._land_buf = self._SHARED_LAND_BUF
+        self._land_surface = self._SHARED_LAND_SURFACE
+        self._coast_buf = self._SHARED_COAST_BUF
+        self._coast_surface = self._SHARED_COAST_SURFACE
         self._cur_idx = 0
         self._playing = True
         self._anim_timer_id = None
@@ -1226,7 +1319,7 @@ class HimawariSatelliteView(Gtk.Box):
 
         # Satellite Canvas
         self.canvas = Gtk.DrawingArea()
-        self.canvas.set_size_request(760, 390)
+        self.canvas.set_size_request(int(canvas_size[0]), int(canvas_size[1]))
         self.canvas.set_hexpand(True)
         self.canvas.set_vexpand(True)
         self.canvas.connect("draw", self._on_draw)
@@ -1270,6 +1363,21 @@ class HimawariSatelliteView(Gtk.Box):
     def activate(self):
         """Called when user switches to the Satellite tab."""
         now_ts = datetime.now()
+        cached = self._SHARED_FRAMES_BY_BAND.get(self._band)
+        if cached is not None:
+            c_ts, c_frames = cached
+            if c_frames and (now_ts - c_ts).total_seconds() < 600:
+                self._frames = list(c_frames)
+                self._last_loaded_ts = c_ts
+                self._cur_idx = len(self._frames) - 1
+                self._sync_ui_to_frame()
+                self.lbl_status.set_markup(
+                    "<small><span foreground='#94a3b8'>✔ 日本氣象廳 JMA 向日葵 9 號 (Himawari-9) · 過去 4.5 小時動態雲圖 (每 30 分鐘一幀)</span></small>"
+                )
+                if self._playing and len(self._frames) >= 2:
+                    self._schedule_next_frame(650)
+                return
+
         need_reload = (
             not self._frames
             or self._last_loaded_ts is None
@@ -1408,6 +1516,10 @@ class HimawariSatelliteView(Gtk.Box):
         self._coast_surface = cairo.ImageSurface.create_for_data(
             self._coast_buf, cairo.FORMAT_ARGB32, w_tot, h_tot, stride
         )
+        type(self)._SHARED_LAND_BUF = self._land_buf
+        type(self)._SHARED_LAND_SURFACE = self._land_surface
+        type(self)._SHARED_COAST_BUF = self._coast_buf
+        type(self)._SHARED_COAST_SURFACE = self._coast_surface
 
     def _compose_frame_surface(self, cloud_tiles, band):
         surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, self.IMG_W, self.IMG_H)
@@ -1604,6 +1716,7 @@ class HimawariSatelliteView(Gtk.Box):
                     else:
                         self._loading = False
                         self._last_loaded_ts = datetime.now()
+                        type(self)._SHARED_FRAMES_BY_BAND[band] = (self._last_loaded_ts, list(self._frames))
                         self.btn_reload.set_sensitive(True)
                         self.lbl_status.set_markup(
                             "<small><span foreground='#94a3b8'>✔ 日本氣象廳 JMA 向日葵 9 號 (Himawari-9) · 過去 4.5 小時動態雲圖 (每 30 分鐘一幀)</span></small>"
