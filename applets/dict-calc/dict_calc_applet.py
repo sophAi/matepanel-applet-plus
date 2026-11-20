@@ -1,0 +1,1786 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""
+MATE Panel Offline StarDict Dictionary & Scientific Calculator Applet (DictCalcApplet)
+
+Features:
+- Offline StarDict Dictionary Backend using `/usr/bin/sdcv -n -j` (C++ native speed, 0 MB idle index RAM):
+  - Automatically discovers all StarDict dictionaries (.ifo) in `/usr/share/stardict/dic` and `~/.stardict/dic`
+  - Dictionary group quick filters (常用群組 / 英漢・漢英 / 日漢・漢日 / 專業科技・英英 / 全部詞典)
+  - Full Dictionary Manager inside Preferences to toggle any of the 40+ installed dictionaries
+- Built-in Safe Scientific Calculator Engine (Python `ast` evaluator, zero `eval` risk):
+  - Auto-detects math expressions (or explicit `=` prefix), supports `^` -> `**`, `pi`, `e`, `ans`,
+    `sqrt`, `sin`, `cos`, `tan`, `log`, `log10`, `ln`, `exp`, `abs`, `pow`, `rad`, `deg`, `factorial`, `hex`, `bin`
+  - **Auto-copies calculation results to system CLIPBOARD (`Ctrl+V` ready)** by default!
+- Two switchable MATE Panel display modes:
+  1. 'badge'       : Compact Cairo rounded icon [DICT] with active Scan-Selection green indicator dot
+  2. 'panel_entry' : Inline Gtk.Entry search/calc box directly embedded on the MATE Panel
+- Scan Selection (滑鼠劃詞查詢):
+  - Event-driven `Gdk.SELECTION_PRIMARY` clipboard monitor (0% idle CPU overhead)
+  - Optional modifier key requirement (None / Ctrl / Alt / Shift) to prevent accidental popups
+  - Instant floating result popup near mouse cursor for both dictionary words AND highlighted math formulas
+- Global Hotkeys via `Keybinder 3.0`:
+  - Configurable hotkey to summon/focus the Query & Calculator window (default `<Ctrl><Alt>d`)
+  - Configurable hotkey to immediately query/calculate the current PRIMARY selection (`Scan Selection` hotkey, default `<Ctrl><Alt>s`)
+- Customizable panel font color & badge background style (dark / light / transparent + contrast shadow).
+"""
+
+import ast
+import glob
+import html
+import json
+import math
+import operator
+import os
+import re
+import subprocess
+import sys
+import threading
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, GObject, Gtk
+import cairo
+
+try:
+    gi.require_version("MatePanelApplet", "4.0")
+    from gi.repository import MatePanelApplet
+    HAS_MATE_PANEL = True
+except (ValueError, ImportError):
+    HAS_MATE_PANEL = False
+
+try:
+    gi.require_version("Keybinder", "3.0")
+    from gi.repository import Keybinder
+    HAS_KEYBINDER = True
+except (ValueError, ImportError):
+    HAS_KEYBINDER = False
+
+
+CONFIG_DIR = os.path.expanduser("~/.config/matepanel-applet-plus")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "dict-calc.json")
+
+DICT_SEARCH_DIRS = [
+    "/usr/share/stardict/dic",
+    os.path.expanduser("~/.stardict/dic"),
+]
+
+# Sensible default enabled dictionaries (Chinese-English, Japanese-Chinese, English-English)
+DEFAULT_PREFERRED_DICTS = [
+    "懶蟲簡明英漢詞典",
+    "懶蟲簡明漢英詞典",
+    "DrEye4in1詞典",
+    "XDICT漢英辭典",
+    "XiaoXueTang-jc",
+    "XiaoXueTang-cj",
+    "DrEye-jc",
+    "DrEye-cj",
+    "Oxford English Collocation Dictionary",
+    "WordNet",
+    "英文字根字典",
+]
+
+DEFAULT_CONFIG = {
+    "display_mode": "badge",             # "badge" (精簡方塊圖示) or "panel_entry" (面板內嵌直接查詢框)
+    "panel_entry_width": 170,            # 面板內嵌查詢框寬度 (px)
+    "scan_selection_enabled": False,     # 是否啟用滑鼠反白自動劃詞查詢 (Selection Primary)
+    "scan_modifier": "ctrl",             # 劃詞觸發修飾鍵: "none", "ctrl", "alt", "shift"
+    "hotkey_open_window": "<Ctrl><Alt>d",# 呼叫查詢/計算視窗的全域快捷鍵
+    "hotkey_scan_selection": "<Ctrl><Alt>s", # 立即查詢目前滑鼠反白文字 (Scan Selection) 的全域快捷鍵
+    "calc_auto_copy": True,              # 數學計算模式預設自動將結果存入系統剪貼簿 (可直接 Ctrl+V)
+    "active_dict_group": "custom",       # "custom" (已勾選常用), "en_zh", "ja_zh", "sci_en", "all"
+    "enabled_dicts": list(DEFAULT_PREFERRED_DICTS),
+    "result_font_size": 11,              # 結果視窗字型大小 (pt)
+    "font_color_mode": "dynamic",        # "dynamic" or "custom"
+    "custom_font_color": "#ffffff",      # 自訂面板字形顏色
+    "badge_bg_style": "dark",            # "dark", "light", "transparent"
+    "text_shadow": False,                # 面板文字描邊陰影
+}
+
+
+# =============================================================================
+# 1. Safe Scientific Calculator Engine (AST-based, zero eval() risk)
+# =============================================================================
+
+class SafeMathCalculator:
+    """Safe mathematical expression evaluator supporting scientific functions, `^`, and `ans`."""
+
+    BIN_OPS = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+        ast.FloorDiv: operator.floordiv,
+        ast.Mod: operator.mod,
+        ast.Pow: operator.pow,
+        ast.BitXor: operator.xor,
+        ast.BitAnd: operator.and_,
+        ast.BitOr: operator.or_,
+        ast.LShift: operator.lshift,
+        ast.RShift: operator.rshift,
+    }
+
+    UNARY_OPS = {
+        ast.UAdd: operator.pos,
+        ast.USub: operator.neg,
+        ast.Invert: operator.invert,
+    }
+
+    FUNCS = {
+        "abs": abs,
+        "round": round,
+        "min": min,
+        "max": max,
+        "pow": pow,
+        "sqrt": math.sqrt,
+        "cbrt": lambda x: math.copysign(abs(x) ** (1.0 / 3.0), x),
+        "sin": math.sin,
+        "cos": math.cos,
+        "tan": math.tan,
+        "asin": math.asin,
+        "acos": math.acos,
+        "atan": math.atan,
+        "atan2": math.atan2,
+        "sinh": math.sinh,
+        "cosh": math.cosh,
+        "tanh": math.tanh,
+        "log": math.log,
+        "ln": math.log,
+        "log10": math.log10,
+        "log2": math.log2,
+        "exp": math.exp,
+        "floor": math.floor,
+        "ceil": math.ceil,
+        "rad": math.radians,
+        "deg": math.degrees,
+        "radians": math.radians,
+        "degrees": math.degrees,
+        "factorial": math.factorial,
+        "gcd": math.gcd,
+        "hex": lambda x: hex(int(x)),
+        "bin": lambda x: bin(int(x)),
+        "oct": lambda x: oct(int(x)),
+    }
+
+    CONSTS = {
+        "pi": math.pi,
+        "e": math.e,
+        "tau": math.tau,
+        "inf": math.inf,
+    }
+
+    def __init__(self):
+        self.last_ans = 0.0
+        self.history = []  # list of (expr, formatted_result)
+
+    @staticmethod
+    def _looks_like_math(raw_text):
+        """
+        Heuristic to decide whether user input should be evaluated as a math formula.
+        Returns (is_math, cleaned_expr)
+        """
+        s = raw_text.strip()
+        if not s:
+            return (False, "")
+        # Explicit '=' prefix always triggers calculator
+        if s.startswith("="):
+            return (True, s[1:].strip())
+
+        # Replace common unicode math symbols
+        s_norm = (
+            s.replace("×", "*")
+            .replace("÷", "/")
+            .replace("−", "-")
+            .replace("（", "(")
+            .replace("）", ")")
+            .replace("π", "pi")
+        )
+
+        # Pure plain word without digits/operators/parentheses -> dictionary lookup
+        if not re.search(r"[0-9+\-*/^%()]", s_norm):
+            return (False, "")
+
+        # Single plain number without any operator/function (e.g. "100" or "2026")
+        # Wait: allow single hex/bin like 0xff or 0b1010, or expressions with operators/parens
+        if re.fullmatch(r"0[xXbBoO][0-9a-fA-F]+", s_norm):
+            return (True, s_norm)
+        if re.fullmatch(r"[+-]?\d+(\.\d+)?", s_norm):
+            return (False, "")
+
+        # Check allowed characters for math expressions
+        if not re.fullmatch(r"[0-9a-zA-Z_.,+\-*/^%() \t]+", s_norm):
+            return (False, "")
+
+        # Check all identifiers are known math functions, constants, 'ans', or scientific notation 'e'
+        tokens = re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", s_norm)
+        allowed_ids = set(SafeMathCalculator.FUNCS.keys()) | set(SafeMathCalculator.CONSTS.keys()) | {"ans"}
+        for tok in tokens:
+            if tok.lower() in allowed_ids:
+                continue
+            # Allow hex literals like 0xff or scientific notation like 1e5
+            if re.fullmatch(r"[xXoObB][0-9a-fA-F]+", tok):
+                continue
+            if re.fullmatch(r"[eE]", tok):
+                continue
+            return (False, "")
+
+        return (True, s_norm)
+
+    def _eval_node(self, node):
+        if isinstance(node, ast.Expression):
+            return self._eval_node(node.body)
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)):
+                return node.value
+            raise ValueError("Unsupported constant")
+        if isinstance(node, ast.Name):
+            name = node.id.lower()
+            if name == "ans":
+                return self.last_ans
+            if name in self.CONSTS:
+                return self.CONSTS[name]
+            raise ValueError(f"Unknown symbol: {node.id}")
+        if isinstance(node, ast.UnaryOp):
+            op_func = self.UNARY_OPS.get(type(node.op))
+            if op_func is None:
+                raise ValueError("Unsupported unary operator")
+            return op_func(self._eval_node(node.operand))
+        if isinstance(node, ast.BinOp):
+            op_func = self.BIN_OPS.get(type(node.op))
+            if op_func is None:
+                raise ValueError("Unsupported binary operator")
+            left = self._eval_node(node.left)
+            right = self._eval_node(node.right)
+            if isinstance(node.op, ast.Pow) and isinstance(right, (int, float)) and abs(right) > 10000:
+                raise ValueError("Exponent too large")
+            return op_func(left, right)
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name):
+                raise ValueError("Unsupported call")
+            fn_name = node.func.id.lower()
+            fn = self.FUNCS.get(fn_name)
+            if fn is None:
+                raise ValueError(f"Unknown function: {node.func.id}")
+            args = [self._eval_node(a) for a in node.args]
+            return fn(*args)
+        raise ValueError(f"Unsupported expression node: {type(node).__name__}")
+
+    @staticmethod
+    def format_result(val):
+        if isinstance(val, str):
+            return val
+        if isinstance(val, bool):
+            return str(val)
+        if isinstance(val, int):
+            return str(val)
+        if isinstance(val, float):
+            if math.isnan(val) or math.isinf(val):
+                return str(val)
+            # Clean floating point representation (e.g. 0.30000000000000004 -> 0.3)
+            if abs(val - round(val)) < 1e-12 and abs(val) < 1e15:
+                return str(int(round(val)))
+            return f"{val:.12g}"
+        return str(val)
+
+    def try_evaluate(self, raw_text, record_history=False):
+        """
+        Attempt to evaluate `raw_text` as a mathematical expression.
+        Returns (is_math, formatted_result_str, error_str_or_None)
+        """
+        is_math, expr = self._looks_like_math(raw_text)
+        if not is_math or not expr:
+            return (False, None, None)
+
+        # Convert '^' to '**' for intuitive power syntax
+        expr_py = expr.replace("^", "**")
+        # Support implicit multiplication like '2pi' or '3(4+5)'
+        expr_py = re.sub(r"(\d)\s*(pi\b|e\b|\()", r"\1*\2", expr_py)
+        expr_py = re.sub(r"\)\s*(\d|\()", r")*\1", expr_py)
+
+        try:
+            tree = ast.parse(expr_py, mode="eval")
+            val = self._eval_node(tree)
+            res_str = self.format_result(val)
+            if isinstance(val, (int, float)):
+                self.last_ans = val
+            if record_history:
+                self.history.insert(0, (expr, res_str))
+                self.history = self.history[:20]
+            return (True, res_str, None)
+        except Exception as exc:
+            return (True, None, str(exc))
+
+
+# =============================================================================
+# 2. StarDict Dictionary Discovery & SDCV Native JSON Query Engine
+# =============================================================================
+
+class StarDictManager:
+    """Discovers StarDict .ifo dictionaries and queries them asynchronously via `/usr/bin/sdcv -n -j`."""
+
+    SDCV_BIN = "/usr/bin/sdcv"
+
+    def __init__(self):
+        self.all_dicts = self.discover_dictionaries()
+
+    @staticmethod
+    def _classify_dict(bookname, dirname):
+        low = f"{bookname} {dirname}".lower()
+        if any(k in low for k in ("-jc", "-cj", "xiaoxuetang", "drey", "naver", "kr")):
+            if any(k in low for k in ("-jc", "-cj", "xiaoxuetang")):
+                return "ja_zh"
+        if any(k in low for k in ("英漢", "漢英", "英汉", "汉英", "lazyworm", "xdict", "drey", "zigen", "字根", "本草")):
+            if any(k in low for k in ("科技", "數學", "化學", "物理", "生物", "大氣", "powerword", "ncce")):
+                return "sci_en"
+            return "en_zh"
+        return "sci_en"
+
+    @classmethod
+    def discover_dictionaries(cls):
+        """
+        Scan /usr/share/stardict/dic and ~/.stardict/dic for .ifo files.
+        Returns list of dicts: [{'bookname': str, 'wordcount': int, 'group': str, 'path': str}]
+        """
+        found = []
+        seen_names = set()
+        for base_dir in DICT_SEARCH_DIRS:
+            if not os.path.isdir(base_dir):
+                continue
+            for ifo_path in sorted(glob.glob(os.path.join(base_dir, "*", "*.ifo"))):
+                bookname = None
+                wordcount = 0
+                try:
+                    with open(ifo_path, "r", encoding="utf-8", errors="replace") as f:
+                        for line in f:
+                            line = line.strip()
+                            if line.startswith("bookname="):
+                                bookname = line.split("=", 1)[1].strip()
+                            elif line.startswith("wordcount="):
+                                try:
+                                    wordcount = int(line.split("=", 1)[1].strip())
+                                except ValueError:
+                                    pass
+                except OSError:
+                    continue
+                if bookname and bookname not in seen_names:
+                    seen_names.add(bookname)
+                    dirname = os.path.basename(os.path.dirname(ifo_path))
+                    found.append(
+                        {
+                            "bookname": bookname,
+                            "wordcount": wordcount,
+                            "group": cls._classify_dict(bookname, dirname),
+                            "path": ifo_path,
+                        }
+                    )
+        found.sort(key=lambda d: (d["group"], d["bookname"]))
+        return found
+
+    def get_dicts_for_group(self, group_name, custom_enabled_list):
+        if group_name == "all":
+            return []  # empty means query all dictionaries in sdcv
+        if group_name == "custom":
+            valid = [d["bookname"] for d in self.all_dicts if d["bookname"] in custom_enabled_list]
+            return valid
+        return [d["bookname"] for d in self.all_dicts if d["group"] == group_name]
+
+    @classmethod
+    def clean_definition(cls, raw_def):
+        """Clean up HTML/XML tags occasionally present in Babylon/PowerWord StarDict entries."""
+        if not raw_def:
+            return ""
+        text = raw_def.replace("\r\n", "\n").replace("\r", "\n")
+        # Convert <br> / <p> to newlines, strip other HTML tags cleanly
+        if "<" in text and ">" in text:
+            text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+            text = re.sub(r"(?i)</p\s*>", "\n", text)
+            text = re.sub(r"<[^>]+>", "", text)
+            text = html.unescape(text)
+        # Collapse excessive blank lines
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+    def query_sync(self, word, dict_names=None, timeout=6.0):
+        """
+        Query StarDict via `sdcv -n -j`.
+        Returns list of [{'dict': str, 'word': str, 'definition': str}]
+        """
+        w = word.strip()
+        if not w:
+            return []
+        cmd = [self.SDCV_BIN, "-n", "-j"]
+        if dict_names:
+            for dn in dict_names:
+                cmd.extend(["-u", dn])
+        cmd.append(w)
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            out = proc.stdout.strip()
+            if not out:
+                return []
+            # sdcv -j outputs a JSON array (sometimes prefixed by non-JSON lines if warnings occur)
+            idx_bracket = out.find("[")
+            if idx_bracket < 0:
+                return []
+            items = json.loads(out[idx_bracket:])
+            results = []
+            for it in items:
+                d_name = it.get("dict", "Unknown")
+                w_res = it.get("word", w)
+                defn = self.clean_definition(it.get("definition", ""))
+                if defn:
+                    results.append({"dict": d_name, "word": w_res, "definition": defn})
+            return results
+        except Exception:
+            return []
+
+
+def hex_to_rgb(hex_str, default=(1.0, 1.0, 1.0)):
+    if not hex_str or not isinstance(hex_str, str):
+        return default
+    s = hex_str.strip().lstrip("#")
+    if len(s) == 3:
+        s = "".join(c * 2 for c in s)
+    if len(s) != 6:
+        return default
+    try:
+        return (
+            int(s[0:2], 16) / 255.0,
+            int(s[2:4], 16) / 255.0,
+            int(s[4:6], 16) / 255.0,
+        )
+    except ValueError:
+        return default
+
+
+def rgb_luminance(rgb):
+    return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+
+
+def draw_rounded_rect(ctx, x, y, w, h, r):
+    r = min(r, w / 2.0, h / 2.0)
+    ctx.new_sub_path()
+    ctx.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    ctx.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    ctx.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    ctx.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    ctx.close_path()
+
+
+# =============================================================================
+# 3. Query & Calculator Popup Window (Shared by Manual Query & Scan Selection)
+# =============================================================================
+
+class DictCalcPopupWindow(Gtk.Window):
+    """
+    Fast Dictionary & Scientific Calculator popup window.
+    - Supports instant math formula evaluation (auto-copied to system clipboard!)
+    - Supports multi-dictionary StarDict results with group switcher tabs
+    - Press Esc to hide immediately
+    """
+
+    GROUP_OPTIONS = [
+        ("custom", "⭐ 常用詞典"),
+        ("en_zh", "🇬🇧 英漢/漢英"),
+        ("ja_zh", "🇯🇵 日漢/漢日"),
+        ("sci_en", "🔬 科技/英英"),
+        ("all", "📚 全部 41 套"),
+    ]
+
+    def __init__(self, parent_widget):
+        super().__init__(title="📖 StarDict 離線詞典 & 🧮 科學計算機")
+        self.parent_widget = parent_widget
+        self.set_default_size(600, 480)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.connect("delete-event", self._on_delete_hide)
+        self.connect("key-press-event", self._on_key_press)
+
+        self._query_seq = 0
+        self._last_calc_result = None
+        self._build_ui()
+
+    def _on_delete_hide(self, *_args):
+        self.hide()
+        return True
+
+    def _on_key_press(self, _widget, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self.hide()
+            return True
+        return False
+
+    def _build_ui(self):
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        root.set_margin_top(12)
+        root.set_margin_bottom(12)
+        root.set_margin_start(14)
+        root.set_margin_end(14)
+
+        # Row 1: Search / Formula Entry + Action Buttons
+        top_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+        self.search_entry = Gtk.Entry()
+        self.search_entry.set_hexpand(True)
+        self.search_entry.set_placeholder_text(
+            "輸入中/英/日單字查詞，或直接輸入數學公式（例如 2^10、sqrt(2)*pi、=128*3.14）..."
+        )
+        self.search_entry.connect("activate", self._on_search_activate)
+        self.search_entry.connect("changed", self._on_search_changed)
+        top_box.pack_start(self.search_entry, True, True, 0)
+
+        btn_go = Gtk.Button(label="🔎 查詢 / 計算")
+        btn_go.connect("clicked", self._on_search_activate)
+        top_box.pack_start(btn_go, False, False, 0)
+
+        btn_clear = Gtk.Button(label="✖")
+        btn_clear.set_tooltip_text("清除輸入")
+        btn_clear.connect("clicked", self._on_clear)
+        top_box.pack_start(btn_clear, False, False, 0)
+
+        btn_prefs = Gtk.Button(label="⚙️")
+        btn_prefs.set_tooltip_text("偏好設定（詞典管理 / 快捷鍵 / 劃詞取詞）")
+        btn_prefs.connect("clicked", lambda *_: self.parent_widget.show_preferences_dialog())
+        top_box.pack_start(btn_prefs, False, False, 0)
+
+        root.pack_start(top_box, False, False, 0)
+
+        # Row 2: Dictionary Group Quick Switcher + Scan Selection Toggle
+        bar2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+        self.group_buttons = {}
+        cur_grp = self.parent_widget.config.get("active_dict_group", "custom")
+        grp_leader = None
+        for g_code, g_label in self.GROUP_OPTIONS:
+            rb = Gtk.RadioButton.new_with_label_from_widget(grp_leader, g_label)
+            rb.set_mode(False)  # toggle-button appearance
+            if grp_leader is None:
+                grp_leader = rb
+            if g_code == cur_grp:
+                rb.set_active(True)
+            rb.connect("toggled", self._on_group_toggled, g_code)
+            bar2.pack_start(rb, False, False, 0)
+            self.group_buttons[g_code] = rb
+
+        self.chk_scan = Gtk.CheckButton(label="✂ 劃詞自動查")
+        self.chk_scan.set_active(self.parent_widget.config.get("scan_selection_enabled", False))
+        self.chk_scan.connect("toggled", self._on_scan_toggled)
+        bar2.pack_end(self.chk_scan, False, False, 0)
+
+        root.pack_start(bar2, False, False, 0)
+
+        # Row 3: Highlighted Calculator Result Banner (auto-shown when formula detected)
+        self.calc_frame = Gtk.Frame()
+        self.calc_frame.set_shadow_type(Gtk.ShadowType.ETCHED_IN)
+        calc_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        calc_hbox.set_margin_top(8)
+        calc_hbox.set_margin_bottom(8)
+        calc_hbox.set_margin_start(12)
+        calc_hbox.set_margin_end(12)
+
+        self.calc_result_lbl = Gtk.Label(xalign=0.0)
+        self.calc_result_lbl.set_selectable(True)
+        calc_hbox.pack_start(self.calc_result_lbl, True, True, 0)
+
+        self.btn_copy_calc = Gtk.Button(label="📋 複製答案")
+        self.btn_copy_calc.connect("clicked", self._on_copy_calc_clicked)
+        calc_hbox.pack_end(self.btn_copy_calc, False, False, 0)
+
+        self.calc_frame.add(calc_hbox)
+        root.pack_start(self.calc_frame, False, False, 0)
+
+        # Row 4: Scrollable Dictionary Results TextView
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_vexpand(True)
+
+        self.result_view = Gtk.TextView()
+        self.result_view.set_editable(False)
+        self.result_view.set_cursor_visible(False)
+        self.result_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.result_view.set_left_margin(10)
+        self.result_view.set_right_margin(10)
+        self.result_view.set_top_margin(8)
+        self.result_view.set_bottom_margin(8)
+        self.result_buf = self.result_view.get_buffer()
+        self._init_text_tags()
+
+        scroll.add(self.result_view)
+        root.pack_start(scroll, True, True, 0)
+
+        # Row 5: Status Footer
+        self.status_lbl = Gtk.Label(xalign=0.0)
+        self._update_status_footer()
+        root.pack_start(self.status_lbl, False, False, 0)
+
+        self.add(root)
+        self.show_all()
+        self.calc_frame.hide()
+
+    def _init_text_tags(self):
+        buf = self.result_buf
+        fs = int(self.parent_widget.config.get("result_font_size", 11))
+        self.tag_dict_hdr = buf.create_tag(
+            "dict_hdr",
+            weight=700,
+            foreground="#38bdf8",
+            scale=1.12,
+            pixels_above_lines=8,
+            pixels_below_lines=3,
+        )
+        self.tag_word = buf.create_tag(
+            "word_title",
+            weight=700,
+            foreground="#fbbf24",
+            scale=1.08,
+        )
+        self.tag_body = buf.create_tag(
+            "body_text",
+            size_points=fs,
+            pixels_below_lines=2,
+        )
+        self.tag_muted = buf.create_tag(
+            "muted",
+            foreground="#94a3b8",
+            size_points=max(9, fs - 1),
+        )
+
+    def update_font_size(self):
+        fs = int(self.parent_widget.config.get("result_font_size", 11))
+        self.tag_body.set_property("size-points", fs)
+        self.tag_muted.set_property("size-points", max(9, fs - 1))
+
+    def _update_status_footer(self, extra_msg=""):
+        hk_open = self.parent_widget.config.get("hotkey_open_window", "<Ctrl><Alt>d")
+        hk_scan = self.parent_widget.config.get("hotkey_scan_selection", "<Ctrl><Alt>s")
+        n_total = len(self.parent_widget.dict_mgr.all_dicts)
+        msg = extra_msg if extra_msg else (
+            f"已偵測 {n_total} 套離線詞典  |  呼叫視窗: {hk_open}  |  劃詞查詢: {hk_scan}  |  按 Esc 關閉"
+        )
+        self.status_lbl.set_markup(f"<small><span foreground='#94a3b8'>{html.escape(msg)}</span></small>")
+
+    def sync_controls(self):
+        self.chk_scan.set_active(self.parent_widget.config.get("scan_selection_enabled", False))
+        cur_grp = self.parent_widget.config.get("active_dict_group", "custom")
+        if cur_grp in self.group_buttons:
+            self.group_buttons[cur_grp].set_active(True)
+        self.update_font_size()
+        self._update_status_footer()
+
+    def _on_clear(self, *_args):
+        self.search_entry.set_text("")
+        self.calc_frame.hide()
+        self.result_buf.set_text("")
+        self.search_entry.grab_focus()
+
+    def _on_group_toggled(self, rb, group_code):
+        if not rb.get_active():
+            return
+        self.parent_widget.config["active_dict_group"] = group_code
+        self.parent_widget._save_config()
+        txt = self.search_entry.get_text().strip()
+        if txt:
+            self.run_query(txt, record_calc_history=False)
+
+    def _on_scan_toggled(self, chk):
+        self.parent_widget.set_scan_selection_enabled(chk.get_active())
+
+    def _on_copy_calc_clicked(self, *_args):
+        if self._last_calc_result:
+            self.parent_widget.copy_to_clipboard(self._last_calc_result)
+            self._update_status_footer(f"✅ 已將計算結果「{self._last_calc_result}」複製到系統剪貼簿 (可直接 Ctrl+V)")
+
+    def _on_search_changed(self, entry):
+        """Live math preview while typing mathematical formulas."""
+        txt = entry.get_text().strip()
+        if not txt:
+            self.calc_frame.hide()
+            return
+        is_math, res_str, err = self.parent_widget.calc.try_evaluate(txt, record_history=False)
+        if is_math and res_str is not None:
+            self._show_calc_banner(txt, res_str, auto_copied=False)
+        elif not is_math:
+            self.calc_frame.hide()
+
+    def _on_search_activate(self, *_args):
+        txt = self.search_entry.get_text().strip()
+        if txt:
+            self.run_query(txt, record_calc_history=True)
+
+    def _show_calc_banner(self, expr_str, res_str, auto_copied=False):
+        self._last_calc_result = res_str
+        copied_badge = (
+            "   <span foreground='#34d399'><small>✔ 已自動存入剪貼簿 (Ctrl+V 可直接貼上)</small></span>"
+            if auto_copied
+            else "   <span foreground='#94a3b8'><small>(按 Enter 計算並自動存入剪貼簿)</small></span>"
+        )
+        self.calc_result_lbl.set_markup(
+            f"🧮 <tt>{html.escape(expr_str)}</tt>  =  "
+            f"<span size='x-large' foreground='#34d399'><b>{html.escape(res_str)}</b></span>"
+            f"{copied_badge}"
+        )
+        self.calc_frame.show_all()
+
+    def present_with_query(self, text="", near_pointer=False):
+        self.sync_controls()
+        if near_pointer:
+            display = Gdk.Display.get_default()
+            if display is not None:
+                seat = display.get_default_seat()
+                if seat is not None and seat.get_pointer() is not None:
+                    _, px, py = seat.get_pointer().get_position()
+                    self.move(max(10, px - 120), max(36, py + 18))
+        else:
+            self.set_position(Gtk.WindowPosition.CENTER)
+
+        self.show_all()
+        if not self._last_calc_result:
+            self.calc_frame.hide()
+        self.present_with_time(Gdk.CURRENT_TIME)
+
+        if text:
+            self.search_entry.set_text(text)
+            self.search_entry.set_position(-1)
+            self.run_query(text, record_calc_history=True)
+        else:
+            self.search_entry.grab_focus()
+            self.search_entry.select_region(0, -1)
+
+    def run_query(self, raw_text, record_calc_history=True):
+        """Evaluate math expression (if applicable) and asynchronously query StarDict."""
+        q = raw_text.strip()
+        if not q:
+            return
+
+        # 1. Check Scientific Calculator first
+        is_math, res_str, err = self.parent_widget.calc.try_evaluate(
+            q, record_history=record_calc_history
+        )
+        if is_math:
+            if res_str is not None:
+                auto_copy = bool(self.parent_widget.config.get("calc_auto_copy", True))
+                if auto_copy:
+                    self.parent_widget.copy_to_clipboard(res_str)
+                self._show_calc_banner(q, res_str, auto_copied=auto_copy)
+                self._render_calc_history_view(q, res_str, auto_copy)
+                self._update_status_footer(
+                    f"🧮 計算完成：{q} = {res_str}" + ("（已自動存入剪貼簿，可直接 Ctrl+V）" if auto_copy else "")
+                )
+                return
+            else:
+                self.calc_result_lbl.set_markup(
+                    f"🧮 <span foreground='#f87171'>算式語法錯誤：{html.escape(err or '')}</span>"
+                )
+                self.calc_frame.show_all()
+                return
+
+        # 2. Dictionary Lookup via background thread (keeps GTK UI 100% responsive)
+        self.calc_frame.hide()
+        self._last_calc_result = None
+        self._query_seq += 1
+        seq = self._query_seq
+
+        self.result_buf.set_text("")
+        self.result_buf.insert_with_tags(
+            self.result_buf.get_end_iter(), f"🔎 正在查詢「{q}」...", self.tag_muted
+        )
+
+        group_code = self.parent_widget.config.get("active_dict_group", "custom")
+        custom_list = self.parent_widget.config.get("enabled_dicts", DEFAULT_PREFERRED_DICTS)
+        dict_names = self.parent_widget.dict_mgr.get_dicts_for_group(group_code, custom_list)
+
+        def worker():
+            results = self.parent_widget.dict_mgr.query_sync(q, dict_names=dict_names)
+            GLib.idle_add(self._on_dict_results_ready, seq, q, results, group_code)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _render_calc_history_view(self, expr_str, res_str, auto_copied):
+        buf = self.result_buf
+        buf.set_text("")
+        buf.insert_with_tags(buf.get_end_iter(), "🧮 科學計算機模式\n", self.tag_dict_hdr)
+        buf.insert_with_tags(
+            buf.get_end_iter(),
+            f"算式：{expr_str}\n結果：{res_str}\n"
+            + ("狀態：✔ 已自動存入系統剪貼簿，可直接按 Ctrl+V 貼上\n\n" if auto_copied else "\n"),
+            self.tag_body,
+        )
+        buf.insert_with_tags(
+            buf.get_end_iter(),
+            "💡 支援語法：+ - * / // % ^ (次方) | ans (上筆答案) | pi, e | "
+            "sqrt(), cbrt(), sin(), cos(), tan(), log(), log10(), ln(), exp(), rad(), deg(), factorial(), hex(), bin()\n\n",
+            self.tag_muted,
+        )
+        if self.parent_widget.calc.history:
+            buf.insert_with_tags(buf.get_end_iter(), "📜 最近計算歷史紀錄：\n", self.tag_word)
+            for h_expr, h_res in self.parent_widget.calc.history[:10]:
+                buf.insert_with_tags(
+                    buf.get_end_iter(), f"  • {h_expr}  =  {h_res}\n", self.tag_body
+                )
+
+    def _on_dict_results_ready(self, seq, query_word, results, group_code):
+        if seq != self._query_seq:
+            return False
+
+        buf = self.result_buf
+        buf.set_text("")
+
+        if not results:
+            buf.insert_with_tags(
+                buf.get_end_iter(),
+                f"找不到「{query_word}」的詞條釋義。\n\n"
+                f"💡 建議：\n"
+                f"• 點選上方「📚 全部 41 套」擴大搜尋範圍\n"
+                f"• 若要進行數學計算，可在算式最前面加上「=」（例如 =2^10）\n",
+                self.tag_muted,
+            )
+            self._update_status_footer(f"查詢「{query_word}」：0 筆結果")
+            return False
+
+        for idx, item in enumerate(results):
+            if idx > 0:
+                buf.insert_with_tags(buf.get_end_iter(), "\n" + ("─" * 52) + "\n", self.tag_muted)
+            buf.insert_with_tags(
+                buf.get_end_iter(), f"📖 {item['dict']}\n", self.tag_dict_hdr
+            )
+            buf.insert_with_tags(
+                buf.get_end_iter(), f"【{item['word']}】\n", self.tag_word
+            )
+            buf.insert_with_tags(
+                buf.get_end_iter(), f"{item['definition']}\n", self.tag_body
+            )
+
+        self.result_view.scroll_to_iter(buf.get_start_iter(), 0.0, False, 0.0, 0.0)
+        self._update_status_footer(f"查詢「{query_word}」：共找到 {len(results)} 筆詞典釋義")
+        return False
+
+
+# =============================================================================
+# 4. Main MATE Panel Applet Widget (Badge / Inline Panel Entry + Hotkeys + Scan)
+# =============================================================================
+
+class DictCalcWidget(Gtk.EventBox):
+    """
+    Main widget placed inside either a MatePanelApplet or a standalone Gtk.Window.
+    """
+
+    FONT_COLOR_PRESETS = [
+        ("純白 (深色面板)", "#ffffff"),
+        ("炭黑 (淺色面板)", "#111827"),
+        ("科技青", "#38bdf8"),
+        ("翠綠", "#34d399"),
+        ("琥珀金", "#fbbf24"),
+    ]
+
+    def __init__(self, applet=None):
+        super().__init__()
+        self.applet = applet
+        self.set_visible_window(False)
+        self.set_above_child(True)
+        self.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.ENTER_NOTIFY_MASK
+            | Gdk.EventMask.LEAVE_NOTIFY_MASK
+        )
+
+        self.config = self._load_config()
+        self.dict_mgr = StarDictManager()
+        self.calc = SafeMathCalculator()
+
+        self.panel_size = 28
+        self.popup_win = None
+        self.prefs_win = None
+        self.active_menu = None
+        self._bound_hotkeys = []
+        self._last_scanned_text = ""
+
+        # Container supporting both 'badge' mode and 'panel_entry' inline search box mode
+        self.root_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.add(self.root_box)
+
+        # 1. Cairo Badge Canvas (always shown, or next to inline entry)
+        self.canvas = Gtk.DrawingArea()
+        self.canvas.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
+        )
+        self.canvas.connect("draw", self._on_draw_badge)
+        self.canvas.connect("button-press-event", self._on_button_press)
+        self.root_box.pack_start(self.canvas, False, False, 0)
+
+        # 2. Optional Inline Panel Search/Calc Entry
+        self.panel_entry = Gtk.Entry()
+        self.panel_entry.set_placeholder_text("查詞 / 算式...")
+        self.panel_entry.connect("activate", self._on_panel_entry_activate)
+        self.root_box.pack_start(self.panel_entry, False, False, 0)
+
+        self.connect("button-press-event", self._on_button_press)
+        self.connect("destroy", self._on_destroy)
+
+        # Clipboards: CLIPBOARD (Ctrl+V) and PRIMARY (Mouse Scan Selection)
+        self.clipboard_main = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        self.clipboard_primary = Gtk.Clipboard.get(Gdk.SELECTION_PRIMARY)
+        self.clipboard_primary.connect("owner-change", self._on_primary_selection_changed)
+
+        # Initialize Keybinder global hotkeys
+        if HAS_KEYBINDER:
+            try:
+                Keybinder.init()
+            except Exception:
+                pass
+        self.rebind_global_hotkeys()
+
+        self._apply_panel_layout()
+        self._update_tooltip()
+        self.show_all()
+        self._sync_entry_visibility()
+
+    def _load_config(self):
+        cfg = dict(DEFAULT_CONFIG)
+        if os.path.exists(CONFIG_PATH):
+            try:
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    user_cfg = json.load(f)
+                if isinstance(user_cfg, dict):
+                    cfg.update(user_cfg)
+            except Exception:
+                pass
+        return cfg
+
+    def _save_config(self):
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def copy_to_clipboard(self, text):
+        """Copy text to system CLIPBOARD so user can immediately paste with Ctrl+V."""
+        if not text:
+            return
+        self.clipboard_main.set_text(str(text), -1)
+        self.clipboard_main.store()
+
+    # =========================================================================
+    # Global Hotkeys (Keybinder 3.0)
+    # =========================================================================
+
+    def rebind_global_hotkeys(self):
+        if not HAS_KEYBINDER:
+            return
+        for old_hk in self._bound_hotkeys:
+            try:
+                Keybinder.unbind(old_hk)
+            except Exception:
+                pass
+        self._bound_hotkeys = []
+
+        hk_open = self.config.get("hotkey_open_window", "").strip()
+        if hk_open:
+            try:
+                if Keybinder.bind(hk_open, self._on_hotkey_open_window):
+                    self._bound_hotkeys.append(hk_open)
+            except Exception:
+                pass
+
+        hk_scan = self.config.get("hotkey_scan_selection", "").strip()
+        if hk_scan and hk_scan != hk_open:
+            try:
+                if Keybinder.bind(hk_scan, self._on_hotkey_scan_selection):
+                    self._bound_hotkeys.append(hk_scan)
+            except Exception:
+                pass
+
+    def _on_hotkey_open_window(self, _keystr):
+        GLib.idle_add(self.toggle_popup_window)
+
+    def _on_hotkey_scan_selection(self, _keystr):
+        GLib.idle_add(self.trigger_scan_selection_now)
+
+    # =========================================================================
+    # Scan Selection (Mouse Highlight PRIMARY Clipboard Lookup)
+    # =========================================================================
+
+    def set_scan_selection_enabled(self, enabled):
+        self.config["scan_selection_enabled"] = bool(enabled)
+        self._save_config()
+        self._update_tooltip()
+        self.canvas.queue_draw()
+
+    def toggle_scan_selection(self, *_args):
+        self.set_scan_selection_enabled(not self.config.get("scan_selection_enabled", False))
+
+    def _is_scan_modifier_pressed(self):
+        req_mod = self.config.get("scan_modifier", "ctrl")
+        if req_mod == "none":
+            return True
+        display = Gdk.Display.get_default()
+        if display is None:
+            return False
+        seat = display.get_default_seat()
+        if seat is None or seat.get_pointer() is None:
+            return False
+        root_win = Gdk.get_default_root_window()
+        if root_win is None:
+            return False
+        _, _, _, state = root_win.get_device_position(seat.get_pointer())
+        if req_mod == "ctrl":
+            return bool(state & Gdk.ModifierType.CONTROL_MASK)
+        if req_mod == "alt":
+            return bool(state & Gdk.ModifierType.MOD1_MASK)
+        if req_mod == "shift":
+            return bool(state & Gdk.ModifierType.SHIFT_MASK)
+        return True
+
+    def _on_primary_selection_changed(self, clipboard, _event):
+        if not self.config.get("scan_selection_enabled", False):
+            return
+        if not self._is_scan_modifier_pressed():
+            return
+        clipboard.request_text(self._on_primary_text_received, False)
+
+    def trigger_scan_selection_now(self, *_args):
+        """Triggered via global Scan Selection hotkey (works even if auto-scan is OFF)."""
+        self.clipboard_primary.request_text(self._on_primary_text_received, True)
+
+    def _on_primary_text_received(self, _clipboard, text, force_from_hotkey):
+        if not text:
+            if force_from_hotkey:
+                # Fallback to main CLIPBOARD if PRIMARY is empty
+                txt2 = self.clipboard_main.wait_for_text() or ""
+                text = txt2
+        cleaned = (text or "").strip()
+        if not cleaned or len(cleaned) > 160 or "\n" in cleaned:
+            if force_from_hotkey:
+                self.open_popup_window("")
+            return
+        if not force_from_hotkey and cleaned == self._last_scanned_text:
+            return
+        self._last_scanned_text = cleaned
+        self.open_popup_window(cleaned, near_pointer=True)
+
+    # =========================================================================
+    # Panel Layout, Drawing & Events
+    # =========================================================================
+
+    def set_panel_size(self, size):
+        self.panel_size = max(22, min(64, int(size)))
+        self._apply_panel_layout()
+
+    def _sync_entry_visibility(self):
+        if self.config.get("display_mode", "badge") == "panel_entry":
+            self.panel_entry.show()
+        else:
+            self.panel_entry.hide()
+
+    def _apply_panel_layout(self):
+        h = max(24, self.panel_size)
+        bw = max(34, int(h * 1.25))
+        self.canvas.set_size_request(bw, h)
+        entry_w = max(90, min(320, int(self.config.get("panel_entry_width", 170))))
+        self.panel_entry.set_size_request(entry_w, max(20, h - 4))
+        self._sync_entry_visibility()
+        self.canvas.queue_draw()
+
+    def _on_panel_entry_activate(self, entry):
+        txt = entry.get_text().strip()
+        if not txt:
+            return
+        self.open_popup_window(txt, near_pointer=False)
+
+    def _update_tooltip(self):
+        scan_on = self.config.get("scan_selection_enabled", False)
+        mod_map = {"none": "純反白", "ctrl": "按住 Ctrl", "alt": "按住 Alt", "shift": "按住 Shift"}
+        mod_txt = mod_map.get(self.config.get("scan_modifier", "ctrl"), "Ctrl")
+        scan_str = f"啟用中 ({mod_txt})" if scan_on else "已關閉 (中鍵點擊可切換)"
+        hk_open = self.config.get("hotkey_open_window", "<Ctrl><Alt>d")
+        hk_scan = self.config.get("hotkey_scan_selection", "<Ctrl><Alt>s")
+        n_dicts = len(self.dict_mgr.all_dicts)
+
+        self.set_tooltip_markup(
+            f"<b>📖 StarDict 離線詞典 &amp; 🧮 科學計算機 Plus</b>\n"
+            f"• 離線詞庫數: <b>{n_dicts}</b> 套\n"
+            f"• 滑鼠劃詞查詢 (Scan Selection): <b>{scan_str}</b>\n"
+            f"• 計算機結果自動存入剪貼簿: <b>{'開啟 (可直接 Ctrl+V)' if self.config.get('calc_auto_copy', True) else '關閉'}</b>\n"
+            f"• 全域快捷鍵: 呼叫視窗 <b>{html.escape(hk_open)}</b> | 劃詞查詢 <b>{html.escape(hk_scan)}</b>\n"
+            f"<small>左鍵: 開啟查詢/計算視窗 | 中鍵: 開關劃詞取詞 | 右鍵: 偏好設定</small>"
+        )
+
+    def _draw_styled_text(self, ctx, x, y, text, rgb):
+        if self.config.get("text_shadow", False):
+            lum = rgb_luminance(rgb)
+            s_rgb = (0.0, 0.0, 0.0, 0.82) if lum > 0.45 else (1.0, 1.0, 1.0, 0.82)
+            ctx.set_source_rgba(*s_rgb)
+            for dx, dy in ((-0.8, 0.0), (0.8, 0.0), (0.0, -0.8), (0.0, 0.8)):
+                ctx.move_to(x + dx, y + dy)
+                ctx.show_text(text)
+        ctx.set_source_rgba(rgb[0], rgb[1], rgb[2], 1.0)
+        ctx.move_to(x, y)
+        ctx.show_text(text)
+
+    def _on_draw_badge(self, widget, ctx):
+        alloc = widget.get_allocation()
+        w, h = float(alloc.width), float(alloc.height)
+        pad_y = 1.0
+        bh = max(20.0, h - pad_y * 2)
+        bw = max(28.0, w - 2.0)
+        x, y = 1.0, pad_y
+
+        scan_on = self.config.get("scan_selection_enabled", False)
+        bg_style = self.config.get("badge_bg_style", "dark")
+
+        if scan_on:
+            bg_rgb = (0.10, 0.34, 0.30)
+            border_rgb = (0.20, 0.84, 0.62)
+            text_rgb = (0.94, 1.00, 0.98)
+        else:
+            bg_rgb = (0.14, 0.24, 0.40)
+            border_rgb = (0.28, 0.72, 0.98)
+            text_rgb = (0.94, 0.98, 1.00)
+
+        draw_rounded_rect(ctx, x + 0.5, y + 0.5, bw - 1.0, bh - 1.0, 4.5)
+        if bg_style == "dark":
+            ctx.set_source_rgba(bg_rgb[0], bg_rgb[1], bg_rgb[2], 0.92)
+            ctx.fill_preserve()
+        elif bg_style == "light":
+            l_r = min(1.0, 0.88 + bg_rgb[0] * 0.22)
+            l_g = min(1.0, 0.88 + bg_rgb[1] * 0.22)
+            l_b = min(1.0, 0.88 + bg_rgb[2] * 0.22)
+            ctx.set_source_rgba(l_r, l_g, l_b, 0.92)
+            ctx.fill_preserve()
+
+        ctx.set_source_rgba(border_rgb[0], border_rgb[1], border_rgb[2], 0.95)
+        ctx.set_line_width(1.2)
+        ctx.stroke()
+
+        # Scan Selection active green indicator dot in top-right corner
+        if scan_on:
+            ctx.arc(x + bw - 4.5, y + 4.5, 2.3, 0, 2 * math.pi)
+            ctx.set_source_rgba(0.25, 0.98, 0.58, 1.0)
+            ctx.fill()
+
+        if self.config.get("font_color_mode", "dynamic") == "custom":
+            c_rgb = hex_to_rgb(self.config.get("custom_font_color", "#ffffff"), default=text_rgb)
+            title_rgb = c_rgb
+            sub_rgb = c_rgb
+        else:
+            title_rgb = border_rgb
+            sub_rgb = (bg_rgb[0] * 0.85, bg_rgb[1] * 0.85, bg_rgb[2] * 0.85) if bg_style == "light" else text_rgb
+
+        ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        t_sz = max(6.5, bh * 0.27)
+        ctx.set_font_size(t_sz)
+        t_str = "DICT"
+        ext = ctx.text_extents(t_str)
+        self._draw_styled_text(
+            ctx,
+            x + (bw - ext.width) / 2.0 - ext.x_bearing,
+            y + t_sz + 1.5,
+            t_str,
+            title_rgb,
+        )
+
+        s_sz = max(7.0, bh * 0.30)
+        ctx.set_font_size(s_sz)
+        s_str = "SCAN" if scan_on else "CALC"
+        s_ext = ctx.text_extents(s_str)
+        self._draw_styled_text(
+            ctx,
+            x + (bw - s_ext.width) / 2.0 - s_ext.x_bearing,
+            y + bh - 3.2,
+            s_str,
+            sub_rgb,
+        )
+        return False
+
+    def handle_applet_button_press(self, widget, event):
+        # Allow clicking inside the inline panel_entry without intercepting focus
+        if (
+            self.config.get("display_mode", "badge") == "panel_entry"
+            and event.window == self.panel_entry.get_window()
+        ):
+            return False
+        if event.button == 1:
+            GObject.signal_stop_emission_by_name(widget, "button-press-event")
+            self.toggle_popup_window()
+            return True
+        elif event.button == 2:
+            GObject.signal_stop_emission_by_name(widget, "button-press-event")
+            self.toggle_scan_selection()
+            return True
+        return False
+
+    def _on_button_press(self, widget, event):
+        if event.button == 1:
+            if self.applet is not None:
+                GObject.signal_stop_emission_by_name(widget, "button-press-event")
+            self.toggle_popup_window()
+            return True
+        elif event.button == 2:
+            if self.applet is not None:
+                GObject.signal_stop_emission_by_name(widget, "button-press-event")
+            self.toggle_scan_selection()
+            return True
+        elif event.button == 3 and self.applet is None:
+            self.show_preferences_dialog()
+            return True
+        return False
+
+    def _ensure_popup_window(self):
+        if self.popup_win is None:
+            self.popup_win = DictCalcPopupWindow(self)
+        return self.popup_win
+
+    def toggle_popup_window(self, *_args):
+        win = self._ensure_popup_window()
+        if win.is_visible():
+            win.hide()
+        else:
+            win.present_with_query("", near_pointer=False)
+
+    def open_popup_window(self, text="", near_pointer=False):
+        win = self._ensure_popup_window()
+        win.present_with_query(text, near_pointer=near_pointer)
+
+    # =========================================================================
+    # Preferences Window (Hotkeys + Scan Selection + Calculator + 41 Dicts)
+    # =========================================================================
+
+    def show_preferences_dialog(self, *_args):
+        if self.prefs_win is not None:
+            self.prefs_win.present()
+            return
+
+        win = Gtk.Window(title="StarDict 離線詞典 & 計算機 Plus — 偏好設定")
+        win.set_default_size(560, 660)
+        win.set_position(Gtk.WindowPosition.CENTER)
+        self.prefs_win = win
+        win.connect("destroy", lambda *_: setattr(self, "prefs_win", None))
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        outer.set_margin_top(12)
+        outer.set_margin_bottom(12)
+        outer.set_margin_start(14)
+        outer.set_margin_end(14)
+
+        notebook = Gtk.Notebook()
+
+        # ---------------- Tab 1: General, Hotkeys, Scan Selection & Appearance ----------------
+        tab1 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        tab1.set_margin_top(12)
+        tab1.set_margin_bottom(12)
+        tab1.set_margin_start(14)
+        tab1.set_margin_end(14)
+
+        # 1. Global Hotkeys
+        s1_lbl = Gtk.Label(xalign=0.0)
+        s1_lbl.set_markup(
+            "<b>1. 全域快捷鍵設定</b> "
+            + (
+                "<small><span foreground='#34d399'>(Keybinder 3.0 已啟用)</span></small>"
+                if HAS_KEYBINDER
+                else "<small><span foreground='#f87171'>(未安裝 Keybinder 3.0)</span></small>"
+            )
+        )
+        tab1.pack_start(s1_lbl, False, False, 0)
+
+        hk_grid = Gtk.Grid(column_spacing=10, row_spacing=8)
+        hk_grid.set_margin_start(12)
+
+        entry_hk_open = Gtk.Entry()
+        entry_hk_open.set_text(self.config.get("hotkey_open_window", "<Ctrl><Alt>d"))
+        entry_hk_open.set_placeholder_text("例如 <Ctrl><Alt>d 或 <Super>d")
+
+        entry_hk_scan = Gtk.Entry()
+        entry_hk_scan.set_text(self.config.get("hotkey_scan_selection", "<Ctrl><Alt>s"))
+        entry_hk_scan.set_placeholder_text("例如 <Ctrl><Alt>s 或 <Alt>q")
+
+        btn_apply_hk = Gtk.Button(label="套用快捷鍵")
+
+        hk_grid.attach(Gtk.Label(label="呼叫查詢/計算視窗快捷鍵：", xalign=0.0), 0, 0, 1, 1)
+        hk_grid.attach(entry_hk_open, 1, 0, 1, 1)
+        hk_grid.attach(Gtk.Label(label="Scan Selection 劃詞查詢快捷鍵：", xalign=0.0), 0, 1, 1, 1)
+        hk_grid.attach(entry_hk_scan, 1, 1, 1, 1)
+        hk_grid.attach(btn_apply_hk, 2, 0, 1, 2)
+        tab1.pack_start(hk_grid, False, False, 0)
+
+        tab1.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+
+        # 2. Scan Selection & Calculator Behavior
+        s2_lbl = Gtk.Label(xalign=0.0)
+        s2_lbl.set_markup("<b>2. 滑鼠劃詞查詢 (Scan Selection) 與計算機設定</b>")
+        tab1.pack_start(s2_lbl, False, False, 0)
+
+        chk_scan_en = Gtk.CheckButton(label="啟用滑鼠反白自動劃詞查詢 (監聽 PRIMARY 選取區)")
+        chk_scan_en.set_active(self.config.get("scan_selection_enabled", False))
+        tab1.pack_start(chk_scan_en, False, False, 0)
+
+        mod_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        mod_box.set_margin_start(14)
+        mod_box.pack_start(Gtk.Label(label="自動劃詞觸發條件：", xalign=0.0), False, False, 0)
+        combo_mod = Gtk.ComboBoxText()
+        for m_id, m_lbl in (
+            ("ctrl", "反白時需按住 Ctrl 鍵 (避免誤觸，推薦)"),
+            ("alt", "反白時需按住 Alt 鍵"),
+            ("shift", "反白時需按住 Shift 鍵"),
+            ("none", "純滑鼠反白即立刻彈出查詢"),
+        ):
+            combo_mod.append(m_id, m_lbl)
+        combo_mod.set_active_id(self.config.get("scan_modifier", "ctrl"))
+        mod_box.pack_start(combo_mod, True, True, 0)
+        tab1.pack_start(mod_box, False, False, 0)
+
+        chk_auto_copy = Gtk.CheckButton(
+            label="數學計算模式下，預設將計算結果自動存入系統剪貼簿 (可直接 Ctrl+V 貼上)"
+        )
+        chk_auto_copy.set_active(self.config.get("calc_auto_copy", True))
+        tab1.pack_start(chk_auto_copy, False, False, 0)
+
+        tab1.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+
+        # 3. Panel Mode & Appearance
+        s3_lbl = Gtk.Label(xalign=0.0)
+        s3_lbl.set_markup("<b>3. 面板顯示樣式、字形顏色與底色適應</b>")
+        tab1.pack_start(s3_lbl, False, False, 0)
+
+        rb_badge = Gtk.RadioButton.new_with_label_from_widget(
+            None, "模式 A：精簡圓角方塊圖示 ([DICT / CALC])"
+        )
+        rb_entry = Gtk.RadioButton.new_with_label_from_widget(
+            rb_badge, "模式 B：面板內嵌即時查詢與計算輸入框 ([DICT] [輸入單字或算式...])"
+        )
+        if self.config.get("display_mode", "badge") == "badge":
+            rb_badge.set_active(True)
+        else:
+            rb_entry.set_active(True)
+        tab1.pack_start(rb_badge, False, False, 0)
+        tab1.pack_start(rb_entry, False, False, 0)
+
+        size_grid = Gtk.Grid(column_spacing=12, row_spacing=6)
+        size_grid.set_margin_start(14)
+        spin_entry_w = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(
+                value=float(self.config.get("panel_entry_width", 170)),
+                lower=90.0,
+                upper=320.0,
+                step_increment=10.0,
+                page_increment=20.0,
+                page_size=0.0,
+            ),
+            climb_rate=1.0,
+            digits=0,
+        )
+        spin_res_fs = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(
+                value=float(self.config.get("result_font_size", 11)),
+                lower=8.0,
+                upper=22.0,
+                step_increment=1.0,
+                page_increment=2.0,
+                page_size=0.0,
+            ),
+            climb_rate=1.0,
+            digits=0,
+        )
+        size_grid.attach(Gtk.Label(label="面板內嵌輸入框寬度 (px)：", xalign=0.0), 0, 0, 1, 1)
+        size_grid.attach(spin_entry_w, 1, 0, 1, 1)
+        size_grid.attach(Gtk.Label(label="查詢結果視窗字型大小 (pt)：", xalign=0.0), 2, 0, 1, 1)
+        size_grid.attach(spin_res_fs, 3, 0, 1, 1)
+        tab1.pack_start(size_grid, False, False, 0)
+
+        # Font color & badge background
+        col_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        rb_col_dyn = Gtk.RadioButton.new_with_label_from_widget(None, "自動字色")
+        rb_col_cus = Gtk.RadioButton.new_with_label_from_widget(rb_col_dyn, "自訂面板字色：")
+        if self.config.get("font_color_mode", "dynamic") == "dynamic":
+            rb_col_dyn.set_active(True)
+        else:
+            rb_col_cus.set_active(True)
+        col_btn = Gtk.ColorButton()
+        rgba0 = Gdk.RGBA()
+        if not rgba0.parse(self.config.get("custom_font_color", "#ffffff")):
+            rgba0.parse("#ffffff")
+        col_btn.set_rgba(rgba0)
+        col_box.pack_start(rb_col_dyn, False, False, 0)
+        col_box.pack_start(rb_col_cus, False, False, 0)
+        col_box.pack_start(col_btn, False, False, 0)
+        tab1.pack_start(col_box, False, False, 0)
+
+        bg_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        bg_box.pack_start(Gtk.Label(label="方塊背景底色：", xalign=0.0), False, False, 0)
+        rb_bg_dark = Gtk.RadioButton.new_with_label_from_widget(None, "深色底")
+        rb_bg_light = Gtk.RadioButton.new_with_label_from_widget(rb_bg_dark, "淺色底")
+        rb_bg_trans = Gtk.RadioButton.new_with_label_from_widget(rb_bg_dark, "完全透明")
+        cur_bg = self.config.get("badge_bg_style", "dark")
+        if cur_bg == "dark":
+            rb_bg_dark.set_active(True)
+        elif cur_bg == "light":
+            rb_bg_light.set_active(True)
+        else:
+            rb_bg_trans.set_active(True)
+        bg_box.pack_start(rb_bg_dark, False, False, 0)
+        bg_box.pack_start(rb_bg_light, False, False, 0)
+        bg_box.pack_start(rb_bg_trans, False, False, 0)
+        tab1.pack_start(bg_box, False, False, 0)
+
+        chk_shadow = Gtk.CheckButton(label="啟用面板文字高對比描邊陰影")
+        chk_shadow.set_active(self.config.get("text_shadow", False))
+        tab1.pack_start(chk_shadow, False, False, 0)
+
+        notebook.append_page(tab1, Gtk.Label(label="⚙️ 一般、快捷鍵與外觀"))
+
+        # ---------------- Tab 2: 41 StarDict Dictionaries Manager ----------------
+        tab2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        tab2.set_margin_top(10)
+        tab2.set_margin_bottom(10)
+        tab2.set_margin_start(12)
+        tab2.set_margin_end(12)
+
+        d_hdr = Gtk.Label(xalign=0.0)
+        d_hdr.set_markup(
+            f"<b>已掃描到 {len(self.dict_mgr.all_dicts)} 套離線 StarDict 詞典</b> "
+            f"<small>(勾選後將納入「⭐ 常用詞典」群組查詢)</small>"
+        )
+        tab2.pack_start(d_hdr, False, False, 0)
+
+        # TreeView with checkboxes
+        store = Gtk.ListStore(bool, str, str, int)
+        enabled_set = set(self.config.get("enabled_dicts", DEFAULT_PREFERRED_DICTS))
+        grp_labels = {"en_zh": "英漢/漢英", "ja_zh": "日漢/漢日", "sci_en": "科技/英英"}
+        for d in self.dict_mgr.all_dicts:
+            store.append(
+                [
+                    d["bookname"] in enabled_set,
+                    d["bookname"],
+                    grp_labels.get(d["group"], d["group"]),
+                    d["wordcount"],
+                ]
+            )
+
+        tree = Gtk.TreeView(model=store)
+        rend_toggle = Gtk.CellRendererToggle()
+
+        def on_dict_row_toggled(_cell, path_str):
+            store[path_str][0] = not store[path_str][0]
+            new_enabled = [row[1] for row in store if row[0]]
+            self.config["enabled_dicts"] = new_enabled
+            self._save_config()
+
+        rend_toggle.connect("toggled", on_dict_row_toggled)
+        tree.append_column(Gtk.TreeViewColumn("啟用", rend_toggle, active=0))
+        col_name = Gtk.TreeViewColumn("詞典名稱 (Bookname)", Gtk.CellRendererText(), text=1)
+        col_name.set_expand(True)
+        tree.append_column(col_name)
+        tree.append_column(Gtk.TreeViewColumn("分類", Gtk.CellRendererText(), text=2))
+        tree.append_column(Gtk.TreeViewColumn("詞條數", Gtk.CellRendererText(), text=3))
+
+        d_scroll = Gtk.ScrolledWindow()
+        d_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        d_scroll.set_vexpand(True)
+        d_scroll.add(tree)
+        tab2.pack_start(d_scroll, True, True, 0)
+
+        d_btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_sel_all = Gtk.Button(label="全部勾選")
+        btn_sel_none = Gtk.Button(label="全部取消")
+        btn_sel_def = Gtk.Button(label="恢復推薦常用詞典")
+
+        def set_dict_selection(mode_sel):
+            for row in store:
+                if mode_sel == "all":
+                    row[0] = True
+                elif mode_sel == "none":
+                    row[0] = False
+                else:
+                    row[0] = row[1] in DEFAULT_PREFERRED_DICTS
+            self.config["enabled_dicts"] = [row[1] for row in store if row[0]]
+            self._save_config()
+
+        btn_sel_all.connect("clicked", lambda *_: set_dict_selection("all"))
+        btn_sel_none.connect("clicked", lambda *_: set_dict_selection("none"))
+        btn_sel_def.connect("clicked", lambda *_: set_dict_selection("default"))
+        d_btn_box.pack_start(btn_sel_all, False, False, 0)
+        d_btn_box.pack_start(btn_sel_none, False, False, 0)
+        d_btn_box.pack_start(btn_sel_def, False, False, 0)
+        tab2.pack_start(d_btn_box, False, False, 0)
+
+        notebook.append_page(tab2, Gtk.Label(label=f"📚 詞典管理 ({len(self.dict_mgr.all_dicts)} 套)"))
+
+        outer.pack_start(notebook, True, True, 0)
+
+        # Live apply bindings for Tab 1
+        def rgba_to_hex(rgba):
+            r = max(0, min(255, int(round(rgba.red * 255))))
+            g = max(0, min(255, int(round(rgba.green * 255))))
+            b = max(0, min(255, int(round(rgba.blue * 255))))
+            return f"#{r:02x}{g:02x}{b:02x}"
+
+        def apply_tab1(*_):
+            self.config["hotkey_open_window"] = entry_hk_open.get_text().strip()
+            self.config["hotkey_scan_selection"] = entry_hk_scan.get_text().strip()
+            self.config["scan_selection_enabled"] = chk_scan_en.get_active()
+            self.config["scan_modifier"] = combo_mod.get_active_id() or "ctrl"
+            self.config["calc_auto_copy"] = chk_auto_copy.get_active()
+            self.config["display_mode"] = "badge" if rb_badge.get_active() else "panel_entry"
+            self.config["panel_entry_width"] = int(spin_entry_w.get_value_as_int())
+            self.config["result_font_size"] = int(spin_res_fs.get_value_as_int())
+            self.config["font_color_mode"] = "dynamic" if rb_col_dyn.get_active() else "custom"
+            self.config["custom_font_color"] = rgba_to_hex(col_btn.get_rgba())
+            if rb_bg_dark.get_active():
+                self.config["badge_bg_style"] = "dark"
+            elif rb_bg_light.get_active():
+                self.config["badge_bg_style"] = "light"
+            else:
+                self.config["badge_bg_style"] = "transparent"
+            self.config["text_shadow"] = chk_shadow.get_active()
+            self._save_config()
+            self.rebind_global_hotkeys()
+            self._apply_panel_layout()
+            self._update_tooltip()
+            if self.popup_win is not None:
+                self.popup_win.sync_controls()
+
+        btn_apply_hk.connect("clicked", apply_tab1)
+        combo_mod.connect("changed", apply_tab1)
+        col_btn.connect("color-set", lambda *_: (rb_col_cus.set_active(True), apply_tab1()))
+        for w_c in (
+            chk_scan_en,
+            chk_auto_copy,
+            rb_badge,
+            rb_entry,
+            rb_col_dyn,
+            rb_col_cus,
+            rb_bg_dark,
+            rb_bg_light,
+            rb_bg_trans,
+            chk_shadow,
+        ):
+            w_c.connect("toggled", apply_tab1)
+        for sp_c in (spin_entry_w, spin_res_fs):
+            sp_c.connect("value-changed", apply_tab1)
+
+        # Bottom Close Button
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_open_q = Gtk.Button(label="🔎 開啟查詢/計算視窗")
+        btn_open_q.connect("clicked", lambda *_: self.open_popup_window(""))
+        btn_close = Gtk.Button(label="關閉")
+        btn_close.connect("clicked", lambda *_: win.destroy())
+        btn_row.pack_start(btn_open_q, False, False, 0)
+        btn_row.pack_end(btn_close, False, False, 0)
+        outer.pack_end(btn_row, False, False, 0)
+
+        win.add(outer)
+        win.show_all()
+
+    def show_about_dialog(self, *_args):
+        dlg = Gtk.AboutDialog()
+        dlg.set_program_name("StarDict 離線詞典 & 科學計算機 Plus")
+        dlg.set_version("1.0.0")
+        dlg.set_comments(
+            "MATE Panel 離線 StarDict 多詞典查詢與科學計算機 Applet。\n"
+            "直連系統 sdcv 離線詞庫、支援滑鼠劃詞取詞、全域快捷鍵與計算結果自動存入剪貼簿。"
+        )
+        dlg.set_website("https://github.com/sophAi/matepanel-applet-plus")
+        dlg.run()
+        dlg.destroy()
+
+    def _on_destroy(self, *_args):
+        if HAS_KEYBINDER:
+            for hk in self._bound_hotkeys:
+                try:
+                    Keybinder.unbind(hk)
+                except Exception:
+                    pass
+        if self.popup_win is not None:
+            self.popup_win.destroy()
+            self.popup_win = None
+        if self.prefs_win is not None:
+            self.prefs_win.destroy()
+            self.prefs_win = None
+
+
+def setup_applet_context_menu(applet, widget):
+    action_group = Gtk.ActionGroup(name="DictCalcAppletActions")
+    action_group.add_actions(
+        [
+            (
+                "OpenQueryAction",
+                Gtk.STOCK_FIND,
+                "開啟查詢 / 計算機視窗 (_Search & Calc)...",
+                None,
+                "開啟離線詞典查詢與科學計算機視窗",
+                lambda *_: widget.open_popup_window(""),
+            ),
+            (
+                "ScanNowAction",
+                Gtk.STOCK_SELECT_ALL,
+                "立即查詢反白文字 (_Scan Selection Now)",
+                None,
+                "查詢或計算目前滑鼠反白選取的文字",
+                widget.trigger_scan_selection_now,
+            ),
+            (
+                "ToggleScanAction",
+                Gtk.STOCK_YES,
+                "開關自動劃詞取詞 (_Toggle Auto Scan)",
+                None,
+                "切換啟用或關閉滑鼠反白自動劃詞查詢",
+                widget.toggle_scan_selection,
+            ),
+            (
+                "PreferencesAction",
+                Gtk.STOCK_PREFERENCES,
+                "偏好設定與詞典管理 (_Preferences)...",
+                None,
+                "設定快捷鍵、劃詞取詞、自動複製答案與管理 41 套離線詞典",
+                widget.show_preferences_dialog,
+            ),
+            (
+                "AboutAction",
+                Gtk.STOCK_ABOUT,
+                "關於 (_About)...",
+                None,
+                "關於 StarDict 離線詞典 & 科學計算機 Plus",
+                widget.show_about_dialog,
+            ),
+        ]
+    )
+
+    menu_xml = (
+        '<menuitem name="OpenQuery" action="OpenQueryAction"/>'
+        '<menuitem name="ScanNow" action="ScanNowAction"/>'
+        '<menuitem name="ToggleScan" action="ToggleScanAction"/>'
+        "<separator/>"
+        '<menuitem name="Preferences" action="PreferencesAction"/>'
+        '<menuitem name="About" action="AboutAction"/>'
+        "<separator/>"
+    )
+    applet.setup_menu(menu_xml, action_group)
+
+
+def applet_fill(applet):
+    os.chdir(os.path.expanduser("~"))
+    applet.set_flags(MatePanelApplet.AppletFlags.EXPAND_MINOR)
+    applet.set_background_widget(applet)
+    applet.set_events(
+        applet.get_events()
+        | Gdk.EventMask.BUTTON_PRESS_MASK
+        | Gdk.EventMask.BUTTON_RELEASE_MASK
+    )
+
+    widget = DictCalcWidget(applet=applet)
+    init_size = applet.get_size()
+    if init_size:
+        widget.set_panel_size(init_size)
+
+    setup_applet_context_menu(applet, widget)
+
+    applet.connect("button-press-event", widget.handle_applet_button_press)
+    applet.connect("change-size", lambda _ap, sz: widget.set_panel_size(sz))
+
+    applet.add(widget)
+    applet.show_all()
+
+
+def applet_factory(applet, iid, _data):
+    if iid not in ("DictCalcApplet", "MateDictCalcApplet"):
+        return False
+    applet_fill(applet)
+    return True
+
+
+def run_standalone_window():
+    win = Gtk.Window(title="MATE StarDict & Calculator Applet - 預覽測試視窗")
+    win.set_default_size(680, 175)
+    win.set_position(Gtk.WindowPosition.CENTER)
+    win.connect("destroy", Gtk.main_quit)
+
+    vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+    vbox.set_margin_top(16)
+    vbox.set_margin_bottom(16)
+    vbox.set_margin_start(16)
+    vbox.set_margin_end(16)
+
+    info_lbl = Gtk.Label(xalign=0.0)
+    info_lbl.set_markup(
+        "<b>MATE Panel 模擬預覽列 — StarDict 離線詞典 &amp; 🧮 科學計算機 Plus</b>\n"
+        "<small>• <b>左鍵點選</b> <tt>[DICT]</tt>（或按預設快捷鍵 <tt>Ctrl+Alt+D</tt>）：開啟查詢與計算機視窗\n"
+        "• <b>中鍵點選</b> <tt>[DICT]</tt>：開關滑鼠劃詞查詢 | 快捷鍵 <tt>Ctrl+Alt+S</tt>：立即查詢滑鼠反白文字</small>"
+    )
+    vbox.pack_start(info_lbl, False, False, 0)
+
+    panel_frame = Gtk.EventBox()
+    css_provider = Gtk.CssProvider()
+    css_provider.load_from_data(
+        b".simulated-panel-dark { background-color: #1e2229; border-radius: 6px; padding: 6px; }"
+    )
+    panel_frame.get_style_context().add_provider(
+        css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+    )
+    panel_frame.get_style_context().add_class("simulated-panel-dark")
+
+    hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    hbox.set_margin_top(4)
+    hbox.set_margin_bottom(4)
+    hbox.set_margin_start(10)
+    hbox.set_margin_end(10)
+
+    panel_lbl = Gtk.Label()
+    panel_lbl.set_markup("<span foreground='#9aa0a6'><small>模擬面板 👉</small></span>")
+    hbox.pack_start(panel_lbl, False, False, 0)
+
+    widget = DictCalcWidget(applet=None)
+    widget.set_panel_size(32)
+    hbox.pack_start(widget, False, False, 0)
+
+    btn_prefs = Gtk.Button(label="⚙️ 偏好設定 & 詞典管理")
+    btn_prefs.connect("clicked", widget.show_preferences_dialog)
+    hbox.pack_end(btn_prefs, False, False, 0)
+
+    btn_open = Gtk.Button(label="🔎 開啟查詢/計算視窗")
+    btn_open.connect("clicked", lambda *_: widget.open_popup_window(""))
+    hbox.pack_end(btn_open, False, False, 0)
+
+    panel_frame.add(hbox)
+    vbox.pack_start(panel_frame, False, False, 0)
+
+    win.add(vbox)
+    win.show_all()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    if "--window" in sys.argv or "-w" in sys.argv:
+        run_standalone_window()
+    elif "--test-query" in sys.argv:
+        idx = sys.argv.index("--test-query")
+        q = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else "hello"
+        calc = SafeMathCalculator()
+        is_m, res, err = calc.try_evaluate(q, record_history=True)
+        if is_m:
+            print(json.dumps({"mode": "calc", "expr": q, "result": res, "error": err}, ensure_ascii=False, indent=2))
+        else:
+            mgr = StarDictManager()
+            d_names = mgr.get_dicts_for_group("custom", DEFAULT_PREFERRED_DICTS)
+            hits = mgr.query_sync(q, dict_names=d_names)
+            print(json.dumps({"mode": "dict", "query": q, "total_dicts": len(mgr.all_dicts), "hits": len(hits), "first_hit": hits[0] if hits else None}, ensure_ascii=False, indent=2))
+    else:
+        if not HAS_MATE_PANEL:
+            sys.stderr.write("Error: MatePanelApplet GI bindings not available.\n")
+            sys.exit(1)
+        MatePanelApplet.Applet.factory_main(
+            "DictCalcAppletFactory",
+            True,
+            MatePanelApplet.Applet.__gtype__,
+            applet_factory,
+            None,
+        )

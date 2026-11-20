@@ -1,0 +1,13 @@
+[Applet Factory]
+Id=DictCalcAppletFactory
+InProcess=false
+Location=@APPLET_EXEC@
+Name=StarDict Dictionary & Calculator Applet Factory
+Description=Factory for Offline StarDict Dictionary and Scientific Calculator Applet
+
+[DictCalcApplet]
+Name=StarDict Dictionary & Calc Plus
+Name[zh_TW]=StarDict 離線詞典與計算機 Plus
+Description=Offline StarDict multi-dictionary lookup, scan selection, global hotkeys, and scientific calculator with auto-copy
+Description[zh_TW]=離線查詢系統 StarDict 詞庫（支援滑鼠劃詞與全域快捷鍵），並內建數學公式計算機（自動存入剪貼簿）
+Icon=accessories-dictionary

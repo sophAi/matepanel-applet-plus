@@ -18,16 +18,23 @@ TASK_EXEC="${TASK_DIR}/taskwarrior_applet.py"
 TASK_APPLET_FILE="org.mate.panel.TaskwarriorApplet.mate-panel-applet"
 TASK_SERVICE_FILE="org.mate.panel.applet.TaskwarriorAppletFactory.service"
 
+# 3. StarDict Dictionary & Calculator Applet definitions
+DICT_DIR="${REPO_DIR}/applets/dict-calc"
+DICT_EXEC="${DICT_DIR}/dict_calc_applet.py"
+DICT_APPLET_FILE="org.mate.panel.DictCalcApplet.mate-panel-applet"
+DICT_SERVICE_FILE="org.mate.panel.applet.DictCalcAppletFactory.service"
+
 usage() {
     cat <<EOF
-用法: $0 [install|uninstall|test|test-temp|test-task] [all|temp|task]
+用法: $0 [install|uninstall|test|test-temp|test-task|test-dict] [all|temp|task|dict]
 
 指令:
-  install [all|temp|task]    將 Applet 註冊至系統 MATE Panel 與 D-Bus (預設: all，需要 sudo)
-  uninstall [all|temp|task]  從系統移除 Applet 註冊檔 (預設: all，需要 sudo)
-  test [temp|task]           啟動獨立 GTK 預覽視窗測試 Applet (預設: task，不需 sudo)
-  test-temp                  啟動「CPU/GPU 溫度與負載監控 Plus」獨立預覽視窗
-  test-task                  啟動「Taskwarrior 任務管理 Plus」獨立預覽視窗
+  install [all|temp|task|dict]    將 Applet 註冊至系統 MATE Panel 與 D-Bus (預設: all，需要 sudo)
+  uninstall [all|temp|task|dict]  從系統移除 Applet 註冊檔 (預設: all，需要 sudo)
+  test [temp|task|dict]           啟動獨立 GTK 預覽視窗測試 Applet (不需 sudo)
+  test-temp                       啟動「CPU/GPU 溫度與負載監控 Plus」獨立預覽視窗
+  test-task                       啟動「Taskwarrior 任務管理與番茄鐘 Plus」獨立預覽視窗
+  test-dict                       啟動「StarDict 離線詞典與計算機 Plus」獨立預覽視窗
 EOF
 }
 
@@ -74,10 +81,14 @@ case "${ACTION}" in
         if [[ "${TARGET}" == "all" || "${TARGET}" == "task" ]]; then
             install_one "${TASK_DIR}" "${TASK_EXEC}" "${TASK_APPLET_FILE}" "${TASK_SERVICE_FILE}" "Taskwarrior 任務管理 Plus"
         fi
+        if [[ "${TARGET}" == "all" || "${TARGET}" == "dict" ]]; then
+            install_one "${DICT_DIR}" "${DICT_EXEC}" "${DICT_APPLET_FILE}" "${DICT_SERVICE_FILE}" "StarDict 離線詞典與計算機 Plus"
+        fi
         echo "✅ 安裝完成！"
         echo "👉 現在可以在 MATE 面板空白處按「右鍵」->「加入面板 (Add to Panel...)」，搜尋："
         echo "   • CPU/GPU 溫度監控 Plus"
         echo "   • Taskwarrior 任務管理 Plus"
+        echo "   • StarDict 離線詞典與計算機 Plus"
         ;;
     uninstall)
         if [[ "${TARGET}" == "all" || "${TARGET}" == "temp" ]]; then
@@ -86,11 +97,16 @@ case "${ACTION}" in
         if [[ "${TARGET}" == "all" || "${TARGET}" == "task" ]]; then
             uninstall_one "${TASK_EXEC}" "${TASK_APPLET_FILE}" "${TASK_SERVICE_FILE}" "Taskwarrior 任務管理 Plus"
         fi
+        if [[ "${TARGET}" == "all" || "${TARGET}" == "dict" ]]; then
+            uninstall_one "${DICT_EXEC}" "${DICT_APPLET_FILE}" "${DICT_SERVICE_FILE}" "StarDict 離線詞典與計算機 Plus"
+        fi
         echo "✅ 移除完成！"
         ;;
     test)
         if [[ "${TARGET}" == "temp" ]]; then
             exec /usr/bin/python3 "${TEMP_EXEC}" --window
+        elif [[ "${TARGET}" == "dict" ]]; then
+            exec /usr/bin/python3 "${DICT_EXEC}" --window
         else
             exec /usr/bin/python3 "${TASK_EXEC}" --window
         fi
@@ -100,6 +116,9 @@ case "${ACTION}" in
         ;;
     test-task)
         exec /usr/bin/python3 "${TASK_EXEC}" --window
+        ;;
+    test-dict)
+        exec /usr/bin/python3 "${DICT_EXEC}" --window
         ;;
     *)
         usage
