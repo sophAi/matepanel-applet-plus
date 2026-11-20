@@ -1311,6 +1311,50 @@ class StarDictManager:
         except Exception:
             return []
 
+    @staticmethod
+    def is_single_english_word(text):
+        """Return True iff `text` is a single pure-English word (length >= 3, no whitespace)."""
+        s = (text or "").strip()
+        return len(s) >= 3 and bool(re.fullmatch(r"[A-Za-z][A-Za-z'-]{1,40}", s))
+
+    @classmethod
+    def suggest_spelling_sync(cls, word, max_suggestions=6, timeout=2.0):
+        """
+        Use system `/usr/bin/aspell -a --lang=en` (~15ms, 0 MB idle RAM) to suggest
+        likely correct spellings for a misspelled single English word.
+        """
+        w = (word or "").strip()
+        if not cls.is_single_english_word(w):
+            return []
+        aspell_bin = "/usr/bin/aspell"
+        if not os.path.isfile(aspell_bin):
+            return []
+        try:
+            proc = subprocess.run(
+                [aspell_bin, "-a", "--lang=en"],
+                input=w + "\n",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            suggestions = []
+            w_low = w.lower()
+            for line in proc.stdout.splitlines():
+                if line.startswith("& ") and ":" in line:
+                    rhs = line.split(":", 1)[1].strip()
+                    for cand in rhs.split(","):
+                        c = cand.strip()
+                        if c and c.lower() != w_low and c not in suggestions:
+                            suggestions.append(c)
+                            if len(suggestions) >= max_suggestions:
+                                break
+                    break
+            return suggestions
+        except Exception:
+            return []
+
 
 def hex_to_rgb(hex_str, default=(1.0, 1.0, 1.0)):
     if not hex_str or not isinstance(hex_str, str):
@@ -1430,6 +1474,11 @@ class DictCalcPopupWindow(Gtk.Window):
         self.calc_frame.add(calc_hbox)
         root.pack_start(self.calc_frame, False, False, 0)
 
+        # Spelling Suggestion Bar (shown only when a misspelled single English word is detected)
+        self.suggest_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        self.suggest_box.set_no_show_all(True)
+        root.pack_start(self.suggest_box, False, False, 0)
+
         # Scrollable Dictionary Results TextView
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
@@ -1458,6 +1507,36 @@ class DictCalcPopupWindow(Gtk.Window):
         self.add(root)
         self.show_all()
         self.calc_frame.hide()
+        self.suggest_box.hide()
+
+    def set_spelling_suggestions(self, original_word, suggestions, auto_word=None):
+        for child in list(self.suggest_box.get_children()):
+            self.suggest_box.remove(child)
+        if not suggestions:
+            self.suggest_box.hide()
+            return
+        lbl = Gtk.Label()
+        lbl.set_markup(
+            f"<small><span foreground='#fbbf24'>💡 您是不是要找：</span></small>"
+        )
+        self.suggest_box.pack_start(lbl, False, False, 0)
+        for cand in suggestions[:5]:
+            btn = Gtk.Button(label=cand)
+            btn.set_can_focus(False)
+            btn.set_relief(Gtk.ReliefStyle.NONE)
+            if auto_word and cand == auto_word:
+                btn.set_tooltip_text(f"已自動顯示「{cand}」釋義")
+            else:
+                btn.set_tooltip_text(f"點擊查詢「{cand}」")
+            btn.connect(
+                "clicked",
+                lambda _b, w=cand: (
+                    self.parent_widget.panel_entry.set_text(w),
+                    self.parent_widget.execute_query(w, near_pointer=False, keep_panel_focus=True),
+                ),
+            )
+            self.suggest_box.pack_start(btn, False, False, 0)
+        self.suggest_box.show_all()
 
     def _init_text_tags(self):
         buf = self.result_buf
@@ -1555,6 +1634,7 @@ class DictCalcPopupWindow(Gtk.Window):
             self.query_title_lbl.set_markup(f"<b>📖 查詢：{html.escape(short_q)}</b>")
             loading_msg = f"🔎 正在查詢「{short_q}」..."
         self.calc_frame.hide()
+        self.suggest_box.hide()
         self._last_calc_result = None
         self.result_buf.set_text("")
         self.result_buf.insert_with_tags(
@@ -1606,8 +1686,16 @@ class DictCalcPopupWindow(Gtk.Window):
         )
         self.position_and_show(near_pointer=near_pointer)
 
-    def show_dict_results(self, query_word, results, near_pointer=False):
-        self.query_title_lbl.set_markup(f"<b>📖 查詢：{html.escape(query_word)}</b>")
+    def show_dict_results(self, query_word, results, near_pointer=False, spelling_info=None):
+        if spelling_info:
+            orig_w, sugs, auto_w = spelling_info
+            self.query_title_lbl.set_markup(
+                f"<b>📖 拼字修正：{html.escape(orig_w)} → {html.escape(auto_w or sugs[0])}</b>"
+            )
+            self.set_spelling_suggestions(orig_w, sugs, auto_word=auto_w)
+        else:
+            self.query_title_lbl.set_markup(f"<b>📖 查詢：{html.escape(query_word)}</b>")
+            self.suggest_box.hide()
         self.calc_frame.hide()
         self._last_calc_result = None
 
@@ -1615,9 +1703,14 @@ class DictCalcPopupWindow(Gtk.Window):
         buf.set_text("")
 
         if not results:
+            sug_hint = ""
+            if spelling_info:
+                _ow, sugs, _aw = spelling_info
+                sug_hint = f"💡 您是不是要找：{', '.join(sugs)}\n\n"
             buf.insert_with_tags(
                 buf.get_end_iter(),
                 f"找不到「{query_word}」的詞條釋義。\n\n"
+                f"{sug_hint}"
                 f"💡 建議：\n"
                 f"• 點選右上角「⚙️ 偏好設定 → 詞典管理」勾選更多詞典\n"
                 f"• 若要進行數學計算，可在算式最前面加上「=」（例如 =2^10）\n",
@@ -2411,18 +2504,21 @@ class DictCalcWidget(Gtk.EventBox):
             "results": [],
             "pending": (1 if sdcv_names else 0) + len(virtual_tr_names),
             "has_virtual": bool(virtual_tr_names),
+            "spelling_info": None,
         }
 
-        def merge_and_render(new_items):
+        def merge_and_render(new_items, spelling_info=None):
             if seq != self._query_seq:
                 return False
+            if spelling_info is not None:
+                state["spelling_info"] = spelling_info
             if new_items:
                 state["results"].extend(new_items)
                 state["results"].sort(key=lambda r: priority_map.get(r["dict"], 999999))
             state["pending"] -= 1
             is_final = state["pending"] <= 0
             # Progressive display: show offline results immediately if non-empty; wait for final if still empty
-            if state["results"] or is_final:
+            if state["results"] or state["spelling_info"] or is_final:
                 self._on_query_dict_done(
                     seq,
                     q,
@@ -2430,7 +2526,8 @@ class DictCalcWidget(Gtk.EventBox):
                     near_pointer,
                     use_dbus_dict,
                     keep_panel_focus,
-                    allow_fallback=(is_final and not state["has_virtual"]),
+                    allow_fallback=(is_final and not state["has_virtual"] and state["spelling_info"] is None),
+                    spelling_info=state["spelling_info"],
                 )
             return False
 
@@ -2444,13 +2541,23 @@ class DictCalcWidget(Gtk.EventBox):
                 use_dbus_dict,
                 keep_panel_focus,
                 True,
+                None,
             )
             return
 
         if sdcv_names:
             def sdcv_worker():
                 res = self.dict_mgr.query_sync(q, dict_names=sdcv_names)
-                GLib.idle_add(merge_and_render, res)
+                sp_info = None
+                # If offline StarDict found 0 hits for a single English word, run aspell spelling suggestion
+                # and automatically look up the top suggested correction!
+                if not res and StarDictManager.is_single_english_word(q):
+                    sugs = StarDictManager.suggest_spelling_sync(q, max_suggestions=6)
+                    if sugs:
+                        auto_w = sugs[0]
+                        res = self.dict_mgr.query_sync(auto_w, dict_names=sdcv_names)
+                        sp_info = (q, sugs, auto_w)
+                GLib.idle_add(merge_and_render, res, sp_info)
 
             threading.Thread(target=sdcv_worker, daemon=True).start()
 
@@ -2637,6 +2744,7 @@ class DictCalcWidget(Gtk.EventBox):
         use_dbus_dict,
         keep_panel_focus,
         allow_fallback=True,
+        spelling_info=None,
     ):
         if seq != self._query_seq:
             return False
@@ -2645,6 +2753,7 @@ class DictCalcWidget(Gtk.EventBox):
         if (
             allow_fallback
             and not results
+            and spelling_info is None
             and self.config.get("google_translate_enabled", True)
             and self.config.get("google_translate_fallback", True)
         ):
@@ -2664,15 +2773,35 @@ class DictCalcWidget(Gtk.EventBox):
             max_dicts = max(1, min(5, int(self.config.get("dbus_popup_max_dicts", 3))))
             book_icons = ["📘", "📗", "📙", "📕", "📓"]
 
+            sp_banner = ""
+            title_word = query_word
+            if spelling_info:
+                orig_w, sugs, auto_w = spelling_info
+                title_word = f"{orig_w} → {auto_w}"
+                others = [s for s in sugs[1:5]]
+                other_str = f"（其他：{' · '.join(others)}）" if others else ""
+                sp_banner = f"<i>💡 拼字建議：{html.escape(orig_w)} → <b>{html.escape(auto_w)}</b>{html.escape(other_str)}</i>"
+
             if not results:
-                self._notify_dbus(
-                    f"📖 查無詞條：{query_word}",
-                    self._wrap_dbus_font("請檢查拼字，或在偏好設定的「詞典管理」勾選更多詞典。"),
-                    icon="accessories-dictionary",
-                    timeout_sec=timeout_sec,
-                )
+                if spelling_info:
+                    orig_w, sugs, _aw = spelling_info
+                    self._notify_dbus(
+                        f"❓ 查無「{orig_w}」— 拼字建議",
+                        self._wrap_dbus_font(
+                            f"您是不是要找：\n<b>{html.escape('  ·  '.join(sugs))}</b>"
+                        ),
+                        icon="accessories-dictionary",
+                        timeout_sec=timeout_sec,
+                    )
+                else:
+                    self._notify_dbus(
+                        f"📖 查無詞條：{query_word}",
+                        self._wrap_dbus_font("請檢查拼字，或在偏好設定的「詞典管理」勾選更多詞典。"),
+                        icon="accessories-dictionary",
+                        timeout_sec=timeout_sec,
+                    )
             elif dbus_style == "separate":
-                # Mode 1: Each dictionary gets its own crisp independent D-Bus bubble (replaced in-place next query)
+                # Mode 1: Each dictionary gets its own crisp independent bubble
                 batch = []
                 shown = results[:max_dicts]
                 for idx, item in enumerate(shown):
@@ -2686,12 +2815,17 @@ class DictCalcWidget(Gtk.EventBox):
                         raw_body += "\n…"
                     if len(raw_body) > 460:
                         raw_body = raw_body[:457] + "…"
-                    body = self._wrap_dbus_font(html.escape(raw_body))
+                    esc_body = html.escape(raw_body)
+                    if idx == 0 and sp_banner:
+                        esc_body = f"{sp_banner}\n<span alpha='45%'>────────────────────</span>\n{esc_body}"
+                    body = self._wrap_dbus_font(esc_body)
                     batch.append((summary, body, "accessories-dictionary"))
                 self._notify_dbus_batch(batch, timeout_sec=timeout_sec)
             else:
-                # Mode 2: Single merged D-Bus bubble with clear bold divider banners and indented definitions
+                # Mode 2: Single merged bubble with clear bold divider banners and indented definitions
                 blocks = []
+                if sp_banner:
+                    blocks.append(sp_banner)
                 shown = results[:max_dicts]
                 total_chars = 0
                 for idx, item in enumerate(shown):
@@ -2714,7 +2848,7 @@ class DictCalcWidget(Gtk.EventBox):
                     blocks.append(f"<i>…（另有 {len(results) - max_dicts} 套詞典命中）</i>")
                 body = self._wrap_dbus_font("\n\n".join(blocks).strip())
                 self._notify_dbus(
-                    f"📖 {query_word}",
+                    f"📖 {title_word}",
                     body,
                     icon="accessories-dictionary",
                     timeout_sec=timeout_sec,
@@ -2722,7 +2856,7 @@ class DictCalcWidget(Gtk.EventBox):
         else:
             self._last_result_was_bubble = False
             win = self._ensure_popup_window()
-            win.show_dict_results(query_word, results, near_pointer=near_pointer)
+            win.show_dict_results(query_word, results, near_pointer=near_pointer, spelling_info=spelling_info)
 
         if keep_panel_focus:
             GLib.idle_add(self._refocus_panel_entry)
