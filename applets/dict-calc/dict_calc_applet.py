@@ -85,6 +85,15 @@ DEFAULT_PREFERRED_DICTS = [
     "英文字根字典",
 ]
 
+# Virtual online translation engines that can be enabled & prioritized alongside offline StarDict dicts
+VIRTUAL_TRANSLATE_DICTS = [
+    {"bookname": "🌐 Google 翻譯", "engine": "google", "group": "online_tr", "wordcount": 0},
+    {"bookname": "🌐 Gemini AI 翻譯", "engine": "gemini", "group": "online_tr", "wordcount": 0},
+    {"bookname": "🌐 OpenAI 相容 (Groq/Ollama)", "engine": "openai_compat", "group": "online_tr", "wordcount": 0},
+    {"bookname": "🌐 DeepL 翻譯", "engine": "deepl", "group": "online_tr", "wordcount": 0},
+]
+VIRTUAL_DICT_ENGINE_MAP = {d["bookname"]: d["engine"] for d in VIRTUAL_TRANSLATE_DICTS}
+
 DEFAULT_CONFIG = {
     "display_mode": "panel_entry",       # "panel_entry" (純面板查詢輸入框，預設) or "badge" (精簡方塊圖示)
     "result_output_mode": "window",      # "window" (無焦點精簡結果視窗), "dbus_popup" (系統 D-Bus 通知泡泡), "calc_dbus_dict_window" (混合模式)
@@ -530,7 +539,7 @@ class GoogleTranslator:
     def lang_label(cls, code):
         return cls.LANG_LABELS.get(code, code)
 
-    def _build_llm_prompt(self, target_lang):
+    def _build_llm_prompt(self, target_lang, concise_word=False):
         tgt_name = self.lang_label(target_lang)
         if target_lang == "zh-TW":
             style = "自然流暢的台灣繁體中文，貼近母語語氣與慣用語，保留專有名詞與技術縮寫"
@@ -538,6 +547,12 @@ class GoogleTranslator:
             style = "自然流畅的简体中文，保留专有名词与技术缩写"
         else:
             style = f"natural, idiomatic {tgt_name}, preserving proper nouns and technical terms"
+        if concise_word:
+            return (
+                f"You are a concise bilingual dictionary. Explain/translate the given word or short phrase into {style}. "
+                f"List the main part(s) of speech and 1-3 concise meanings, followed by 1 short natural example sentence with translation. "
+                f"Keep the entire response compact (within 4-6 short lines) with no preamble."
+            )
         return (
             f"You are a professional translator. Translate the user's text into {style}. "
             f"Output ONLY the translation itself, with no explanations, quotes, or extra commentary. "
@@ -667,7 +682,7 @@ class GoogleTranslator:
         models = sorted(set(models))
         return models, None
 
-    def _translate_gemini(self, text, tl, api_key, model, timeout=12.0, on_model_migrated=None):
+    def _translate_gemini(self, text, tl, api_key, model, timeout=12.0, on_model_migrated=None, concise_word=False):
         api_key = (api_key or "").strip()
         if not api_key:
             return None, "auto", "尚未設定 Gemini API Key"
@@ -682,7 +697,7 @@ class GoogleTranslator:
             if "flash" in model_id:
                 gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
             body_obj = {
-                "system_instruction": {"parts": [{"text": self._build_llm_prompt(tl)}]},
+                "system_instruction": {"parts": [{"text": self._build_llm_prompt(tl, concise_word=concise_word)}]},
                 "contents": [{"role": "user", "parts": [{"text": text}]}],
                 "generationConfig": gen_cfg,
             }
@@ -739,7 +754,7 @@ class GoogleTranslator:
 
         return None, "auto", err or "Gemini 翻譯失敗"
 
-    def _translate_openai_compat(self, text, tl, base_url, api_key, model, timeout=12.0):
+    def _translate_openai_compat(self, text, tl, base_url, api_key, model, timeout=12.0, concise_word=False):
         base = (base_url or "https://api.groq.com/openai/v1").strip().rstrip("/")
         if not base.endswith("/chat/completions"):
             url = base + "/chat/completions"
@@ -754,7 +769,7 @@ class GoogleTranslator:
             "model": model_id,
             "temperature": 0.2,
             "messages": [
-                {"role": "system", "content": self._build_llm_prompt(tl)},
+                {"role": "system", "content": self._build_llm_prompt(tl, concise_word=concise_word)},
                 {"role": "user", "content": text},
             ],
         }
@@ -826,14 +841,24 @@ class GoogleTranslator:
         except Exception as exc:
             return None, "auto", f"DeepL 錯誤：{exc}"
 
-    def translate_sync(self, text, primary_tl="zh-TW", reverse_tl="en", config=None, timeout=8.0, on_model_migrated=None):
+    def translate_sync(
+        self,
+        text,
+        primary_tl="zh-TW",
+        reverse_tl="en",
+        config=None,
+        timeout=8.0,
+        on_model_migrated=None,
+        engine_override=None,
+        concise_word=False,
+    ):
         """
         Multi-engine synchronous translator (Google / Gemini / OpenAI-compat / DeepL)
         with automatic 404 model discovery and automatic fallback to Google Translate.
         Returns: (translated_text, detected_src_lang, target_lang, engine_label, error_msg)
         """
         cfg = config or {}
-        engine = cfg.get("translate_engine", "google")
+        engine = engine_override or cfg.get("translate_engine", "google")
         fallback_google = bool(cfg.get("translate_fallback_google", True))
         tl = self.detect_target_lang(text, primary_tl=primary_tl, reverse_tl=reverse_tl)
 
@@ -842,7 +867,7 @@ class GoogleTranslator:
             model_tag = cfg.get("gemini_model", "gemini-3.1-flash-lite")
         elif engine == "openai_compat":
             model_tag = cfg.get("openai_model", "llama-3.3-70b-versatile")
-        cache_key = (engine, model_tag, text, tl)
+        cache_key = (engine, model_tag, bool(concise_word), text, tl)
         with self._lock:
             if cache_key in self._cache:
                 self._cache.move_to_end(cache_key)
@@ -859,6 +884,7 @@ class GoogleTranslator:
                 cfg.get("gemini_model", "gemini-3.1-flash-lite"),
                 timeout=max(timeout, 12.0),
                 on_model_migrated=on_model_migrated,
+                concise_word=concise_word,
             )
         elif engine == "openai_compat":
             base_u = cfg.get("openai_base_url", "https://api.groq.com/openai/v1")
@@ -871,7 +897,13 @@ class GoogleTranslator:
             else:
                 eng_lbl = "OpenAI 相容"
             tr_text, src_lang, err = self._translate_openai_compat(
-                text, tl, base_u, cfg.get("openai_api_key", ""), cfg.get("openai_model", "llama-3.3-70b-versatile"), timeout=max(timeout, 12.0)
+                text,
+                tl,
+                base_u,
+                cfg.get("openai_api_key", ""),
+                cfg.get("openai_model", "llama-3.3-70b-versatile"),
+                timeout=max(timeout, 12.0),
+                concise_word=concise_word,
             )
         elif engine == "deepl":
             eng_lbl = "DeepL"
@@ -2272,59 +2304,175 @@ class DictCalcWidget(Gtk.EventBox):
                 GLib.idle_add(self._refocus_panel_entry)
             return
 
-        # 2. Smart Routing: Sentence / Paragraph -> Google Translate (Scheme A)
+        # 2. Resolve Active Dictionary Profile (Offline StarDict + Virtual Online Translation Engines)
         use_dbus_dict = out_mode == "dbus_popup"
         gt_enabled = bool(self.config.get("google_translate_enabled", True))
         self._query_seq += 1
         seq = self._query_seq
 
-        if gt_enabled and GoogleTranslator.is_sentence_or_paragraph(q):
-            self._start_google_translate(
-                seq,
-                q,
-                near_pointer=near_pointer,
-                use_dbus_dict=use_dbus_dict,
-                keep_panel_focus=keep_panel_focus,
-                is_fallback=False,
+        if source == "scan":
+            custom_list = list(
+                self.config.get(
+                    "enabled_dicts_scan",
+                    self.config.get("enabled_dicts", DEFAULT_PREFERRED_DICTS),
+                )
             )
-            return
+        elif use_dbus_dict:
+            custom_list = list(
+                self.config.get(
+                    "enabled_dicts_dbus",
+                    self.config.get("enabled_dicts", DEFAULT_PREFERRED_DICTS),
+                )
+            )
+        else:
+            custom_list = list(self.config.get("enabled_dicts", DEFAULT_PREFERRED_DICTS))
 
-        # 3. Offline StarDict Asynchronous Lookup (Single word / short phrase)
+        sdcv_names = self.dict_mgr.get_ordered_enabled_dicts(
+            [n for n in custom_list if n not in VIRTUAL_DICT_ENGINE_MAP]
+        )
+        virtual_tr_names = [n for n in custom_list if n in VIRTUAL_DICT_ENGINE_MAP]
+        priority_map = {name: i for i, name in enumerate(custom_list)}
+
+        # 2a. Sentence / Paragraph Routing: skip offline StarDict, run online translation engine(s)
+        is_sentence = GoogleTranslator.is_sentence_or_paragraph(q)
+        if is_sentence:
+            if len(virtual_tr_names) == 1:
+                self._start_google_translate(
+                    seq,
+                    q,
+                    near_pointer=near_pointer,
+                    use_dbus_dict=use_dbus_dict,
+                    keep_panel_focus=keep_panel_focus,
+                    is_fallback=False,
+                    engine_override=VIRTUAL_DICT_ENGINE_MAP[virtual_tr_names[0]],
+                )
+                return
+            elif len(virtual_tr_names) > 1:
+                # Multiple online translation engines enabled for this profile: query in parallel
+                sdcv_names = []
+            elif gt_enabled:
+                self._start_google_translate(
+                    seq,
+                    q,
+                    near_pointer=near_pointer,
+                    use_dbus_dict=use_dbus_dict,
+                    keep_panel_focus=keep_panel_focus,
+                    is_fallback=False,
+                )
+                return
+
+        # 3. Parallel Offline StarDict + Virtual Translation Engines with Progressive Offline-First Rendering
         if not use_dbus_dict:
             win = self._ensure_popup_window()
-            win.show_loading(q, near_pointer=near_pointer, is_translate=False)
+            win.show_loading(q, near_pointer=near_pointer, is_translate=(not sdcv_names and bool(virtual_tr_names)))
             if keep_panel_focus:
                 GLib.idle_add(self._refocus_panel_entry)
 
-        if source == "scan":
-            custom_list = self.config.get(
-                "enabled_dicts_scan",
-                self.config.get("enabled_dicts", DEFAULT_PREFERRED_DICTS),
-            )
-        elif use_dbus_dict:
-            custom_list = self.config.get(
-                "enabled_dicts_dbus",
-                self.config.get("enabled_dicts", DEFAULT_PREFERRED_DICTS),
-            )
-        else:
-            custom_list = self.config.get("enabled_dicts", DEFAULT_PREFERRED_DICTS)
-        dict_names = self.dict_mgr.get_ordered_enabled_dicts(custom_list)
+        state = {
+            "results": [],
+            "pending": (1 if sdcv_names else 0) + len(virtual_tr_names),
+            "has_virtual": bool(virtual_tr_names),
+        }
 
-        def worker():
-            results = self.dict_mgr.query_sync(q, dict_names=dict_names)
+        def merge_and_render(new_items):
+            if seq != self._query_seq:
+                return False
+            if new_items:
+                state["results"].extend(new_items)
+                state["results"].sort(key=lambda r: priority_map.get(r["dict"], 999999))
+            state["pending"] -= 1
+            is_final = state["pending"] <= 0
+            # Progressive display: show offline results immediately if non-empty; wait for final if still empty
+            if state["results"] or is_final:
+                self._on_query_dict_done(
+                    seq,
+                    q,
+                    list(state["results"]),
+                    near_pointer,
+                    use_dbus_dict,
+                    keep_panel_focus,
+                    allow_fallback=(is_final and not state["has_virtual"]),
+                )
+            return False
+
+        if state["pending"] == 0:
             GLib.idle_add(
                 self._on_query_dict_done,
                 seq,
                 q,
-                results,
+                [],
                 near_pointer,
                 use_dbus_dict,
                 keep_panel_focus,
+                True,
             )
+            return
 
-        threading.Thread(target=worker, daemon=True).start()
+        if sdcv_names:
+            def sdcv_worker():
+                res = self.dict_mgr.query_sync(q, dict_names=sdcv_names)
+                GLib.idle_add(merge_and_render, res)
 
-    def _start_google_translate(self, seq, text, near_pointer, use_dbus_dict, keep_panel_focus, is_fallback=False):
+            threading.Thread(target=sdcv_worker, daemon=True).start()
+
+        if virtual_tr_names:
+            primary_tl = self.config.get("google_translate_target", "zh-TW")
+            reverse_tl = self.config.get("google_translate_reverse", "en")
+            cfg_snapshot = dict(self.config)
+
+            def on_gemini_migrated(new_model_id):
+                def _save_new_model():
+                    self.config["gemini_model"] = new_model_id
+                    self._save_config()
+                    return False
+                GLib.idle_add(_save_new_model)
+
+            for v_name in virtual_tr_names:
+                v_eng = VIRTUAL_DICT_ENGINE_MAP[v_name]
+
+                def v_worker(bookname=v_name, eng=v_eng):
+                    tr_txt, src_l, tgt_l, _eng_lbl, err_m = self.translator.translate_sync(
+                        q,
+                        primary_tl=primary_tl,
+                        reverse_tl=reverse_tl,
+                        config=cfg_snapshot,
+                        on_model_migrated=on_gemini_migrated,
+                        engine_override=eng,
+                        concise_word=(not is_sentence),
+                    )
+                    items_out = []
+                    if err_m is None and tr_txt:
+                        src_lbl = GoogleTranslator.lang_label(src_l)
+                        tgt_lbl = GoogleTranslator.lang_label(tgt_l)
+                        items_out.append(
+                            {
+                                "dict": bookname,
+                                "word": f"{q[:36] + '…' if len(q) > 36 else q} ({src_lbl} → {tgt_lbl})",
+                                "definition": tr_txt,
+                            }
+                        )
+                    elif err_m:
+                        items_out.append(
+                            {
+                                "dict": bookname,
+                                "word": q[:36] + "…" if len(q) > 36 else q,
+                                "definition": f"⚠️ {err_m}",
+                            }
+                        )
+                    GLib.idle_add(merge_and_render, items_out)
+
+                threading.Thread(target=v_worker, daemon=True).start()
+
+    def _start_google_translate(
+        self,
+        seq,
+        text,
+        near_pointer,
+        use_dbus_dict,
+        keep_panel_focus,
+        is_fallback=False,
+        engine_override=None,
+    ):
         """Run selected translation engine asynchronously; follows user's result_output_mode."""
         use_dbus_tr = use_dbus_dict
 
@@ -2352,6 +2500,7 @@ class DictCalcWidget(Gtk.EventBox):
                 reverse_tl=reverse_tl,
                 config=cfg_snapshot,
                 on_model_migrated=on_gemini_migrated,
+                engine_override=engine_override,
             )
             GLib.idle_add(
                 self._on_translate_done,
@@ -2437,13 +2586,23 @@ class DictCalcWidget(Gtk.EventBox):
             self.panel_entry.grab_focus()
         return False
 
-    def _on_query_dict_done(self, seq, query_word, results, near_pointer, use_dbus_dict, keep_panel_focus):
+    def _on_query_dict_done(
+        self,
+        seq,
+        query_word,
+        results,
+        near_pointer,
+        use_dbus_dict,
+        keep_panel_focus,
+        allow_fallback=True,
+    ):
         if seq != self._query_seq:
             return False
 
         # Auto-fallback to Google Translate when offline StarDict returns 0 hits
         if (
-            not results
+            allow_fallback
+            and not results
             and self.config.get("google_translate_enabled", True)
             and self.config.get("google_translate_fallback", True)
         ):
@@ -3333,16 +3492,22 @@ class DictCalcWidget(Gtk.EventBox):
 
         def update_dict_hdr():
             n_all = len(self.dict_mgr.all_dicts)
+            n_tr = len(VIRTUAL_TRANSLATE_DICTS)
             d_hdr.set_markup(
-                f"<b>已掃描到 {n_all} 套離線 StarDict 詞典（三種查詢情境獨立管理）</b>\n"
-                f"<small>可分別為「無焦點查詢視窗」、「氣泡框」與「Scan Selection 劃詞」設定不同詞典與顯示順位（支援右側按鈕與滑鼠拖曳）</small>"
+                f"<b>已掃描到 {n_all} 套離線詞典 + {n_tr} 套線上翻譯引擎（三種情境獨立管理）</b>\n"
+                f"<small>可自由混搭離線詞典與線上翻譯引擎並調整順位；離線詞典先即時顯示，線上翻譯並行回填</small>"
             )
-            d_tab_lbl.set_text(f"📚 詞典管理 ({n_all} 套)")
+            d_tab_lbl.set_text(f"📚 詞典管理 ({n_all}+{n_tr})")
 
         update_dict_hdr()
         tab2.pack_start(d_hdr, False, False, 0)
 
-        grp_labels = {"en_zh": "英漢/漢英", "ja_zh": "日漢/漢日", "sci_en": "科技/英英"}
+        grp_labels = {
+            "online_tr": "線上翻譯",
+            "en_zh": "英漢/漢英",
+            "ja_zh": "日漢/漢日",
+            "sci_en": "科技/英英",
+        }
         dict_notebook = Gtk.Notebook()
         profile_refreshers = []
 
@@ -3356,21 +3521,24 @@ class DictCalcWidget(Gtk.EventBox):
             info_lbl = Gtk.Label(xalign=0.0)
             page.pack_start(info_lbl, False, False, 0)
 
-            store = Gtk.ListStore(bool, str, str, int)
+            store = Gtk.ListStore(bool, str, str, str)
             rebuilding = [False]
 
             def populate_store_from_list(enabled_list):
-                dict_by_name = {d["bookname"]: d for d in self.dict_mgr.all_dicts}
+                all_entries = list(VIRTUAL_TRANSLATE_DICTS) + list(self.dict_mgr.all_dicts)
+                dict_by_name = {d["bookname"]: d for d in all_entries}
                 store.clear()
                 added = set()
                 for name in enabled_list:
                     if name in dict_by_name and name not in added:
                         d = dict_by_name[name]
-                        store.append([True, d["bookname"], grp_labels.get(d["group"], d["group"]), d["wordcount"]])
+                        cnt_str = "線上" if d["group"] == "online_tr" else str(d["wordcount"])
+                        store.append([True, d["bookname"], grp_labels.get(d["group"], d["group"]), cnt_str])
                         added.add(name)
-                for d in self.dict_mgr.all_dicts:
+                for d in all_entries:
                     if d["bookname"] not in added:
-                        store.append([False, d["bookname"], grp_labels.get(d["group"], d["group"]), d["wordcount"]])
+                        cnt_str = "線上" if d["group"] == "online_tr" else str(d["wordcount"])
+                        store.append([False, d["bookname"], grp_labels.get(d["group"], d["group"]), cnt_str])
                         added.add(d["bookname"])
 
             def update_count_label():
