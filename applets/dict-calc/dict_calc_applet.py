@@ -854,8 +854,9 @@ class DictCalcWidget(Gtk.EventBox):
     def __init__(self, applet=None):
         super().__init__()
         self.applet = applet
+        # IMPORTANT: Do NOT set_above_child(True) on the EventBox so child Gtk.Entry receives clicks & focus directly!
         self.set_visible_window(False)
-        self.set_above_child(True)
+        self.set_above_child(False)
         self.add_events(
             Gdk.EventMask.BUTTON_PRESS_MASK
             | Gdk.EventMask.BUTTON_RELEASE_MASK
@@ -887,10 +888,26 @@ class DictCalcWidget(Gtk.EventBox):
         self.canvas.connect("button-press-event", self._on_button_press)
         self.root_box.pack_start(self.canvas, False, False, 0)
 
-        # 2. Optional Inline Panel Search/Calc Entry
+        # 2. Pure Inline Panel Search/Calc Entry (click-to-type with request_focus + integrated icons & popup menu)
         self.panel_entry = Gtk.Entry()
         self.panel_entry.set_placeholder_text("查詞 / 算式...")
+        self.panel_entry.set_icon_from_icon_name(
+            Gtk.EntryIconPosition.PRIMARY, "edit-find-symbolic"
+        )
+        self.panel_entry.set_icon_from_icon_name(
+            Gtk.EntryIconPosition.SECONDARY, "emblem-system-symbolic"
+        )
+        self.panel_entry.set_icon_tooltip_text(
+            Gtk.EntryIconPosition.PRIMARY, "點此開關滑鼠劃詞查詢 (Scan Selection)"
+        )
+        self.panel_entry.set_icon_tooltip_text(
+            Gtk.EntryIconPosition.SECONDARY, "開啟查詢視窗 / 偏好設定與詞典管理"
+        )
         self.panel_entry.connect("activate", self._on_panel_entry_activate)
+        self.panel_entry.connect("button-press-event", self._on_panel_entry_button_press)
+        self.panel_entry.connect("icon-press", self._on_panel_entry_icon_press)
+        self.panel_entry.connect("populate-popup", self._on_panel_entry_populate_popup)
+        self.panel_entry.connect("key-press-event", self._on_panel_entry_key_press)
         self.root_box.pack_start(self.panel_entry, False, False, 0)
 
         self.connect("button-press-event", self._on_button_press)
@@ -984,6 +1001,7 @@ class DictCalcWidget(Gtk.EventBox):
     def set_scan_selection_enabled(self, enabled):
         self.config["scan_selection_enabled"] = bool(enabled)
         self._save_config()
+        self._update_entry_icons()
         self._update_tooltip()
         self.canvas.queue_draw()
 
@@ -1047,11 +1065,34 @@ class DictCalcWidget(Gtk.EventBox):
         self.panel_size = max(22, min(64, int(size)))
         self._apply_panel_layout()
 
+    def _update_entry_icons(self):
+        scan_on = self.config.get("scan_selection_enabled", False)
+        if scan_on:
+            self.panel_entry.set_icon_from_icon_name(
+                Gtk.EntryIconPosition.PRIMARY, "edit-cut-symbolic"
+            )
+            self.panel_entry.set_icon_tooltip_text(
+                Gtk.EntryIconPosition.PRIMARY, "✂ 滑鼠劃詞查詢已開啟（點此關閉）"
+            )
+            self.panel_entry.set_placeholder_text("✂ 查詞 / 算式...")
+        else:
+            self.panel_entry.set_icon_from_icon_name(
+                Gtk.EntryIconPosition.PRIMARY, "edit-find-symbolic"
+            )
+            self.panel_entry.set_icon_tooltip_text(
+                Gtk.EntryIconPosition.PRIMARY, "🔎 點此開啟滑鼠劃詞查詢 (Scan Selection)"
+            )
+            self.panel_entry.set_placeholder_text("查詞 / 算式...")
+
     def _sync_entry_visibility(self):
         if self.config.get("display_mode", "badge") == "panel_entry":
+            # Pure Inline Entry Mode: hide the left [DICT] badge and show only the compact Entry box
+            self.canvas.hide()
             self.panel_entry.show()
+            self._update_entry_icons()
         else:
             self.panel_entry.hide()
+            self.canvas.show()
 
     def _apply_panel_layout(self):
         h = max(24, self.panel_size)
@@ -1062,11 +1103,67 @@ class DictCalcWidget(Gtk.EventBox):
         self._sync_entry_visibility()
         self.canvas.queue_draw()
 
+    def _on_panel_entry_button_press(self, entry, event):
+        """Request X11 keyboard focus from mate-panel so clicking the inline entry lets you type immediately!"""
+        if event.button == 1:
+            if self.applet is not None:
+                try:
+                    self.applet.request_focus(event.time)
+                except Exception:
+                    pass
+            entry.grab_focus()
+        elif event.button == 2:
+            # Middle click toggles Scan Selection
+            self.toggle_scan_selection()
+            return True
+        return False
+
+    def _on_panel_entry_key_press(self, entry, event):
+        if event.keyval == Gdk.KEY_Escape:
+            entry.set_text("")
+            if self.popup_win is not None and self.popup_win.is_visible():
+                self.popup_win.hide()
+            return True
+        return False
+
+    def _on_panel_entry_icon_press(self, entry, icon_pos, event):
+        if icon_pos == Gtk.EntryIconPosition.PRIMARY:
+            # Left icon toggles Scan Selection
+            self.toggle_scan_selection()
+        elif icon_pos == Gtk.EntryIconPosition.SECONDARY:
+            # Right gear icon opens Preferences & Dictionary Manager
+            self.show_preferences_dialog()
+
+    def _on_panel_entry_populate_popup(self, _entry, menu):
+        """Integrate Applet controls (Preferences, Scan Selection, Open Window) into the Entry right-click menu."""
+        menu.prepend(Gtk.SeparatorMenuItem())
+
+        mi_prefs = Gtk.MenuItem(label="⚙️ 偏好設定與詞典順位管理...")
+        mi_prefs.connect("activate", lambda *_: self.show_preferences_dialog())
+        menu.prepend(mi_prefs)
+
+        scan_on = self.config.get("scan_selection_enabled", False)
+        mi_scan_chk = Gtk.CheckMenuItem(label="✂ 啟用滑鼠劃詞查詢 (Scan Selection)")
+        mi_scan_chk.set_active(scan_on)
+        mi_scan_chk.connect("toggled", lambda w: self.set_scan_selection_enabled(w.get_active()))
+        menu.prepend(mi_scan_chk)
+
+        mi_scan_now = Gtk.MenuItem(label="🔎 立即查詢反白文字 (Scan Now)")
+        mi_scan_now.connect("activate", lambda *_: self.trigger_scan_selection_now())
+        menu.prepend(mi_scan_now)
+
+        mi_open = Gtk.MenuItem(label="📖 開啟獨立查詢 / 計算機視窗...")
+        mi_open.connect("activate", lambda *_: self.open_popup_window(self.panel_entry.get_text().strip()))
+        menu.prepend(mi_open)
+
+        menu.show_all()
+
     def _on_panel_entry_activate(self, entry):
         txt = entry.get_text().strip()
         if not txt:
             return
         self.open_popup_window(txt, near_pointer=False)
+        entry.select_region(0, -1)
 
     def _update_tooltip(self):
         scan_on = self.config.get("scan_selection_enabled", False)
@@ -1174,11 +1271,14 @@ class DictCalcWidget(Gtk.EventBox):
         return False
 
     def handle_applet_button_press(self, widget, event):
-        # Allow clicking inside the inline panel_entry without intercepting focus
-        if (
-            self.config.get("display_mode", "badge") == "panel_entry"
-            and event.window == self.panel_entry.get_window()
-        ):
+        # In pure inline entry mode, let Gtk.Entry handle clicks and request_focus directly
+        if self.config.get("display_mode", "badge") == "panel_entry":
+            if event.button == 1:
+                try:
+                    self.applet.request_focus(event.time)
+                except Exception:
+                    pass
+                self.panel_entry.grab_focus()
             return False
         if event.button == 1:
             GObject.signal_stop_emission_by_name(widget, "button-press-event")
@@ -1191,6 +1291,8 @@ class DictCalcWidget(Gtk.EventBox):
         return False
 
     def _on_button_press(self, widget, event):
+        if self.config.get("display_mode", "badge") == "panel_entry" and widget is not self.canvas:
+            return False
         if event.button == 1:
             if self.applet is not None:
                 GObject.signal_stop_emission_by_name(widget, "button-press-event")
@@ -1327,7 +1429,7 @@ class DictCalcWidget(Gtk.EventBox):
             None, "模式 A：精簡圓角方塊圖示 ([DICT / CALC])"
         )
         rb_entry = Gtk.RadioButton.new_with_label_from_widget(
-            rb_badge, "模式 B：面板內嵌即時查詢與計算輸入框 ([DICT] [輸入單字或算式...])"
+            rb_badge, "模式 B：純面板查詢/計算輸入框 (隱藏方塊，隨點即打字，左右內建劃詞與設定圖示)"
         )
         if self.config.get("display_mode", "badge") == "badge":
             rb_badge.set_active(True)
