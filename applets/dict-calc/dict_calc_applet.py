@@ -88,6 +88,7 @@ DEFAULT_CONFIG = {
     "dbus_popup_max_dicts": 3,           # D-Bus 泡泡最多顯示幾本命中的詞典 (1..5)
     "dbus_popup_timeout_sec": 8,         # D-Bus 通知泡泡停留秒數 (1..60)
     "dbus_popup_font_size": 11,          # D-Bus 氣泡框字型大小 (pt)
+    "dbus_popup_y_offset": 24,           # D-Bus 氣泡框與面板/輸入框的垂直安全間距 (px)
     "panel_entry_width": 170,            # 面板內嵌查詢框寬度 (px)
     "scan_selection_enabled": False,     # 是否啟用滑鼠反白自動劃詞查詢 (Selection Primary)
     "scan_modifier": "ctrl",             # 劃詞觸發修飾鍵: "none", "ctrl", "alt", "shift"
@@ -149,9 +150,11 @@ class DBusNotifier:
         except Exception:
             pass
 
-    def show_batch(self, items, timeout_sec=8):
+    def show_batch(self, items, timeout_sec=8, positions=None):
         """
         Show 1 or more notifications: items = [(summary, body, icon), ...]
+        Optional positions = [(x, y), ...] passed via standard Desktop Notifications x/y hints
+        so bubbles never overlap mate-panel or the inline search box.
         Reuses previous notification IDs in-place and closes any excess old bubbles.
         """
         proxy = self._get_proxy()
@@ -161,6 +164,11 @@ class DBusNotifier:
         new_ids = []
         for idx, (summary, body, icon) in enumerate(items):
             replace_id = self._last_ids[idx] if idx < len(self._last_ids) else 0
+            hints = {}
+            if positions is not None and idx < len(positions) and positions[idx] is not None:
+                px, py = positions[idx]
+                hints["x"] = GLib.Variant("i", int(px))
+                hints["y"] = GLib.Variant("i", int(py))
             try:
                 args = GLib.Variant(
                     "(susssasa{sv}i)",
@@ -171,7 +179,7 @@ class DBusNotifier:
                         str(summary),
                         str(body),
                         [],
-                        {},
+                        hints,
                         timeout_ms,
                     ),
                 )
@@ -188,8 +196,9 @@ class DBusNotifier:
         self._last_ids = new_ids
         return True
 
-    def show(self, summary, body, icon="accessories-dictionary", timeout_sec=8):
-        return self.show_batch([(summary, body, icon)], timeout_sec=timeout_sec)
+    def show(self, summary, body, icon="accessories-dictionary", timeout_sec=8, position=None):
+        positions = [position] if position is not None else None
+        return self.show_batch([(summary, body, icon)], timeout_sec=timeout_sec, positions=positions)
 
 
 # =============================================================================
@@ -1302,6 +1311,82 @@ class DictCalcWidget(Gtk.EventBox):
         fs = max(8, min(22, int(self.config.get("dbus_popup_font_size", 11))))
         return f"<span size='{fs * 1024}'>{markup_body}</span>"
 
+    def _compute_dbus_positions(self, items):
+        """
+        Compute safe (x, y) coordinates for D-Bus notification bubbles so they NEVER overlap
+        mate-panel or the inline search box, stacking cleanly away from the panel edge.
+        """
+        display = Gdk.Display.get_default()
+        if display is None:
+            return None
+        gdk_win = self.get_window()
+        if gdk_win is not None:
+            _, ox, oy = gdk_win.get_origin()
+            alloc = self.get_allocation()
+            monitor = display.get_monitor_at_window(gdk_win)
+        else:
+            ox, oy = 0, 0
+            alloc = None
+            monitor = display.get_primary_monitor() or display.get_monitor(0)
+        if monitor is None:
+            return None
+
+        geo = monitor.get_geometry()
+        wa = monitor.get_workarea()
+        fs = max(8, min(22, int(self.config.get("dbus_popup_font_size", 11))))
+        gap = max(0, min(300, int(self.config.get("dbus_popup_y_offset", 24))))
+
+        est_w = 360
+        if gdk_win is not None:
+            px = max(wa.x + 12, min(ox, wa.x + wa.width - est_w - 12))
+            panel_at_top = (oy + (alloc.height / 2.0)) < (geo.y + geo.height / 2.0)
+        else:
+            px = wa.x + wa.width - est_w - 16
+            panel_at_top = (wa.y - geo.y) >= ((geo.y + geo.height) - (wa.y + wa.height))
+
+        # Estimate each bubble height based on visible wrapped lines + font size
+        heights = []
+        chars_per_line = max(14, int(280.0 / max(8.0, fs * 0.85)))
+        line_h = fs * 1.65 + 2.5
+        for _summary, body, _icon in items:
+            plain = html.unescape(re.sub(r"<[^>]+>", "", str(body)))
+            vis_lines = 0
+            for ln in plain.splitlines():
+                # CJK characters are roughly double width
+                eff_len = sum(2 if ord(ch) > 127 else 1 for ch in ln)
+                vis_lines += max(1, (eff_len + chars_per_line - 1) // chars_per_line)
+            est_h = int(72 + max(1, vis_lines) * line_h)
+            est_h = max(96, min(est_h, max(120, wa.height - 60)))
+            heights.append(est_h)
+
+        positions = []
+        if panel_at_top:
+            safe_top = (max(wa.y, oy + alloc.height) if gdk_win is not None else wa.y) + gap
+            cur_y = safe_top
+            for est_h in heights:
+                py = min(cur_y, wa.y + wa.height - est_h - 8)
+                py = max(safe_top, py)
+                positions.append((int(px), int(py)))
+                cur_y += est_h + 12
+        else:
+            safe_bottom = (min(wa.y + wa.height, oy) if gdk_win is not None else (wa.y + wa.height)) - gap
+            cur_bottom = safe_bottom
+            for est_h in heights:
+                py = cur_bottom - est_h
+                py = max(wa.y + 10, py)
+                positions.append((int(px), int(py)))
+                cur_bottom = py - 12
+
+        return positions
+
+    def _notify_dbus_batch(self, items, timeout_sec=None):
+        t_sec = int(self.config.get("dbus_popup_timeout_sec", 8)) if timeout_sec is None else int(timeout_sec)
+        positions = self._compute_dbus_positions(items)
+        return self.dbus_notifier.show_batch(items, timeout_sec=t_sec, positions=positions)
+
+    def _notify_dbus(self, summary, body, icon="accessories-dictionary", timeout_sec=None):
+        return self._notify_dbus_batch([(summary, body, icon)], timeout_sec=timeout_sec)
+
     def execute_query(self, raw_text, near_pointer=False, keep_panel_focus=False, source="panel"):
         """
         Central query & calculator dispatcher.
@@ -1332,7 +1417,7 @@ class DictCalcWidget(Gtk.EventBox):
             use_dbus = out_mode in ("dbus_popup", "calc_dbus_dict_window")
             if use_dbus:
                 if err is not None:
-                    self.dbus_notifier.show(
+                    self._notify_dbus(
                         f"🧮 算式錯誤：{q}",
                         self._wrap_dbus_font(html.escape(str(err))),
                         icon="dialog-error",
@@ -1342,7 +1427,7 @@ class DictCalcWidget(Gtk.EventBox):
                     body_markup = f"{html.escape(q)} = <b>{html.escape(str(res_str))}</b>" + (
                         "\n✔ 已自動存入系統剪貼簿 (Ctrl+V 可直接貼上)" if auto_copy else ""
                     )
-                    self.dbus_notifier.show(
+                    self._notify_dbus(
                         f"🧮 計算結果：{res_str}",
                         self._wrap_dbus_font(body_markup),
                         icon="accessories-calculator",
@@ -1411,7 +1496,7 @@ class DictCalcWidget(Gtk.EventBox):
             book_icons = ["📘", "📗", "📙", "📕", "📓"]
 
             if not results:
-                self.dbus_notifier.show(
+                self._notify_dbus(
                     f"📖 查無詞條：{query_word}",
                     self._wrap_dbus_font("請檢查拼字，或在偏好設定的「詞典管理」勾選更多詞典。"),
                     icon="accessories-dictionary",
@@ -1434,7 +1519,7 @@ class DictCalcWidget(Gtk.EventBox):
                         raw_body = raw_body[:457] + "…"
                     body = self._wrap_dbus_font(html.escape(raw_body))
                     batch.append((summary, body, "accessories-dictionary"))
-                self.dbus_notifier.show_batch(batch, timeout_sec=timeout_sec)
+                self._notify_dbus_batch(batch, timeout_sec=timeout_sec)
             else:
                 # Mode 2: Single merged D-Bus bubble with clear bold divider banners and indented definitions
                 blocks = []
@@ -1459,7 +1544,7 @@ class DictCalcWidget(Gtk.EventBox):
                 if len(results) > max_dicts:
                     blocks.append(f"<i>…（另有 {len(results) - max_dicts} 套詞典命中）</i>")
                 body = self._wrap_dbus_font("\n\n".join(blocks).strip())
-                self.dbus_notifier.show(
+                self._notify_dbus(
                     f"📖 {query_word}",
                     body,
                     icon="accessories-dictionary",
@@ -1796,16 +1881,31 @@ class DictCalcWidget(Gtk.EventBox):
             digits=0,
         )
         dbus_num_box.pack_start(spin_dbus_fs, False, False, 0)
+        dbus_num_box.pack_start(Gtk.Label(label="離面板間距(px)：", xalign=0.0), False, False, 0)
+        spin_dbus_yoff = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(
+                value=float(self.config.get("dbus_popup_y_offset", 24)),
+                lower=0.0,
+                upper=300.0,
+                step_increment=8.0,
+                page_increment=24.0,
+                page_size=0.0,
+            ),
+            climb_rate=1.0,
+            digits=0,
+        )
+        spin_dbus_yoff.set_tooltip_text("D-Bus 氣泡框與 MATE Panel / 輸入框之間的垂直安全距離 (px)")
+        dbus_num_box.pack_start(spin_dbus_yoff, False, False, 0)
         btn_test_dbus = Gtk.Button(label="🔔 測試")
-        btn_test_dbus.set_tooltip_text("發送測試 D-Bus 氣泡以預覽字型大小")
+        btn_test_dbus.set_tooltip_text("發送測試 D-Bus 氣泡以預覽字型大小與垂直位置")
         btn_test_dbus.connect(
             "clicked",
-            lambda *_: self.dbus_notifier.show(
-                f"📘 氣泡字型預覽 ({self.config.get('dbus_popup_font_size', 11)} pt)",
+            lambda *_: self._notify_dbus(
+                f"📘 氣泡預覽 ({self.config.get('dbus_popup_font_size', 11)} pt)",
                 self._wrap_dbus_font(
                     "<b>━━━ 📘 DrEye4.1 (example) ━━━</b>\n"
                     "  n. 範例；實例；榜樣\n"
-                    "  目前 D-Bus 氣泡框字型大小預覽測試。"
+                    "  已自動避開 MATE Panel 與輸入框位置。"
                 ),
                 icon="accessories-dictionary",
                 timeout_sec=4,
@@ -2149,6 +2249,7 @@ class DictCalcWidget(Gtk.EventBox):
             self.config["dbus_popup_max_dicts"] = int(spin_dbus_max.get_value_as_int())
             self.config["dbus_popup_timeout_sec"] = int(spin_dbus_sec.get_value_as_int())
             self.config["dbus_popup_font_size"] = int(spin_dbus_fs.get_value_as_int())
+            self.config["dbus_popup_y_offset"] = int(spin_dbus_yoff.get_value_as_int())
             self.config["display_mode"] = "badge" if rb_badge.get_active() else "panel_entry"
             self.config["panel_entry_width"] = int(spin_entry_w.get_value_as_int())
             self.config["result_font_size"] = int(spin_res_fs.get_value_as_int())
@@ -2193,7 +2294,7 @@ class DictCalcWidget(Gtk.EventBox):
             chk_shadow,
         ):
             w_c.connect("toggled", apply_tab1)
-        for sp_c in (spin_dbus_max, spin_dbus_sec, spin_dbus_fs, spin_entry_w, spin_res_fs):
+        for sp_c in (spin_dbus_max, spin_dbus_sec, spin_dbus_fs, spin_dbus_yoff, spin_entry_w, spin_res_fs):
             sp_c.connect("value-changed", apply_tab1)
 
         # Bottom Close Button
