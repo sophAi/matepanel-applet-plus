@@ -930,13 +930,17 @@ class ClockWeatherPopupWindow(Gtk.Window):
             pm25 = cur.get("pm2_5")
             pm10 = cur.get("pm10")
             metric_lines.append(
-                f"🍃 空氣品質：<span foreground='{aqi_col}'><b>{html.escape(aqi_lbl)}</b></span>"
+                f"🍃 空氣品質：<span background='#1e293b' foreground='{aqi_col}'> <b>{html.escape(aqi_lbl)}</b> </span>"
             )
             pm_parts = []
             if pm25 is not None:
-                pm_parts.append(f"PM2.5 <span foreground='{pm25_to_color(pm25)}'><b>{pm25:.1f}</b></span>")
+                pm_parts.append(
+                    f"PM2.5 <span background='#1e293b' foreground='{pm25_to_color(pm25)}'> <b>{pm25:.1f}</b> </span>"
+                )
             if pm10 is not None:
-                pm_parts.append(f"PM10 <span foreground='{pm10_to_color(pm10)}'><b>{pm10:.1f}</b></span>")
+                pm_parts.append(
+                    f"PM10 <span background='#1e293b' foreground='{pm10_to_color(pm10)}'> <b>{pm10:.1f}</b> </span>"
+                )
             if pm_parts:
                 metric_lines.append(f"   {' · '.join(pm_parts)} μg/m³")
         elif day_fc.get("pm2_5_avg") is not None or day_fc.get("pm10_avg") is not None:
@@ -947,12 +951,12 @@ class ClockWeatherPopupWindow(Gtk.Window):
             fc_parts = []
             if p25_a is not None:
                 fc_parts.append(
-                    f"PM2.5 <span foreground='{pm25_to_color(p25_a)}'><b>{p25_a:.0f}</b></span>"
+                    f"PM2.5 <span background='#1e293b' foreground='{pm25_to_color(p25_a)}'> <b>{p25_a:.0f}</b> </span>"
                     + (f" (高{p25_m:.0f})" if p25_m is not None else "")
                 )
             if p10_a is not None:
                 fc_parts.append(
-                    f"PM10 <span foreground='{pm10_to_color(p10_a)}'><b>{p10_a:.0f}</b></span>"
+                    f"PM10 <span background='#1e293b' foreground='{pm10_to_color(p10_a)}'> <b>{p10_a:.0f}</b> </span>"
                     + (f" (高{p10_m:.0f})" if p10_m is not None else "")
                 )
             if fc_parts:
@@ -1265,22 +1269,18 @@ class ClockWeatherWidget(Gtk.EventBox):
         t = cur.get("temp")
         return f"{int(round(t))}°" if t is not None else "--°"
 
-    def _format_aqi_info(self):
-        """Return (text, color_hex) for compact Scheme B PM2.5/PM10 display, or ('', None) if disabled."""
+    def _get_aqi_dot_color(self):
+        """Return severity color hex for the panel air-quality indicator dot, or None if disabled."""
         if not self.config.get("show_air_quality", True):
-            return "", None
+            return None
         cur = (self.weather_data or {}).get("current") or {}
         p25 = cur.get("pm2_5")
-        p10 = cur.get("pm10")
-        s25 = str(int(round(p25))) if p25 is not None else "--"
-        s10 = str(int(round(p10))) if p10 is not None else "--"
         if p25 is not None:
-            col = pm25_to_color(p25)
-        elif cur.get("us_aqi") is not None:
+            return pm25_to_color(p25)
+        if cur.get("us_aqi") is not None:
             _, col = aqi_to_label_color(cur.get("us_aqi"))
-        else:
-            col = "#94a3b8"
-        return f"{s25}/{s10}", col
+            return col
+        return "#94a3b8"
 
     def _compute_panel_font_size(self, ctx, txt, h):
         """Compute bold panel font size (auto-maximize or user-defined px)."""
@@ -1304,13 +1304,13 @@ class ClockWeatherWidget(Gtk.EventBox):
         h = max(24, self.panel_size)
         clock_txt = self._format_clock_text()
         temp_txt = self._format_temp_text()
-        aqi_txt, _aqi_col = self._format_aqi_info()
+        aqi_col = self._get_aqi_dot_color()
         show_icon = bool(self.config.get("show_weather_icon", True))
         icon_sz = max(16, min(36, int(h - 2)))
 
         surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1)
         ctx = cairo.Context(surf)
-        sample_txt = " ".join(s for s in (clock_txt, temp_txt, aqi_txt) if s) or "12:00"
+        sample_txt = " ".join(s for s in (clock_txt, temp_txt) if s) or "12:00"
         fs, _ext = self._compute_panel_font_size(ctx, sample_txt, h)
 
         pad_x = 4.0
@@ -1319,23 +1319,22 @@ class ClockWeatherWidget(Gtk.EventBox):
             c_ext = ctx.text_extents(clock_txt)
             cur_x += max(c_ext.x_advance, c_ext.width)
 
-        has_weather = show_icon or bool(temp_txt) or bool(aqi_txt)
+        has_weather = show_icon or bool(temp_txt) or (aqi_col is not None)
         if clock_txt and has_weather:
             cur_x += 8.0
 
         if show_icon:
-            cur_x += icon_sz + (3.0 if (temp_txt or aqi_txt) else 0.0)
+            cur_x += icon_sz + (3.0 if (temp_txt or aqi_col is not None) else 0.0)
 
         if temp_txt:
             t_ext = ctx.text_extents(temp_txt)
             cur_x += max(t_ext.x_advance, t_ext.width)
-            if aqi_txt:
+            if aqi_col is not None:
                 cur_x += 6.0
 
-        if aqi_txt:
-            dot_r = max(3.0, min(5.5, fs * 0.24))
-            a_ext = ctx.text_extents(aqi_txt)
-            cur_x += dot_r * 2.0 + 3.5 + max(a_ext.x_advance, a_ext.width)
+        if aqi_col is not None:
+            dot_r = max(4.2, min(6.5, fs * 0.28))
+            cur_x += dot_r * 2.0 + 3.0
 
         total_w = int(math.ceil(cur_x + pad_x + 2.0))
         self.canvas.set_size_request(max(56, total_w), h)
@@ -1413,12 +1412,12 @@ class ClockWeatherWidget(Gtk.EventBox):
             is_light = opacity >= 30 and rgb_luminance(bg_rgb) > 0.55
             fg_rgb = (0.07, 0.09, 0.15) if is_light else (0.95, 0.98, 1.00)
 
-        # Layout Left -> Right: [Date/Weekday HH:MM]  [Weather Icon] [Temp]  [● PM2.5/PM10]
+        # Layout Left -> Right: [Date/Weekday HH:MM]  [Weather Icon] [Temp]  [●]
         clock_txt = self._format_clock_text()
         temp_txt = self._format_temp_text()
-        aqi_txt, aqi_col_hex = self._format_aqi_info()
+        aqi_col_hex = self._get_aqi_dot_color()
         show_icon = bool(self.config.get("show_weather_icon", True))
-        sample_txt = " ".join(s for s in (clock_txt, temp_txt, aqi_txt) if s) or "12:00"
+        sample_txt = " ".join(s for s in (clock_txt, temp_txt) if s) or "12:00"
         fs, ref_ext = self._compute_panel_font_size(ctx, sample_txt, bh)
         base_ty = (bh - ref_ext.height) / 2.0 - ref_ext.y_bearing
 
@@ -1428,7 +1427,7 @@ class ClockWeatherWidget(Gtk.EventBox):
             self._draw_styled_text(ctx, cur_x - c_ext.x_bearing, base_ty, clock_txt, fg_rgb)
             cur_x += max(c_ext.x_advance, c_ext.width)
 
-        has_weather = show_icon or bool(temp_txt) or bool(aqi_txt)
+        has_weather = show_icon or bool(temp_txt) or (aqi_col_hex is not None)
         if clock_txt and has_weather:
             cur_x += 8.0
 
@@ -1441,25 +1440,29 @@ class ClockWeatherWidget(Gtk.EventBox):
                 iy = (bh - icon_sz) / 2.0
                 Gdk.cairo_set_source_pixbuf(ctx, pb, cur_x, iy)
                 ctx.paint()
-            cur_x += icon_sz + (3.0 if (temp_txt or aqi_txt) else 0.0)
+            cur_x += icon_sz + (3.0 if (temp_txt or aqi_col_hex is not None) else 0.0)
 
         if temp_txt:
             t_ext = ctx.text_extents(temp_txt)
             self._draw_styled_text(ctx, cur_x - t_ext.x_bearing, base_ty, temp_txt, fg_rgb)
             cur_x += max(t_ext.x_advance, t_ext.width)
-            if aqi_txt:
+            if aqi_col_hex is not None:
                 cur_x += 6.0
 
-        if aqi_txt:
-            dot_r = max(3.0, min(5.5, fs * 0.24))
+        if aqi_col_hex is not None:
+            dot_r = max(4.2, min(6.5, fs * 0.28))
             dot_rgb = hex_to_rgb(aqi_col_hex, default=(0.58, 0.64, 0.72))
             font_alpha = max(0.10, min(1.0, int(self.config.get("font_opacity", 100)) / 100.0))
-            ctx.arc(cur_x + dot_r, bh / 2.0, dot_r, 0, 2 * math.pi)
+            cx_dot = cur_x + dot_r + 1.0
+            cy_dot = bh / 2.0
+            ctx.new_sub_path()
+            ctx.arc(cx_dot, cy_dot, dot_r, 0, 2 * math.pi)
             ctx.set_source_rgba(dot_rgb[0], dot_rgb[1], dot_rgb[2], font_alpha)
-            ctx.fill()
-            cur_x += dot_r * 2.0 + 3.5
-            a_ext = ctx.text_extents(aqi_txt)
-            self._draw_styled_text(ctx, cur_x - a_ext.x_bearing, base_ty, aqi_txt, fg_rgb)
+            ctx.fill_preserve()
+            # High-contrast dark outline so yellow/green dots stand out clearly on gray/light panels
+            ctx.set_source_rgba(0.06, 0.08, 0.12, 0.92 * font_alpha)
+            ctx.set_line_width(1.5)
+            ctx.stroke()
         return False
 
     def handle_applet_button_press(self, widget, event):
@@ -1583,7 +1586,7 @@ class ClockWeatherWidget(Gtk.EventBox):
         chk_w_icon.set_active(self.config.get("show_weather_icon", True))
         chk_w_temp = Gtk.CheckButton(label="即時溫度")
         chk_w_temp.set_active(self.config.get("show_weather_temp", True))
-        chk_aqi = Gtk.CheckButton(label="PM2.5/PM10")
+        chk_aqi = Gtk.CheckButton(label="空品燈號圓點")
         chk_aqi.set_active(self.config.get("show_air_quality", True))
         chk_date = Gtk.CheckButton(label="日期")
         chk_date.set_active(self.config.get("show_date", True))
