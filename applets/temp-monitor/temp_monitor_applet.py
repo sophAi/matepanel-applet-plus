@@ -1567,9 +1567,9 @@ class TempMonitorWidget(Gtk.EventBox):
             return
 
         win = Gtk.Window(title="CPU/GPU 溫度與負載監控 Plus — 偏好設定")
-        win.set_default_size(510, 680)
+        win.set_default_size(560, 440)
         win.set_position(Gtk.WindowPosition.CENTER)
-        win.set_resizable(False)
+        win.set_resizable(True)
         self.prefs_win = win
 
         def on_win_destroy(*_):
@@ -1578,19 +1578,35 @@ class TempMonitorWidget(Gtk.EventBox):
         win.connect("destroy", on_win_destroy)
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        outer.set_margin_top(14)
-        outer.set_margin_bottom(14)
-        outer.set_margin_start(18)
-        outer.set_margin_end(18)
+        outer.set_margin_top(12)
+        outer.set_margin_bottom(12)
+        outer.set_margin_start(14)
+        outer.set_margin_end(14)
 
-        # Section 1: Monitoring Status & Frequency
+        notebook = Gtk.Notebook()
+        outer.pack_start(notebook, True, True, 0)
+
+        def _make_tab_box(title):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            box.set_margin_top(12)
+            box.set_margin_bottom(12)
+            box.set_margin_start(14)
+            box.set_margin_end(14)
+            notebook.append_page(box, Gtk.Label(label=title))
+            return box
+
+        tab_mon = _make_tab_box("⚙️ 監控與閾值")
+        tab_disp = _make_tab_box("📊 面板顯示")
+        tab_style = _make_tab_box("🎨 外觀與顏色")
+
+        # Section 1: Monitoring Status & Frequency (Tab 1)
         sec1_lbl = Gtk.Label(xalign=0.0)
         sec1_lbl.set_markup("<b>1. 監控開關與時間頻率</b>")
-        outer.pack_start(sec1_lbl, False, False, 0)
+        tab_mon.pack_start(sec1_lbl, False, False, 0)
 
         chk_enable = Gtk.CheckButton(label="啟用自動監控 (關閉時完全停止背景輪詢)")
         chk_enable.set_active(self.config.get("enabled", True))
-        outer.pack_start(chk_enable, False, False, 0)
+        tab_mon.pack_start(chk_enable, False, False, 0)
 
         freq_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         freq_lbl = Gtk.Label(label="監控更新間隔（秒）：", xalign=0.0)
@@ -1605,14 +1621,14 @@ class TempMonitorWidget(Gtk.EventBox):
         spin_freq = Gtk.SpinButton(adjustment=freq_adj, climb_rate=1.0, digits=0)
         freq_box.pack_start(freq_lbl, True, True, 0)
         freq_box.pack_start(spin_freq, False, False, 0)
-        outer.pack_start(freq_box, False, False, 0)
+        tab_mon.pack_start(freq_box, False, False, 0)
 
-        outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+        tab_mon.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
-        # Section 2: Panel Icon Appearance
+        # Section 2: Panel Icon Appearance (Tab 2)
         sec2_lbl = Gtk.Label(xalign=0.0)
-        sec2_lbl.set_markup("<b>2. 面板圖示顯示樣式</b>")
-        outer.pack_start(sec2_lbl, False, False, 0)
+        sec2_lbl.set_markup("<b>1. 面板圖示顯示樣式</b>")
+        tab_disp.pack_start(sec2_lbl, False, False, 0)
 
         rb_badge = Gtk.RadioButton.new_with_label_from_widget(
             None, "模式 A：動態方塊圖示 (Badge Mode)"
@@ -1624,23 +1640,23 @@ class TempMonitorWidget(Gtk.EventBox):
             rb_badge.set_active(True)
         else:
             rb_icontext.set_active(True)
-        outer.pack_start(rb_badge, False, False, 0)
-        outer.pack_start(rb_icontext, False, False, 0)
+        tab_disp.pack_start(rb_badge, False, False, 0)
+        tab_disp.pack_start(rb_icontext, False, False, 0)
 
-        outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+        tab_disp.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
-        # Section 3: NVIDIA / GPU Utilization & Memory-Usage Panel Options
+        # Section 3: NVIDIA / GPU Utilization & Memory-Usage Panel Options (Tab 2)
         sec_gpu_lbl = Gtk.Label(xalign=0.0)
-        sec_gpu_lbl.set_markup("<b>3. GPU 使用率 (GPU-Util) 與顯存 (Memory-Usage) 面板呈現</b>")
-        outer.pack_start(sec_gpu_lbl, False, False, 0)
+        sec_gpu_lbl.set_markup("<b>2. GPU 使用率 (GPU-Util) 與顯存 (Memory-Usage) 面板呈現</b>")
+        tab_disp.pack_start(sec_gpu_lbl, False, False, 0)
 
         chk_gpu_util = Gtk.CheckButton(label="在面板上顯示 Volatile GPU-Util (GPU 核心使用率 %)")
         chk_gpu_util.set_active(self.config.get("show_panel_gpu_util", True))
-        outer.pack_start(chk_gpu_util, False, False, 0)
+        tab_disp.pack_start(chk_gpu_util, False, False, 0)
 
         chk_gpu_mem = Gtk.CheckButton(label="在面板上顯示 Memory-Usage (GPU 顯存使用量)")
         chk_gpu_mem.set_active(self.config.get("show_panel_gpu_mem", True))
-        outer.pack_start(chk_gpu_mem, False, False, 0)
+        tab_disp.pack_start(chk_gpu_mem, False, False, 0)
 
         layout_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         layout_box.set_margin_start(12)
@@ -1656,7 +1672,7 @@ class TempMonitorWidget(Gtk.EventBox):
             rb_layout_comp.set_active(True)
         layout_box.pack_start(rb_layout_sep, False, False, 0)
         layout_box.pack_start(rb_layout_comp, False, False, 0)
-        outer.pack_start(layout_box, False, False, 0)
+        tab_disp.pack_start(layout_box, False, False, 0)
 
         unit_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         unit_box.set_margin_start(12)
@@ -1670,14 +1686,16 @@ class TempMonitorWidget(Gtk.EventBox):
         unit_box.pack_start(unit_lbl, False, False, 0)
         unit_box.pack_start(rb_unit_pct, False, False, 0)
         unit_box.pack_start(rb_unit_gib, False, False, 0)
-        outer.pack_start(unit_box, False, False, 0)
+        tab_disp.pack_start(unit_box, False, False, 0)
 
-        outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+        chk_hover_tip = Gtk.CheckButton(label="滑鼠懸停面板圖示時顯示詳細資訊 (Tooltip)")
+        chk_hover_tip.set_active(self.config.get("show_hover_tooltip", True))
+        tab_disp.pack_start(chk_hover_tip, False, False, 0)
 
-        # Section 4: 3-Stage Panel Font Color & Background Adaptation
+        # Section 4: 3-Stage Panel Font Color & Background Adaptation (Tab 3)
         sec_col_lbl = Gtk.Label(xalign=0.0)
-        sec_col_lbl.set_markup("<b>4. 面板三段式字形顏色與底色適應 (正常 / 中度負載 / 高溫高負載警戒)</b>")
-        outer.pack_start(sec_col_lbl, False, False, 0)
+        sec_col_lbl.set_markup("<b>面板三段式字形顏色與底色適應 (正常 / 中度負載 / 高溫高負載警戒)</b>")
+        tab_style.pack_start(sec_col_lbl, False, False, 0)
 
         rb_font_dyn = Gtk.RadioButton.new_with_label_from_widget(
             None, "使用預設內建動態字形色階"
@@ -1689,8 +1707,8 @@ class TempMonitorWidget(Gtk.EventBox):
             rb_font_dyn.set_active(True)
         else:
             rb_font_cus.set_active(True)
-        outer.pack_start(rb_font_dyn, False, False, 0)
-        outer.pack_start(rb_font_cus, False, False, 0)
+        tab_style.pack_start(rb_font_dyn, False, False, 0)
+        tab_style.pack_start(rb_font_cus, False, False, 0)
 
         def make_color_btn(hex_val, title):
             cb = Gtk.ColorButton()
@@ -1726,13 +1744,13 @@ class TempMonitorWidget(Gtk.EventBox):
         preset_box.pack_start(btn_dark_theme, False, False, 0)
         preset_box.pack_start(btn_light_theme, False, False, 0)
         c_grid.attach(preset_box, 2, 1, 2, 1)
-        outer.pack_start(c_grid, False, False, 0)
+        tab_style.pack_start(c_grid, False, False, 0)
 
         chk_custom_badge = Gtk.CheckButton(
             label="分別自訂 CPU 與 GPU 方塊的底色、框線色與底色透明度（取消勾選則隨溫度變色）"
         )
         chk_custom_badge.set_active(self.config.get("custom_badge_style", True))
-        outer.pack_start(chk_custom_badge, False, False, 0)
+        tab_style.pack_start(chk_custom_badge, False, False, 0)
 
         cg_grid = Gtk.Grid(column_spacing=8, row_spacing=6)
         cg_grid.set_margin_start(14)
@@ -1782,7 +1800,7 @@ class TempMonitorWidget(Gtk.EventBox):
         cg_grid.attach(Gtk.Label(label="透明度：", xalign=0.0), 4, 1, 1, 1)
         cg_grid.attach(gpu_op_scale, 5, 1, 1, 1)
         cg_grid.attach(lbl_gpu_op, 6, 1, 1, 1)
-        outer.pack_start(cg_grid, False, False, 0)
+        tab_style.pack_start(cg_grid, False, False, 0)
 
         bg_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         bg_lbl = Gtk.Label(label="動態模式底色樣式：", xalign=0.0)
@@ -1800,34 +1818,28 @@ class TempMonitorWidget(Gtk.EventBox):
         bg_box.pack_start(rb_bg_dark, False, False, 0)
         bg_box.pack_start(rb_bg_light, False, False, 0)
         bg_box.pack_start(rb_bg_trans, False, False, 0)
-        outer.pack_start(bg_box, False, False, 0)
+        tab_style.pack_start(bg_box, False, False, 0)
 
         chk_shadow = Gtk.CheckButton(label="啟用文字高對比描邊陰影 (透明或花紋面板底色時保持清晰可讀)")
         chk_shadow.set_active(self.config.get("text_shadow", False))
-        outer.pack_start(chk_shadow, False, False, 0)
-
-        chk_hover_tip = Gtk.CheckButton(label="滑鼠懸停面板圖示時顯示詳細資訊 (Tooltip)")
-        chk_hover_tip.set_active(self.config.get("show_hover_tooltip", True))
-        outer.pack_start(chk_hover_tip, False, False, 0)
+        tab_style.pack_start(chk_shadow, False, False, 0)
 
         chk_no_border = Gtk.CheckButton(label="取消 MATE Panel 圖示框線")
         chk_no_border.set_active(self.config.get("hide_panel_border", False))
-        outer.pack_start(chk_no_border, False, False, 0)
+        tab_style.pack_start(chk_no_border, False, False, 0)
 
-        outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
-
-        # Section 5: Calculation & Thresholds
+        # Section 5: Calculation & Thresholds (Tab 1)
         sec5_lbl = Gtk.Label(xalign=0.0)
-        sec5_lbl.set_markup("<b>5. 感測器計算與中度/高溫警戒變色閾值</b>")
-        outer.pack_start(sec5_lbl, False, False, 0)
+        sec5_lbl.set_markup("<b>2. 感測器計算與中度/高溫警戒變色閾值</b>")
+        tab_mon.pack_start(sec5_lbl, False, False, 0)
 
         chk_cores_only = Gtk.CheckButton(label="CPU 平均溫度僅計算實體核心 (Core 0..N，不含 Package)")
         chk_cores_only.set_active(self.config.get("cpu_avg_cores_only", True))
-        outer.pack_start(chk_cores_only, False, False, 0)
+        tab_mon.pack_start(chk_cores_only, False, False, 0)
 
         chk_other = Gtk.CheckButton(label="在點選選單中顯示其他感測器 (NVMe SSD / 主機板 / 風扇)")
         chk_other.set_active(self.config.get("show_other_sensors", True))
-        outer.pack_start(chk_other, False, False, 0)
+        tab_mon.pack_start(chk_other, False, False, 0)
 
         grid = Gtk.Grid(column_spacing=12, row_spacing=6)
         lbl_warn = Gtk.Label(label="溫度中度負載閾值 (°C)：", xalign=0.0)
@@ -1882,7 +1894,7 @@ class TempMonitorWidget(Gtk.EventBox):
         grid.attach(spin_warn_p, 1, 1, 1, 1)
         grid.attach(lbl_crit_p, 2, 1, 1, 1)
         grid.attach(spin_crit_p, 3, 1, 1, 1)
-        outer.pack_start(grid, False, False, 0)
+        tab_mon.pack_start(grid, False, False, 0)
 
         # Live apply bindings
         def rgba_to_hex(rgba):

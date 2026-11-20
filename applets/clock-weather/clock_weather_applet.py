@@ -2417,7 +2417,7 @@ class ClockWeatherWidget(Gtk.EventBox):
             return
 
         win = Gtk.Window(title="月曆、時鐘與天氣預報 Plus — 偏好設定")
-        win.set_default_size(580, 620)
+        win.set_default_size(580, 480)
         win.set_position(Gtk.WindowPosition.CENTER)
         self.prefs_win = win
         win.connect("destroy", lambda *_: setattr(self, "prefs_win", None))
@@ -2431,17 +2431,23 @@ class ClockWeatherWidget(Gtk.EventBox):
         notebook = Gtk.Notebook()
         root_vbox.pack_start(notebook, True, True, 0)
 
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=9)
-        outer.set_margin_top(10)
-        outer.set_margin_bottom(10)
-        outer.set_margin_start(12)
-        outer.set_margin_end(12)
-        notebook.append_page(outer, Gtk.Label(label="一般與面板外觀"))
+        def _make_tab_box(title):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=9)
+            box.set_margin_top(12)
+            box.set_margin_bottom(12)
+            box.set_margin_start(14)
+            box.set_margin_end(14)
+            notebook.append_page(box, Gtk.Label(label=title))
+            return box
 
-        # 1. Weather City & Refresh
+        tab_loc = _make_tab_box("📍 地點與世界時鐘")
+        tab_panel = _make_tab_box("🎨 面板顯示與外觀")
+        tab_bubble = _make_tab_box("📅 月曆與氣泡框")
+
+        # --- Tab 1: Weather City & World Clocks ---
         s1 = Gtk.Label(xalign=0.0)
         s1.set_markup("<b>1. 天氣預報地點與更新設定（Open-Meteo 免 API Key）</b>")
-        outer.pack_start(s1, False, False, 0)
+        tab_loc.pack_start(s1, False, False, 0)
 
         preset_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
         preset_row.set_margin_start(10)
@@ -2451,7 +2457,7 @@ class ClockWeatherWidget(Gtk.EventBox):
             b = Gtk.Button(label=cname)
             preset_btns.append((b, cname, clat, clon))
             preset_row.pack_start(b, False, False, 0)
-        outer.pack_start(preset_row, False, False, 0)
+        tab_loc.pack_start(preset_row, False, False, 0)
 
         search_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         search_row.set_margin_start(10)
@@ -2461,13 +2467,13 @@ class ClockWeatherWidget(Gtk.EventBox):
         btn_search = Gtk.Button(label="🔎 搜尋")
         search_row.pack_start(entry_search, True, True, 0)
         search_row.pack_start(btn_search, False, False, 0)
-        outer.pack_start(search_row, False, False, 0)
+        tab_loc.pack_start(search_row, False, False, 0)
 
         combo_city_res = Gtk.ComboBoxText()
         combo_city_res.set_margin_start(10)
         combo_city_res.append("cur", f"目前地點：{self.config.get('city_name', '台北')} ({self.config.get('latitude', 25.033):.4f}, {self.config.get('longitude', 121.5654):.4f})")
         combo_city_res.set_active_id("cur")
-        outer.pack_start(combo_city_res, False, False, 0)
+        tab_loc.pack_start(combo_city_res, False, False, 0)
         found_cities = {}
 
         freq_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -2488,58 +2494,20 @@ class ClockWeatherWidget(Gtk.EventBox):
         btn_now_fetch = Gtk.Button(label="🔄 立即抓取天氣")
         freq_row.pack_start(spin_interval, False, False, 0)
         freq_row.pack_end(btn_now_fetch, False, False, 0)
-        outer.pack_start(freq_row, False, False, 0)
+        tab_loc.pack_start(freq_row, False, False, 0)
 
-        outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+        tab_loc.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
-        # 2. Panel Display Content (NO seconds option!)
-        s2 = Gtk.Label(xalign=0.0)
-        s2.set_markup("<b>2. 面板顯示項目與月曆設定</b>")
-        outer.pack_start(s2, False, False, 0)
-
-        chk_row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        chk_row1.set_margin_start(10)
-        chk_w_icon = Gtk.CheckButton(label="天氣圖示")
-        chk_w_icon.set_active(self.config.get("show_weather_icon", True))
-        chk_w_temp = Gtk.CheckButton(label="即時溫度")
-        chk_w_temp.set_active(self.config.get("show_weather_temp", True))
-        chk_aqi = Gtk.CheckButton(label="空品燈號圓點")
-        chk_aqi.set_active(self.config.get("show_air_quality", True))
-        chk_date = Gtk.CheckButton(label="日期")
-        chk_date.set_active(self.config.get("show_date", True))
-        chk_wd = Gtk.CheckButton(label="星期")
-        chk_wd.set_active(self.config.get("show_weekday", True))
-        for c in (chk_w_icon, chk_w_temp, chk_aqi, chk_date, chk_wd):
-            chk_row1.pack_start(c, False, False, 0)
-        outer.pack_start(chk_row1, False, False, 0)
-
-        chk_row2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        chk_row2.set_margin_start(10)
-        chk_24h = Gtk.CheckButton(label="使用 24 小時制 (HH:MM)")
-        chk_24h.set_active(self.config.get("use_24h", True))
-        chk_row2.pack_start(chk_24h, False, False, 0)
-        chk_row2.pack_start(Gtk.Label(label="月曆與預報字型大小 (pt)：", xalign=0.0), False, False, 0)
-        spin_cal_fs = Gtk.SpinButton(
-            adjustment=Gtk.Adjustment(
-                value=float(self.config.get("calendar_font_size", 11)),
-                lower=8.0,
-                upper=20.0,
-                step_increment=1.0,
-                page_increment=2.0,
-                page_size=0.0,
-            ),
-            climb_rate=1.0,
-            digits=0,
-        )
-        chk_row2.pack_start(spin_cal_fs, False, False, 0)
-        outer.pack_start(chk_row2, False, False, 0)
+        s_wc = Gtk.Label(xalign=0.0)
+        s_wc.set_markup("<b>2. 世界時鐘城市設定（顯示於完整天氣月曆底部）</b>")
+        tab_loc.pack_start(s_wc, False, False, 0)
 
         wc_hdr_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         wc_hdr_row.set_margin_start(10)
         chk_world = Gtk.CheckButton(label="在天氣月曆底部顯示世界時鐘（自行勾選城市）：")
         chk_world.set_active(self.config.get("show_world_clock", True))
         wc_hdr_row.pack_start(chk_world, False, False, 0)
-        outer.pack_start(wc_hdr_row, False, False, 0)
+        tab_loc.pack_start(wc_hdr_row, False, False, 0)
 
         raw_wc = self.config.get("world_clocks", "Asia/Tokyo, Europe/London, America/New_York")
         cur_wc_list = [s.strip() for s in raw_wc.split(",") if s.strip()]
@@ -2555,7 +2523,7 @@ class ClockWeatherWidget(Gtk.EventBox):
             cb.set_active(tz_id in cur_wc_set)
             wc_grid.attach(cb, idx % 4, idx // 4, 1, 1)
             wc_checkboxes.append((cb, tz_id))
-        outer.pack_start(wc_grid, False, False, 0)
+        tab_loc.pack_start(wc_grid, False, False, 0)
 
         wc_custom_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         wc_custom_row.set_margin_start(24)
@@ -2565,14 +2533,44 @@ class ClockWeatherWidget(Gtk.EventBox):
         entry_world_custom.set_placeholder_text("選填，逗號分隔，如 Asia/Kolkata, Pacific/Auckland")
         entry_world_custom.set_text(", ".join(custom_wc_list))
         wc_custom_row.pack_start(entry_world_custom, True, True, 0)
-        outer.pack_start(wc_custom_row, False, False, 0)
+        tab_loc.pack_start(wc_custom_row, False, False, 0)
 
-        outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+        # --- Tab 2: Panel Display & Appearance (NO seconds option!) ---
+        s2 = Gtk.Label(xalign=0.0)
+        s2.set_markup("<b>1. 面板顯示項目</b>")
+        tab_panel.pack_start(s2, False, False, 0)
 
-        # 3. Panel Appearance (Custom BG / Font Color / Font Opacity / Shadow — Borderless)
+        chk_row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        chk_row1.set_margin_start(10)
+        chk_w_icon = Gtk.CheckButton(label="天氣圖示")
+        chk_w_icon.set_active(self.config.get("show_weather_icon", True))
+        chk_w_temp = Gtk.CheckButton(label="即時溫度")
+        chk_w_temp.set_active(self.config.get("show_weather_temp", True))
+        chk_aqi = Gtk.CheckButton(label="空品燈號圓點")
+        chk_aqi.set_active(self.config.get("show_air_quality", True))
+        chk_date = Gtk.CheckButton(label="日期")
+        chk_date.set_active(self.config.get("show_date", True))
+        chk_wd = Gtk.CheckButton(label="星期")
+        chk_wd.set_active(self.config.get("show_weekday", True))
+        for c in (chk_w_icon, chk_w_temp, chk_aqi, chk_date, chk_wd):
+            chk_row1.pack_start(c, False, False, 0)
+        tab_panel.pack_start(chk_row1, False, False, 0)
+
+        chk_row2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        chk_row2.set_margin_start(10)
+        chk_24h = Gtk.CheckButton(label="使用 24 小時制 (HH:MM)")
+        chk_24h.set_active(self.config.get("use_24h", True))
+        chk_hover_tip = Gtk.CheckButton(label="滑鼠懸停圖示顯示資訊 (Tooltip)")
+        chk_hover_tip.set_active(self.config.get("show_hover_tooltip", True))
+        chk_row2.pack_start(chk_24h, False, False, 0)
+        chk_row2.pack_start(chk_hover_tip, False, False, 0)
+        tab_panel.pack_start(chk_row2, False, False, 0)
+
+        tab_panel.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+
         s3 = Gtk.Label(xalign=0.0)
-        s3.set_markup("<b>3. 面板背景底色、文字顏色與透明度設定</b>")
-        outer.pack_start(s3, False, False, 0)
+        s3.set_markup("<b>2. 面板背景底色、文字顏色、透明度與字體大小</b>")
+        tab_panel.pack_start(s3, False, False, 0)
 
         def make_cbtn(key, default_hex):
             b = Gtk.ColorButton()
@@ -2598,7 +2596,7 @@ class ClockWeatherWidget(Gtk.EventBox):
         bg_row.pack_start(Gtk.Label(label="背景透明度：", xalign=0.0), False, False, 0)
         bg_row.pack_start(scale_op, True, True, 0)
         bg_row.pack_start(lbl_op, False, False, 0)
-        outer.pack_start(bg_row, False, False, 0)
+        tab_panel.pack_start(bg_row, False, False, 0)
 
         fc_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         fc_row.set_margin_start(10)
@@ -2615,7 +2613,7 @@ class ClockWeatherWidget(Gtk.EventBox):
         fc_row.pack_start(rb_fc_cus, False, False, 0)
         fc_row.pack_start(fc_btn, False, False, 0)
         fc_row.pack_end(chk_shadow, False, False, 0)
-        outer.pack_start(fc_row, False, False, 0)
+        tab_panel.pack_start(fc_row, False, False, 0)
 
         fop_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         fop_row.set_margin_start(10)
@@ -2630,7 +2628,7 @@ class ClockWeatherWidget(Gtk.EventBox):
         fop_row.pack_start(Gtk.Label(label="文字透明度：", xalign=0.0), False, False, 0)
         fop_row.pack_start(scale_font_op, True, True, 0)
         fop_row.pack_start(lbl_font_op, False, False, 0)
-        outer.pack_start(fop_row, False, False, 0)
+        tab_panel.pack_start(fop_row, False, False, 0)
 
         pfs_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         pfs_row.set_margin_start(10)
@@ -2651,22 +2649,30 @@ class ClockWeatherWidget(Gtk.EventBox):
         )
         pfs_row.pack_start(chk_panel_fs_auto, False, False, 0)
         pfs_row.pack_start(spin_panel_fs, False, False, 0)
-        chk_hover_tip = Gtk.CheckButton(label="懸停圖示顯示資訊")
-        chk_hover_tip.set_active(self.config.get("show_hover_tooltip", True))
-        pfs_row.pack_end(chk_hover_tip, False, False, 0)
-        outer.pack_start(pfs_row, False, False, 0)
+        tab_panel.pack_start(pfs_row, False, False, 0)
 
-        # --- Tab 2: Calendar Mode & Custom RGBA Bubble Settings ---
-        tab_bubble = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        tab_bubble.set_margin_top(12)
-        tab_bubble.set_margin_bottom(12)
-        tab_bubble.set_margin_start(14)
-        tab_bubble.set_margin_end(14)
-        notebook.append_page(tab_bubble, Gtk.Label(label="月曆與氣泡框"))
-
+        # --- Tab 3: Calendar Mode & Custom RGBA Bubble Settings ---
         bs1 = Gtk.Label(xalign=0.0)
-        bs1.set_markup("<b>1. 左鍵點擊面板時的天氣月曆顯示模式（亦可由右鍵選單快速切換）</b>")
+        bs1.set_markup("<b>1. 天氣月曆顯示模式、字型與自動變化提醒</b>")
         tab_bubble.pack_start(bs1, False, False, 0)
+
+        cal_fs_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        cal_fs_row.set_margin_start(10)
+        cal_fs_row.pack_start(Gtk.Label(label="月曆與氣泡字型大小 (pt)：", xalign=0.0), False, False, 0)
+        spin_cal_fs = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(
+                value=float(self.config.get("calendar_font_size", 11)),
+                lower=8.0,
+                upper=20.0,
+                step_increment=1.0,
+                page_increment=2.0,
+                page_size=0.0,
+            ),
+            climb_rate=1.0,
+            digits=0,
+        )
+        cal_fs_row.pack_start(spin_cal_fs, False, False, 0)
+        tab_bubble.pack_start(cal_fs_row, False, False, 0)
 
         mode_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         mode_row.set_margin_start(10)

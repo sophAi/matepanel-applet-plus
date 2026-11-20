@@ -2685,9 +2685,9 @@ class TaskwarriorWidget(Gtk.EventBox):
             return
 
         win = Gtk.Window(title="Taskwarrior 任務管理 & 番茄鐘 Plus — 偏好設定")
-        win.set_default_size(530, 740)
+        win.set_default_size(560, 450)
         win.set_position(Gtk.WindowPosition.CENTER)
-        win.set_resizable(False)
+        win.set_resizable(True)
         self.prefs_win = win
 
         def on_win_destroy(*_):
@@ -2695,16 +2695,32 @@ class TaskwarriorWidget(Gtk.EventBox):
 
         win.connect("destroy", on_win_destroy)
 
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         outer.set_margin_top(12)
         outer.set_margin_bottom(12)
-        outer.set_margin_start(18)
-        outer.set_margin_end(18)
+        outer.set_margin_start(14)
+        outer.set_margin_end(14)
 
-        # Section 1: Left-click Action & Calendar Options
+        notebook = Gtk.Notebook()
+        outer.pack_start(notebook, True, True, 0)
+
+        def _make_tab_box(title):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=9)
+            box.set_margin_top(12)
+            box.set_margin_bottom(12)
+            box.set_margin_start(14)
+            box.set_margin_end(14)
+            notebook.append_page(box, Gtk.Label(label=title))
+            return box
+
+        tab_cal = _make_tab_box("📅 月曆與任務")
+        tab_pomo = _make_tab_box("🍅 番茄鐘")
+        tab_style = _make_tab_box("🎨 外觀與顏色")
+
+        # Section 1: Left-click Action & Calendar Options (Tab 1)
         sec0_lbl = Gtk.Label(xalign=0.0)
         sec0_lbl.set_markup("<b>1. 左鍵點選行為與月曆視圖設定</b>")
-        outer.pack_start(sec0_lbl, False, False, 0)
+        tab_cal.pack_start(sec0_lbl, False, False, 0)
 
         rb_lc_cal = Gtk.RadioButton.new_with_label_from_widget(
             None, "左鍵點選面板圖示時：直接開啟「📅 雙欄式月曆任務看板」(推薦)"
@@ -2716,14 +2732,14 @@ class TaskwarriorWidget(Gtk.EventBox):
             rb_lc_cal.set_active(True)
         else:
             rb_lc_menu.set_active(True)
-        outer.pack_start(rb_lc_cal, False, False, 0)
-        outer.pack_start(rb_lc_menu, False, False, 0)
+        tab_cal.pack_start(rb_lc_cal, False, False, 0)
+        tab_cal.pack_start(rb_lc_menu, False, False, 0)
 
         chk_cal_comp = Gtk.CheckButton(
             label="在月曆格子與當日清單中顯示歷史「已完成任務 (✓)」(依完成日期歸檔)"
         )
         chk_cal_comp.set_active(self.config.get("calendar_show_completed", True))
-        outer.pack_start(chk_cal_comp, False, False, 0)
+        tab_cal.pack_start(chk_cal_comp, False, False, 0)
 
         cal_fs_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         cal_fs_box.set_margin_start(14)
@@ -2741,14 +2757,14 @@ class TaskwarriorWidget(Gtk.EventBox):
         spin_cal_fs = Gtk.SpinButton(adjustment=adj_cal_fs, climb_rate=1.0, digits=0)
         cal_fs_box.pack_start(lbl_cal_fs, True, True, 0)
         cal_fs_box.pack_start(spin_cal_fs, False, False, 0)
-        outer.pack_start(cal_fs_box, False, False, 0)
+        tab_cal.pack_start(cal_fs_box, False, False, 0)
 
-        outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+        tab_cal.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
-        # Section 2: Pomodoro Focus Timer & Cycle Settings
+        # Section 2: Pomodoro Focus Timer & Cycle Settings (Tab 2)
         sec_pomo_lbl = Gtk.Label(xalign=0.0)
-        sec_pomo_lbl.set_markup("<b>2. 🍅 番茄鐘倒數計時與循環次數設定</b>")
-        outer.pack_start(sec_pomo_lbl, False, False, 0)
+        sec_pomo_lbl.set_markup("<b>🍅 番茄鐘倒數計時、面板呈現與循環次數設定</b>")
+        tab_pomo.pack_start(sec_pomo_lbl, False, False, 0)
 
         pomo_mode_combo = Gtk.ComboBoxText()
         pm_items = [
@@ -2764,7 +2780,7 @@ class TaskwarriorWidget(Gtk.EventBox):
             if pm_id == cur_pm:
                 pm_active = idx
         pomo_mode_combo.set_active(pm_active)
-        outer.pack_start(pomo_mode_combo, False, False, 0)
+        tab_pomo.pack_start(pomo_mode_combo, False, False, 0)
 
         pomo_grid = Gtk.Grid(column_spacing=12, row_spacing=6)
         pomo_grid.set_margin_start(14)
@@ -2808,21 +2824,19 @@ class TaskwarriorWidget(Gtk.EventBox):
         pomo_grid.attach(spin_b_min, 3, 0, 1, 1)
         pomo_grid.attach(lbl_cycles, 0, 1, 1, 1)
         pomo_grid.attach(spin_cycles, 1, 1, 1, 1)
-        outer.pack_start(pomo_grid, False, False, 0)
+        tab_pomo.pack_start(pomo_grid, False, False, 0)
 
         chk_pomo_sync = Gtk.CheckButton(
             label="綁定任務啟動/暫停番茄鐘時，同步觸發 Taskwarrior 的 task start / stop"
         )
         chk_pomo_sync.set_margin_start(14)
         chk_pomo_sync.set_active(self.config.get("pomo_sync_task_start", True))
-        outer.pack_start(chk_pomo_sync, False, False, 0)
+        tab_pomo.pack_start(chk_pomo_sync, False, False, 0)
 
-        outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
-
-        # Section 3: Panel Display Mode
+        # Section 3: Panel Display Mode (Tab 1)
         sec1_lbl = Gtk.Label(xalign=0.0)
-        sec1_lbl.set_markup("<b>3. 面板任務標題與到期警戒設定</b>")
-        outer.pack_start(sec1_lbl, False, False, 0)
+        sec1_lbl.set_markup("<b>2. 面板任務標題與到期警戒設定</b>")
+        tab_cal.pack_start(sec1_lbl, False, False, 0)
 
         rb_badge = Gtk.RadioButton.new_with_label_from_widget(
             None, "模式 A：僅顯示精簡方塊圖示 ([TASK] / [番茄鐘])"
@@ -2834,8 +2848,8 @@ class TaskwarriorWidget(Gtk.EventBox):
             rb_badge.set_active(True)
         else:
             rb_text.set_active(True)
-        outer.pack_start(rb_badge, False, False, 0)
-        outer.pack_start(rb_text, False, False, 0)
+        tab_cal.pack_start(rb_badge, False, False, 0)
+        tab_cal.pack_start(rb_text, False, False, 0)
 
         opt_grid = Gtk.Grid(column_spacing=12, row_spacing=6)
         opt_grid.set_margin_start(14)
@@ -2865,19 +2879,21 @@ class TaskwarriorWidget(Gtk.EventBox):
         opt_grid.attach(spin_maxc, 1, 0, 1, 1)
         opt_grid.attach(lbl_duesoon, 2, 0, 1, 1)
         opt_grid.attach(spin_duesoon, 3, 0, 1, 1)
-        outer.pack_start(opt_grid, False, False, 0)
+        tab_cal.pack_start(opt_grid, False, False, 0)
 
         chk_due_panel = Gtk.CheckButton(label="在模式 B 面板標題後方附上到期倒數 (例如 剩 4 天)")
         chk_due_panel.set_margin_start(14)
         chk_due_panel.set_active(self.config.get("show_due_in_panel", True))
-        outer.pack_start(chk_due_panel, False, False, 0)
+        tab_cal.pack_start(chk_due_panel, False, False, 0)
 
-        outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+        chk_hover_tip = Gtk.CheckButton(label="滑鼠懸停面板圖示時顯示詳細資訊 (Tooltip)")
+        chk_hover_tip.set_active(self.config.get("show_hover_tooltip", True))
+        tab_cal.pack_start(chk_hover_tip, False, False, 0)
 
-        # Section 4: 3-Stage Font Colors & Background Style
+        # Section 4: 3-Stage Font Colors & Background Style (Tab 3)
         sec2_lbl = Gtk.Label(xalign=0.0)
-        sec2_lbl.set_markup("<b>4. 面板三段式字形顏色與底色適應</b>")
-        outer.pack_start(sec2_lbl, False, False, 0)
+        sec2_lbl.set_markup("<b>面板三段式字形顏色與底色適應</b>")
+        tab_style.pack_start(sec2_lbl, False, False, 0)
 
         rb_font_dyn = Gtk.RadioButton.new_with_label_from_widget(
             None, "使用預設內建動態字形色階"
@@ -2889,8 +2905,8 @@ class TaskwarriorWidget(Gtk.EventBox):
             rb_font_dyn.set_active(True)
         else:
             rb_font_cus.set_active(True)
-        outer.pack_start(rb_font_dyn, False, False, 0)
-        outer.pack_start(rb_font_cus, False, False, 0)
+        tab_style.pack_start(rb_font_dyn, False, False, 0)
+        tab_style.pack_start(rb_font_cus, False, False, 0)
 
         def make_color_btn(hex_val, title):
             cb = Gtk.ColorButton()
@@ -2926,13 +2942,13 @@ class TaskwarriorWidget(Gtk.EventBox):
         preset_box.pack_start(btn_dark_theme, False, False, 0)
         preset_box.pack_start(btn_light_theme, False, False, 0)
         c_grid.attach(preset_box, 2, 1, 2, 1)
-        outer.pack_start(c_grid, False, False, 0)
+        tab_style.pack_start(c_grid, False, False, 0)
 
         chk_custom_badge = Gtk.CheckButton(
             label="分別自訂 TASK 與番茄鐘方塊的底色、框線色與底色透明度（取消勾選則隨任務狀態變色）"
         )
         chk_custom_badge.set_active(self.config.get("custom_badge_style", True))
-        outer.pack_start(chk_custom_badge, False, False, 0)
+        tab_style.pack_start(chk_custom_badge, False, False, 0)
 
         tp_grid = Gtk.Grid(column_spacing=8, row_spacing=6)
         tp_grid.set_margin_start(14)
@@ -2982,7 +2998,7 @@ class TaskwarriorWidget(Gtk.EventBox):
         tp_grid.attach(Gtk.Label(label="透明度：", xalign=0.0), 4, 1, 1, 1)
         tp_grid.attach(pomo_op_scale, 5, 1, 1, 1)
         tp_grid.attach(lbl_pomo_op, 6, 1, 1, 1)
-        outer.pack_start(tp_grid, False, False, 0)
+        tab_style.pack_start(tp_grid, False, False, 0)
 
         bg_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         bg_lbl = Gtk.Label(label="動態模式底色樣式：", xalign=0.0)
@@ -3000,19 +3016,15 @@ class TaskwarriorWidget(Gtk.EventBox):
         bg_box.pack_start(rb_bg_dark, False, False, 0)
         bg_box.pack_start(rb_bg_light, False, False, 0)
         bg_box.pack_start(rb_bg_trans, False, False, 0)
-        outer.pack_start(bg_box, False, False, 0)
+        tab_style.pack_start(bg_box, False, False, 0)
 
         chk_shadow = Gtk.CheckButton(label="啟用文字高對比描邊陰影 (透明或花紋面板底色時保持清晰可讀)")
         chk_shadow.set_active(self.config.get("text_shadow", False))
-        outer.pack_start(chk_shadow, False, False, 0)
-
-        chk_hover_tip = Gtk.CheckButton(label="滑鼠懸停面板圖示時顯示詳細資訊 (Tooltip)")
-        chk_hover_tip.set_active(self.config.get("show_hover_tooltip", True))
-        outer.pack_start(chk_hover_tip, False, False, 0)
+        tab_style.pack_start(chk_shadow, False, False, 0)
 
         chk_no_border = Gtk.CheckButton(label="取消 MATE Panel 圖示框線")
         chk_no_border.set_active(self.config.get("hide_panel_border", False))
-        outer.pack_start(chk_no_border, False, False, 0)
+        tab_style.pack_start(chk_no_border, False, False, 0)
 
         def rgba_to_hex(rgba):
             r = max(0, min(255, int(round(rgba.red * 255))))

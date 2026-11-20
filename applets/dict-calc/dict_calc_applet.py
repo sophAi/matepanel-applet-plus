@@ -3615,12 +3615,22 @@ class DictCalcWidget(Gtk.EventBox):
         out_box.pack_start(combo_out, True, True, 0)
         tab1.pack_start(out_box, False, False, 0)
 
-        tab1.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+        tab1_scroll = Gtk.ScrolledWindow()
+        tab1_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        tab1_scroll.add(tab1)
+        notebook.append_page(tab1_scroll, Gtk.Label(label="⚙️ 一般與快捷鍵"))
 
-        # 3. Panel Mode & Appearance
+        # ---------------- Tab 1.5: Dedicated Panel Appearance Page ----------------
+        tab_appear = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        tab_appear.set_margin_top(14)
+        tab_appear.set_margin_bottom(14)
+        tab_appear.set_margin_start(16)
+        tab_appear.set_margin_end(16)
+
+        # Panel Mode & Appearance
         s3_lbl = Gtk.Label(xalign=0.0)
-        s3_lbl.set_markup("<b>3. 面板顯示樣式、字形顏色與底色適應</b>")
-        tab1.pack_start(s3_lbl, False, False, 0)
+        s3_lbl.set_markup("<b>面板顯示樣式、字形顏色與底色適應</b>")
+        tab_appear.pack_start(s3_lbl, False, False, 0)
 
         rb_badge = Gtk.RadioButton.new_with_label_from_widget(
             None, "模式 A：精簡圓角方塊圖示 ([DICT / CALC])"
@@ -3632,8 +3642,8 @@ class DictCalcWidget(Gtk.EventBox):
             rb_badge.set_active(True)
         else:
             rb_entry.set_active(True)
-        tab1.pack_start(rb_badge, False, False, 0)
-        tab1.pack_start(rb_entry, False, False, 0)
+        tab_appear.pack_start(rb_badge, False, False, 0)
+        tab_appear.pack_start(rb_entry, False, False, 0)
 
         size_grid = Gtk.Grid(column_spacing=12, row_spacing=6)
         size_grid.set_margin_start(14)
@@ -3665,7 +3675,7 @@ class DictCalcWidget(Gtk.EventBox):
         size_grid.attach(spin_entry_w, 1, 0, 1, 1)
         size_grid.attach(Gtk.Label(label="查詢結果視窗字型大小 (pt)：", xalign=0.0), 2, 0, 1, 1)
         size_grid.attach(spin_res_fs, 3, 0, 1, 1)
-        tab1.pack_start(size_grid, False, False, 0)
+        tab_appear.pack_start(size_grid, False, False, 0)
 
         # Font color & badge background
         col_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -3683,7 +3693,7 @@ class DictCalcWidget(Gtk.EventBox):
         col_box.pack_start(rb_col_dyn, False, False, 0)
         col_box.pack_start(rb_col_cus, False, False, 0)
         col_box.pack_start(col_btn, False, False, 0)
-        tab1.pack_start(col_box, False, False, 0)
+        tab_appear.pack_start(col_box, False, False, 0)
 
         bg_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         bg_box.pack_start(Gtk.Label(label="方塊背景底色：", xalign=0.0), False, False, 0)
@@ -3723,24 +3733,21 @@ class DictCalcWidget(Gtk.EventBox):
         bg_box.pack_start(btn_bg_dark, False, False, 0)
         bg_box.pack_start(btn_bg_light, False, False, 0)
         bg_box.pack_start(btn_bg_trans, False, False, 0)
-        tab1.pack_start(bg_box, False, False, 0)
+        tab_appear.pack_start(bg_box, False, False, 0)
 
         chk_shadow = Gtk.CheckButton(label="啟用面板文字高對比描邊陰影")
         chk_shadow.set_active(self.config.get("text_shadow", False))
-        tab1.pack_start(chk_shadow, False, False, 0)
+        tab_appear.pack_start(chk_shadow, False, False, 0)
 
         chk_hover_tip = Gtk.CheckButton(label="滑鼠懸停面板圖示時顯示詳細資訊 (Tooltip)")
         chk_hover_tip.set_active(self.config.get("show_hover_tooltip", True))
-        tab1.pack_start(chk_hover_tip, False, False, 0)
+        tab_appear.pack_start(chk_hover_tip, False, False, 0)
 
         chk_no_border = Gtk.CheckButton(label="取消 MATE Panel 圖示框線")
         chk_no_border.set_active(self.config.get("hide_panel_border", False))
-        tab1.pack_start(chk_no_border, False, False, 0)
+        tab_appear.pack_start(chk_no_border, False, False, 0)
 
-        tab1_scroll = Gtk.ScrolledWindow()
-        tab1_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        tab1_scroll.add(tab1)
-        notebook.append_page(tab1_scroll, Gtk.Label(label="⚙️ 一般、快捷鍵與外觀"))
+        notebook.append_page(tab_appear, Gtk.Label(label="🎨 面板外觀"))
 
         # ---------------- Tab 2: Dedicated Bubble Popup Settings Page ----------------
         tab_bubble = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
