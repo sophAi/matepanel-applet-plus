@@ -71,10 +71,14 @@ DEFAULT_CONFIG = {
     "custom_warn_font_color": "#fbbf24", # 自訂「高優先級 / 即將到期」字形顏色
     "custom_crit_font_color": "#f87171", # 自訂「已逾期 / 今日到期」字形顏色
     "badge_bg_style": "dark",            # "dark", "light", "transparent"
-    "custom_badge_style": True,          # 分別自訂 TASK / 番茄鐘方塊底色、框線色與底色透明度
-    "task_bg_color": "#162944",          # TASK 方塊底色
-    "task_border_color": "#38bdf8",      # TASK 方塊框線顏色
-    "task_bg_opacity": 92,               # TASK 方塊底色不透明度 (0..100%)
+    "custom_badge_style": True,          # 分別自訂 TASK (上下月曆分區) / 番茄鐘方塊底色、框線色與透明度
+    "task_header_text": "TASK",          # TASK 方塊上方標頭文字 (如 TASK / Task / 待辦)
+    "task_header_bg_color": "#dc2626",   # TASK 方塊界線以上底色 (預設月曆紅)
+    "task_header_fg_color": "#ffffff",   # TASK 方塊上方文字顏色
+    "task_header_bg_opacity": 96,        # TASK 方塊界線以上透明度 (0..100%)
+    "task_bg_color": "#e5e7eb",          # TASK 方塊界線以下底色 (預設月曆灰白)
+    "task_border_color": "#9ca3af",      # TASK 方塊框線顏色
+    "task_bg_opacity": 96,               # TASK 方塊界線以下透明度 (0..100%)
     "pomo_bg_color": "#3f1d28",          # 番茄鐘方塊底色
     "pomo_border_color": "#f43f5e",      # 番茄鐘方塊框線顏色
     "pomo_bg_opacity": 92,               # 番茄鐘方塊底色不透明度 (0..100%)
@@ -1680,70 +1684,111 @@ class TaskwarriorWidget(Gtk.EventBox):
         eff_bg_rgb = bg_rgb
         eff_bg_alpha = 0.92
         eff_border_rgb = border_rgb
+        split_y = y + max(7.5, bh * 0.32)
 
-        draw_rounded_rect(ctx, x + 0.5, y + 0.5, bw - 1.0, bh - 1.0, 4.5)
         if use_custom:
-            eff_bg_rgb = hex_to_rgb(self.config.get("task_bg_color", "#162944"), default=bg_rgb)
-            eff_border_rgb = hex_to_rgb(self.config.get("task_border_color", "#38bdf8"), default=border_rgb)
-            eff_bg_alpha = max(0.0, min(1.0, float(self.config.get("task_bg_opacity", 92)) / 100.0))
+            hdr_bg_rgb = hex_to_rgb(self.config.get("task_header_bg_color", "#dc2626"), default=(0.86, 0.15, 0.15))
+            hdr_bg_alpha = max(0.0, min(1.0, float(self.config.get("task_header_bg_opacity", 96)) / 100.0))
+            eff_bg_rgb = hex_to_rgb(self.config.get("task_bg_color", "#e5e7eb"), default=bg_rgb)
+            eff_border_rgb = hex_to_rgb(self.config.get("task_border_color", "#9ca3af"), default=border_rgb)
+            eff_bg_alpha = max(0.0, min(1.0, float(self.config.get("task_bg_opacity", 96)) / 100.0))
+
+            ctx.save()
+            draw_rounded_rect(ctx, x + 0.5, y + 0.5, bw - 1.0, bh - 1.0, 4.5)
+            ctx.clip()
+            # Upper calendar header strip (above split_y)
+            if hdr_bg_alpha > 0.0:
+                ctx.rectangle(x, y, bw, split_y - y)
+                ctx.set_source_rgba(hdr_bg_rgb[0], hdr_bg_rgb[1], hdr_bg_rgb[2], hdr_bg_alpha)
+                ctx.fill()
+            # Lower calendar page body (below split_y)
             if eff_bg_alpha > 0.0:
+                ctx.rectangle(x, split_y, bw, (y + bh) - split_y)
                 ctx.set_source_rgba(eff_bg_rgb[0], eff_bg_rgb[1], eff_bg_rgb[2], eff_bg_alpha)
-                ctx.fill_preserve()
-        elif bg_style == "dark":
-            ctx.set_source_rgba(bg_rgb[0], bg_rgb[1], bg_rgb[2], 0.92)
-            ctx.fill_preserve()
-        elif bg_style == "light":
-            l_r = min(1.0, 0.88 + bg_rgb[0] * 0.22)
-            l_g = min(1.0, 0.88 + bg_rgb[1] * 0.22)
-            l_b = min(1.0, 0.88 + bg_rgb[2] * 0.22)
-            eff_bg_rgb = (l_r, l_g, l_b)
-            ctx.set_source_rgba(l_r, l_g, l_b, 0.92)
-            ctx.fill_preserve()
+                ctx.fill()
+            # Crisp horizontal divider line right below the header text
+            if hdr_bg_alpha > 0.0 or eff_bg_alpha > 0.0:
+                ctx.move_to(x + 0.5, split_y)
+                ctx.line_to(x + bw - 0.5, split_y)
+                ctx.set_source_rgba(0.0, 0.0, 0.0, 0.28)
+                ctx.set_line_width(0.85)
+                ctx.stroke()
+            ctx.restore()
         else:
-            eff_bg_alpha = 0.0
+            draw_rounded_rect(ctx, x + 0.5, y + 0.5, bw - 1.0, bh - 1.0, 4.5)
+            if bg_style == "dark":
+                ctx.set_source_rgba(bg_rgb[0], bg_rgb[1], bg_rgb[2], 0.92)
+                ctx.fill()
+            elif bg_style == "light":
+                l_r = min(1.0, 0.88 + bg_rgb[0] * 0.22)
+                l_g = min(1.0, 0.88 + bg_rgb[1] * 0.22)
+                l_b = min(1.0, 0.88 + bg_rgb[2] * 0.22)
+                eff_bg_rgb = (l_r, l_g, l_b)
+                ctx.set_source_rgba(l_r, l_g, l_b, 0.92)
+                ctx.fill()
+            else:
+                eff_bg_alpha = 0.0
+                ctx.new_path()
+            ctx.move_to(x + 1.0, split_y)
+            ctx.line_to(x + bw - 1.0, split_y)
+            ctx.set_source_rgba(eff_border_rgb[0], eff_border_rgb[1], eff_border_rgb[2], 0.45)
+            ctx.set_line_width(0.8)
+            ctx.stroke()
 
         if not self.config.get("hide_panel_border", False):
+            draw_rounded_rect(ctx, x + 0.5, y + 0.5, bw - 1.0, bh - 1.0, 4.5)
             ctx.set_source_rgba(eff_border_rgb[0], eff_border_rgb[1], eff_border_rgb[2], 0.95)
             ctx.set_line_width(1.25)
             ctx.stroke()
-        else:
-            ctx.new_path()
 
         if self.has_active_task:
-            ctx.arc(x + bw - 4.5, y + 4.5, 2.3, 0, 2 * math.pi)
+            ctx.arc(x + bw - 4.0, y + 4.0, 2.2, 0, 2 * math.pi)
             ctx.set_source_rgba(0.20, 0.95, 0.50, 1.0)
             ctx.fill()
 
-        if self.config.get("font_color_mode", "dynamic") == "custom":
-            stage_rgb = self._resolve_panel_text_rgb(sev_lvl, text_rgb)
-            title_rgb = stage_rgb
-            val_rgb = stage_rgb
+        if use_custom:
+            title_rgb = hex_to_rgb(self.config.get("task_header_fg_color", "#ffffff"), default=(1.0, 1.0, 1.0))
+        elif self.config.get("font_color_mode", "dynamic") == "custom":
+            title_rgb = self._resolve_panel_text_rgb(sev_lvl, text_rgb)
         else:
             title_rgb = eff_border_rgb
-            is_light_fill = eff_bg_alpha >= 0.30 and rgb_luminance(eff_bg_rgb) > 0.55
-            val_rgb = (0.07, 0.09, 0.15) if is_light_fill else text_rgb
 
-        # Scheme A: compact top 'TASK' header + enlarged task count number (bh * 0.56) with width clamp
+        if self.config.get("font_color_mode", "dynamic") == "custom":
+            val_rgb = self._resolve_panel_text_rgb(sev_lvl, text_rgb)
+        else:
+            is_light_fill = eff_bg_alpha >= 0.30 and rgb_luminance(eff_bg_rgb) > 0.55
+            val_rgb = (0.08, 0.10, 0.14) if is_light_fill else text_rgb
+
+        # Upper header text centered cleanly above split_y
         ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-        header_size = max(5.5, bh * 0.21)
+        hdr_h = max(6.0, split_y - y)
+        header_size = max(5.5, hdr_h * 0.70)
         ctx.set_font_size(header_size)
-        title = "TASK"
+        raw_title = str(self.config.get("task_header_text", "TASK") or "").strip()
+        title = raw_title[:8] if raw_title else "TASK"
         ext = ctx.text_extents(title)
+        max_hdr_w = max(8.0, bw - 4.0)
+        if ext.width > max_hdr_w and ext.width > 0:
+            header_size *= max_hdr_w / ext.width
+            ctx.set_font_size(header_size)
+            ext = ctx.text_extents(title)
         tx = x + (bw - ext.width) / 2.0 - ext.x_bearing
-        ty = y + header_size + 1.0
+        ty = y + (hdr_h - ext.height) / 2.0 - ext.y_bearing
         self._draw_styled_text(ctx, tx, ty, title, title_rgb)
 
+        # Lower enlarged task count centered cleanly below split_y
+        bot_h = max(10.0, (y + bh) - split_y)
         count_str = str(len(self.filtered_pending))
-        val_size = max(10.0, bh * 0.56)
+        val_size = max(10.0, bot_h * 0.78)
         ctx.set_font_size(val_size)
         v_ext = ctx.text_extents(count_str)
-        max_w = max(8.0, bw - 6.0)
+        max_w = max(8.0, bw - 5.0)
         if v_ext.width > max_w and v_ext.width > 0:
             val_size *= max_w / v_ext.width
             ctx.set_font_size(val_size)
             v_ext = ctx.text_extents(count_str)
         vx = x + (bw - v_ext.width) / 2.0 - v_ext.x_bearing
-        vy = y + bh - 2.2
+        vy = split_y + (bot_h - v_ext.height) / 2.0 - v_ext.y_bearing
         self._draw_styled_text(ctx, vx, vy, count_str, val_rgb)
 
     def _draw_pomo_badge(self, ctx, x, y, bw, bh):
@@ -2944,11 +2989,15 @@ class TaskwarriorWidget(Gtk.EventBox):
         c_grid.attach(preset_box, 2, 1, 2, 1)
         tab_style.pack_start(c_grid, False, False, 0)
 
+        hdr_custom_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         chk_custom_badge = Gtk.CheckButton(
-            label="分別自訂 TASK 與番茄鐘方塊的底色、框線色與底色透明度（取消勾選則隨任務狀態變色）"
+            label="自訂 TASK 月曆上下分區與番茄鐘方塊樣式"
         )
         chk_custom_badge.set_active(self.config.get("custom_badge_style", True))
-        tab_style.pack_start(chk_custom_badge, False, False, 0)
+        btn_cal_preset = Gtk.Button(label="📅 套用紅頂灰白月曆預設")
+        hdr_custom_row.pack_start(chk_custom_badge, True, True, 0)
+        hdr_custom_row.pack_end(btn_cal_preset, False, False, 0)
+        tab_style.pack_start(hdr_custom_row, False, False, 0)
 
         tp_grid = Gtk.Grid(column_spacing=8, row_spacing=6)
         tp_grid.set_margin_start(14)
@@ -2961,13 +3010,29 @@ class TaskwarriorWidget(Gtk.EventBox):
             btn.set_rgba(r)
             return btn
 
-        task_bg_btn = make_color_btn("task_bg_color", "#162944")
-        task_bd_btn = make_color_btn("task_border_color", "#38bdf8")
+        entry_task_hdr = Gtk.Entry()
+        entry_task_hdr.set_width_chars(8)
+        entry_task_hdr.set_max_length(8)
+        entry_task_hdr.set_text(str(self.config.get("task_header_text", "TASK") or "TASK"))
+        task_hdr_fg_btn = make_color_btn("task_header_fg_color", "#ffffff")
+        task_bd_btn = make_color_btn("task_border_color", "#9ca3af")
+
+        task_hdr_bg_btn = make_color_btn("task_header_bg_color", "#dc2626")
+        task_hdr_op_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 100.0, 2.0)
+        task_hdr_op_scale.set_digits(0)
+        task_hdr_op_scale.set_draw_value(False)
+        task_hdr_op_scale.set_size_request(110, -1)
+        th_op_init = max(0, min(100, int(self.config.get("task_header_bg_opacity", 96))))
+        task_hdr_op_scale.set_value(float(th_op_init))
+        lbl_task_hdr_op = Gtk.Label(label=f"{th_op_init}%")
+        lbl_task_hdr_op.set_width_chars(4)
+
+        task_bg_btn = make_color_btn("task_bg_color", "#e5e7eb")
         task_op_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 100.0, 2.0)
         task_op_scale.set_digits(0)
         task_op_scale.set_draw_value(False)
         task_op_scale.set_size_request(110, -1)
-        t_op_init = max(0, min(100, int(self.config.get("task_bg_opacity", 92))))
+        t_op_init = max(0, min(100, int(self.config.get("task_bg_opacity", 96))))
         task_op_scale.set_value(float(t_op_init))
         lbl_task_op = Gtk.Label(label=f"{t_op_init}%")
         lbl_task_op.set_width_chars(4)
@@ -2983,21 +3048,32 @@ class TaskwarriorWidget(Gtk.EventBox):
         lbl_pomo_op = Gtk.Label(label=f"{p_op_init}%")
         lbl_pomo_op.set_width_chars(4)
 
-        tp_grid.attach(Gtk.Label(label="TASK 底色：", xalign=0.0), 0, 0, 1, 1)
-        tp_grid.attach(task_bg_btn, 1, 0, 1, 1)
-        tp_grid.attach(Gtk.Label(label="框線：", xalign=0.0), 2, 0, 1, 1)
-        tp_grid.attach(task_bd_btn, 3, 0, 1, 1)
-        tp_grid.attach(Gtk.Label(label="透明度：", xalign=0.0), 4, 0, 1, 1)
-        tp_grid.attach(task_op_scale, 5, 0, 1, 1)
-        tp_grid.attach(lbl_task_op, 6, 0, 1, 1)
+        tp_grid.attach(Gtk.Label(label="上方文字：", xalign=0.0), 0, 0, 1, 1)
+        tp_grid.attach(entry_task_hdr, 1, 0, 2, 1)
+        tp_grid.attach(Gtk.Label(label="上方字色：", xalign=0.0), 3, 0, 1, 1)
+        tp_grid.attach(task_hdr_fg_btn, 4, 0, 1, 1)
+        tp_grid.attach(Gtk.Label(label="外框：", xalign=0.0), 5, 0, 1, 1)
+        tp_grid.attach(task_bd_btn, 6, 0, 1, 1)
 
-        tp_grid.attach(Gtk.Label(label="番茄鐘底色：", xalign=0.0), 0, 1, 1, 1)
-        tp_grid.attach(pomo_bg_btn, 1, 1, 1, 1)
-        tp_grid.attach(Gtk.Label(label="框線：", xalign=0.0), 2, 1, 1, 1)
-        tp_grid.attach(pomo_bd_btn, 3, 1, 1, 1)
-        tp_grid.attach(Gtk.Label(label="透明度：", xalign=0.0), 4, 1, 1, 1)
-        tp_grid.attach(pomo_op_scale, 5, 1, 1, 1)
-        tp_grid.attach(lbl_pomo_op, 6, 1, 1, 1)
+        tp_grid.attach(Gtk.Label(label="上方底色：", xalign=0.0), 0, 1, 1, 1)
+        tp_grid.attach(task_hdr_bg_btn, 1, 1, 1, 1)
+        tp_grid.attach(Gtk.Label(label="上方透明度：", xalign=0.0), 2, 1, 2, 1)
+        tp_grid.attach(task_hdr_op_scale, 4, 1, 2, 1)
+        tp_grid.attach(lbl_task_hdr_op, 6, 1, 1, 1)
+
+        tp_grid.attach(Gtk.Label(label="下方底色：", xalign=0.0), 0, 2, 1, 1)
+        tp_grid.attach(task_bg_btn, 1, 2, 1, 1)
+        tp_grid.attach(Gtk.Label(label="下方透明度：", xalign=0.0), 2, 2, 2, 1)
+        tp_grid.attach(task_op_scale, 4, 2, 2, 1)
+        tp_grid.attach(lbl_task_op, 6, 2, 1, 1)
+
+        tp_grid.attach(Gtk.Label(label="番茄鐘底色：", xalign=0.0), 0, 3, 1, 1)
+        tp_grid.attach(pomo_bg_btn, 1, 3, 1, 1)
+        tp_grid.attach(Gtk.Label(label="框線：", xalign=0.0), 2, 3, 1, 1)
+        tp_grid.attach(pomo_bd_btn, 3, 3, 1, 1)
+        tp_grid.attach(Gtk.Label(label="透明度：", xalign=0.0), 4, 3, 1, 1)
+        tp_grid.attach(pomo_op_scale, 5, 3, 1, 1)
+        tp_grid.attach(lbl_pomo_op, 6, 3, 1, 1)
         tab_style.pack_start(tp_grid, False, False, 0)
 
         bg_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -3050,6 +3126,12 @@ class TaskwarriorWidget(Gtk.EventBox):
             self.config["custom_warn_font_color"] = rgba_to_hex(color_warn_btn.get_rgba())
             self.config["custom_crit_font_color"] = rgba_to_hex(color_crit_btn.get_rgba())
             self.config["custom_badge_style"] = chk_custom_badge.get_active()
+            self.config["task_header_text"] = entry_task_hdr.get_text().strip() or "TASK"
+            self.config["task_header_bg_color"] = rgba_to_hex(task_hdr_bg_btn.get_rgba())
+            self.config["task_header_fg_color"] = rgba_to_hex(task_hdr_fg_btn.get_rgba())
+            th_op = max(0, min(100, int(round(task_hdr_op_scale.get_value()))))
+            self.config["task_header_bg_opacity"] = th_op
+            lbl_task_hdr_op.set_text(f"{th_op}%")
             self.config["task_bg_color"] = rgba_to_hex(task_bg_btn.get_rgba())
             self.config["task_border_color"] = rgba_to_hex(task_bd_btn.get_rgba())
             t_op = max(0, min(100, int(round(task_op_scale.get_value()))))
@@ -3088,11 +3170,29 @@ class TaskwarriorWidget(Gtk.EventBox):
             rb_font_cus.set_active(True)
             apply_changes()
 
+        def apply_calendar_preset(*_):
+            for btn, hx in (
+                (task_hdr_bg_btn, "#dc2626"),
+                (task_hdr_fg_btn, "#ffffff"),
+                (task_bg_btn, "#e5e7eb"),
+                (task_bd_btn, "#9ca3af"),
+            ):
+                c = Gdk.RGBA()
+                c.parse(hx)
+                btn.set_rgba(c)
+            task_hdr_op_scale.set_value(96.0)
+            task_op_scale.set_value(96.0)
+            chk_custom_badge.set_active(True)
+            rb_font_dyn.set_active(True)
+            apply_changes()
+
+        btn_cal_preset.connect("clicked", apply_calendar_preset)
+        entry_task_hdr.connect("changed", apply_changes)
         for c_btn in (color_norm_btn, color_warn_btn, color_crit_btn):
             c_btn.connect("color-set", on_color_picked)
-        for tp_btn in (task_bg_btn, task_bd_btn, pomo_bg_btn, pomo_bd_btn):
+        for tp_btn in (task_hdr_bg_btn, task_hdr_fg_btn, task_bg_btn, task_bd_btn, pomo_bg_btn, pomo_bd_btn):
             tp_btn.connect("color-set", lambda *_: (chk_custom_badge.set_active(True), apply_changes()))
-        for tp_sc in (task_op_scale, pomo_op_scale):
+        for tp_sc in (task_hdr_op_scale, task_op_scale, pomo_op_scale):
             tp_sc.connect("value-changed", apply_changes)
         tp_grid.set_sensitive(chk_custom_badge.get_active())
         btn_dark_theme.connect(
