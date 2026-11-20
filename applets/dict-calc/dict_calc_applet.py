@@ -2479,6 +2479,8 @@ class DictCalcWidget(Gtk.EventBox):
             return True
         if not self._is_scan_modifier_pressed(state):
             return True
+        # Reset timestamp immediately so we don't send repeated X11 PRIMARY requests during the 1.5s window
+        self._last_mouse_select_ts = 0
         self.clipboard_primary.request_text(self._on_primary_text_received, False)
         return True
 
@@ -2969,41 +2971,48 @@ class DictCalcWidget(Gtk.EventBox):
                     return False
                 GLib.idle_add(_save_new_model)
 
-            for v_name in virtual_tr_names:
-                v_eng = VIRTUAL_DICT_ENGINE_MAP[v_name]
+            def _kickoff_virtual():
+                if seq != self._query_seq:
+                    return False
+                for v_name in virtual_tr_names:
+                    v_eng = VIRTUAL_DICT_ENGINE_MAP[v_name]
 
-                def v_worker(bookname=v_name, eng=v_eng):
-                    tr_txt, src_l, tgt_l, _eng_lbl, err_m = self.translator.translate_sync(
-                        q,
-                        primary_tl=primary_tl,
-                        reverse_tl=reverse_tl,
-                        config=cfg_snapshot,
-                        on_model_migrated=on_gemini_migrated,
-                        engine_override=eng,
-                        concise_word=(not is_sentence),
-                    )
-                    items_out = []
-                    if err_m is None and tr_txt:
-                        src_lbl = GoogleTranslator.lang_label(src_l)
-                        tgt_lbl = GoogleTranslator.lang_label(tgt_l)
-                        items_out.append(
-                            {
-                                "dict": bookname,
-                                "word": f"{q[:36] + '…' if len(q) > 36 else q} ({src_lbl} → {tgt_lbl})",
-                                "definition": tr_txt,
-                            }
+                    def v_worker(bookname=v_name, eng=v_eng):
+                        tr_txt, src_l, tgt_l, _eng_lbl, err_m = self.translator.translate_sync(
+                            q,
+                            primary_tl=primary_tl,
+                            reverse_tl=reverse_tl,
+                            config=cfg_snapshot,
+                            on_model_migrated=on_gemini_migrated,
+                            engine_override=eng,
+                            concise_word=(not is_sentence),
                         )
-                    elif err_m:
-                        items_out.append(
-                            {
-                                "dict": bookname,
-                                "word": q[:36] + "…" if len(q) > 36 else q,
-                                "definition": f"⚠️ {err_m}",
-                            }
-                        )
-                    GLib.idle_add(merge_and_render, items_out)
+                        items_out = []
+                        if err_m is None and tr_txt:
+                            src_lbl = GoogleTranslator.lang_label(src_l)
+                            tgt_lbl = GoogleTranslator.lang_label(tgt_l)
+                            items_out.append(
+                                {
+                                    "dict": bookname,
+                                    "word": f"{q[:36] + '…' if len(q) > 36 else q} ({src_lbl} → {tgt_lbl})",
+                                    "definition": tr_txt,
+                                }
+                            )
+                        elif err_m:
+                            items_out.append(
+                                {
+                                    "dict": bookname,
+                                    "word": q[:36] + "…" if len(q) > 36 else q,
+                                    "definition": f"⚠️ {err_m}",
+                                }
+                            )
+                        GLib.idle_add(merge_and_render, items_out)
 
-                threading.Thread(target=v_worker, daemon=True).start()
+                    threading.Thread(target=v_worker, daemon=True).start()
+                return False
+
+            # 250ms debounce avoids wasted API calls on rapid consecutive scans/queries
+            GLib.timeout_add(250, _kickoff_virtual)
 
         # For a single English word, run fast (~15-30ms) offline sdcv + aspell check BEFORE
         # launching online translation engines (Gemini/OpenAI/Google/DeepL) so misspelled words
@@ -3103,7 +3112,14 @@ class DictCalcWidget(Gtk.EventBox):
                 is_fallback,
             )
 
-        threading.Thread(target=tr_worker, daemon=True).start()
+        def _kickoff_translate():
+            if seq != self._query_seq:
+                return False
+            threading.Thread(target=tr_worker, daemon=True).start()
+            return False
+
+        # 250ms debounce prevents wasted online translation API calls on rapid consecutive triggers
+        GLib.timeout_add(250, _kickoff_translate)
 
     def _on_translate_done(
         self,
@@ -4673,6 +4689,8 @@ class DictCalcWidget(Gtk.EventBox):
             return f"#{r:02x}{g:02x}{b:02x}"
 
         def apply_tab1(*_):
+            old_hk_open = self.config.get("hotkey_open_window", "")
+            old_hk_scan = self.config.get("hotkey_scan_selection", "")
             self.config["hotkey_open_window"] = entry_hk_open.get_text().strip()
             self.config["hotkey_scan_selection"] = entry_hk_scan.get_text().strip()
             self.config["scan_selection_enabled"] = chk_scan_en.get_active()
@@ -4722,7 +4740,11 @@ class DictCalcWidget(Gtk.EventBox):
             self.config["vocab_epub_layout"] = combo_epub_layout.get_active_id() or "per_word"
             self._save_config()
             self._sync_scan_poll_timer()
-            self.rebind_global_hotkeys()
+            if (
+                self.config["hotkey_open_window"] != old_hk_open
+                or self.config["hotkey_scan_selection"] != old_hk_scan
+            ):
+                self.rebind_global_hotkeys()
             self._apply_panel_layout()
             self._update_tooltip()
             if self.popup_win is not None:
@@ -4892,8 +4914,22 @@ class DictCalcWidget(Gtk.EventBox):
         btn_fetch_gem.connect("clicked", on_fetch_gemini_models)
         btn_fetch_oai.connect("clicked", on_fetch_oai_models)
         btn_tr_test.connect("clicked", on_test_translate_clicked)
+        prefs_debounce_id = [None]
+
+        def schedule_apply_tab1(*_):
+            if prefs_debounce_id[0] is not None:
+                try:
+                    GLib.source_remove(prefs_debounce_id[0])
+                except Exception:
+                    pass
+            def _run_debounced():
+                prefs_debounce_id[0] = None
+                apply_tab1()
+                return False
+            prefs_debounce_id[0] = GLib.timeout_add(300, _run_debounced)
+
         for ent_tr in (entry_gem_key, entry_gem_model, entry_oai_url, entry_oai_key, entry_oai_model, entry_dl_key):
-            ent_tr.connect("changed", apply_tab1)
+            ent_tr.connect("changed", schedule_apply_tab1)
         for w_c in (
             chk_scan_en,
             chk_auto_copy,
