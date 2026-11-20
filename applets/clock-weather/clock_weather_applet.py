@@ -37,7 +37,7 @@ import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import Gdk, Gio, GLib, GObject, Gtk
+from gi.repository import Gdk, GLib, GObject, Gtk
 import cairo
 
 try:
@@ -74,16 +74,14 @@ DEFAULT_CONFIG = {
     "custom_font_color": "#ffffff",      # 自訂面板字形顏色
     "font_opacity": 100,                 # 面板文字不透明度 (10..100%)
     "text_shadow": False,                # 面板文字高對比描邊陰影
-    "detail_display_mode": "embedded",   # "embedded" | "custom_bubble" | "system_dbus"
-    "bubble_auto_on_open": False,        # 氣泡模式開啟月曆時自動彈出今日詳情
-    "bubble_close_with_cal": True,       # 關閉月曆時同步關閉詳情氣泡
+    "detail_display_mode": "embedded",   # "embedded" (完整視窗) | "custom_bubble" (精簡月曆 RGBA 氣泡框)
     "bubble_position": "top_right",      # top_left / top_center / top_right / center / bottom_left / bottom_right
     "bubble_offset_x": 0,                # 氣泡水平偏移 (px)
     "bubble_offset_y": 36,               # 氣泡垂直偏移 (px)
     "bubble_bg_color": "#182234",        # 自訂氣泡背景顏色
     "bubble_fg_color": "#f0f6ff",        # 自訂氣泡文字顏色
     "bubble_bg_opacity": 92,             # 自訂氣泡背景不透明度 (0..100%)
-    "bubble_timeout_sec": 12,            # 氣泡自動關閉秒數 (0 = 常駐至點擊或關閉月曆)
+    "bubble_timeout_sec": 12,            # 氣泡自動關閉秒數 (0 = 常駐直到點擊關閉)
 }
 
 WORLD_CLOCK_PRESETS = [
@@ -438,86 +436,19 @@ class OpenMeteoClient:
 
 
 # =============================================================================
-# 1.5 D-Bus Notification & Custom RGBA Weather Bubble (dict-calc style)
+# 1.5 Custom RGBA Compact Weather Calendar Bubble (No Detailed Forecast Pane)
 # =============================================================================
 
-class DBusNotifier:
+class CustomCalendarBubbleWindow(Gtk.Window):
     """
-    Zero-subprocess system D-Bus notification sender (`org.freedesktop.Notifications`).
-    Reuses the last notification ID so consecutive date clicks replace in-place without flooding.
-    """
-
-    def __init__(self):
-        self._proxy = None
-        self._last_id = 0
-
-    def _get_proxy(self):
-        if self._proxy is None:
-            try:
-                self._proxy = Gio.DBusProxy.new_for_bus_sync(
-                    Gio.BusType.SESSION,
-                    Gio.DBusProxyFlags.NONE,
-                    None,
-                    "org.freedesktop.Notifications",
-                    "/org/freedesktop/Notifications",
-                    "org.freedesktop.Notifications",
-                    None,
-                )
-            except Exception:
-                self._proxy = None
-        return self._proxy
-
-    def close(self):
-        if not self._last_id:
-            return
-        proxy = self._get_proxy()
-        if proxy is not None:
-            try:
-                proxy.call_sync(
-                    "CloseNotification",
-                    GLib.Variant("(u)", (int(self._last_id),)),
-                    Gio.DBusCallFlags.NONE,
-                    1000,
-                    None,
-                )
-            except Exception:
-                pass
-        self._last_id = 0
-
-    def show(self, summary, body, icon="weather-few-clouds", timeout_sec=12):
-        proxy = self._get_proxy()
-        if proxy is None:
-            return False
-        timeout_ms = 0 if (timeout_sec is None or int(timeout_sec) <= 0) else max(1000, int(timeout_sec) * 1000)
-        try:
-            args = GLib.Variant(
-                "(susssasa{sv}i)",
-                (
-                    "月曆與天氣預報 Plus",
-                    int(self._last_id),
-                    str(icon or "weather-few-clouds"),
-                    str(summary),
-                    str(body),
-                    [],
-                    {},
-                    timeout_ms,
-                ),
-            )
-            res = proxy.call_sync("Notify", args, Gio.DBusCallFlags.NONE, 2000, None)
-            self._last_id = int(res.unpack()[0]) if res is not None else 0
-            return True
-        except Exception:
-            return False
-
-
-class CustomWeatherBubbleWindow(Gtk.Window):
-    """
-    Borderless, focus-free, RGBA-composited weather detail bubble rendered with Cairo.
-    Supports desktop-theme weather icon, full Pango markup, custom bg/fg/opacity,
-    click-to-dismiss, and hover-to-pause auto-dismiss.
+    Borderless, RGBA-composited compact calendar bubble rendered with Cairo.
+    Displays ONLY the compact 7x6 month calendar plus desktop-theme weather icons,
+    high/low temperatures, and rain probability for today + next 6 days (no detailed forecast).
     """
 
-    def __init__(self, summary, body_markup, icon_pixbuf, bg_hex, fg_hex, bg_opacity, font_size, on_close_cb=None):
+    WEEKDAYS_ZH = ["一", "二", "三", "四", "五", "六", "日"]
+
+    def __init__(self, parent_widget, bg_hex, fg_hex, bg_opacity, font_size, on_close_cb=None):
         super().__init__(type=Gtk.WindowType.POPUP)
         self.set_decorated(False)
         self.set_accept_focus(False)
@@ -528,13 +459,22 @@ class CustomWeatherBubbleWindow(Gtk.Window):
         self.set_type_hint(Gdk.WindowTypeHint.NOTIFICATION)
         self.set_resizable(False)
 
+        self.parent_widget = parent_widget
         self._on_close_cb = on_close_cb
         self._bg_rgb = hex_to_rgb(bg_hex, default=(0.094, 0.133, 0.204))
         self._bg_alpha = max(0.0, min(1.0, float(bg_opacity) / 100.0))
         self._fg_hex = fg_hex or "#f0f6ff"
+        self._fg_rgb = hex_to_rgb(self._fg_hex, default=(0.94, 0.96, 1.0))
+        self._font_size = max(8, min(18, int(font_size)))
         self._timeout_id = None
         self._timeout_sec = 12
         self._hovered = False
+
+        today = date.today()
+        self.view_year = today.year
+        self.view_month = today.month
+        self.cell_dates = []
+        self._compute_month_cells()
 
         screen = self.get_screen()
         if screen is not None:
@@ -547,43 +487,90 @@ class CustomWeatherBubbleWindow(Gtk.Window):
             | Gdk.EventMask.ENTER_NOTIFY_MASK
             | Gdk.EventMask.LEAVE_NOTIFY_MASK
         )
-        self.connect("draw", self._on_draw)
-        self.connect("button-press-event", self._on_click)
+        self.connect("draw", self._on_draw_bg)
         self.connect("enter-notify-event", self._on_enter)
         self.connect("leave-notify-event", self._on_leave)
+        self.connect("button-press-event", self._on_window_click)
 
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        box.set_margin_top(11)
-        box.set_margin_bottom(11)
-        box.set_margin_start(14)
-        box.set_margin_end(14)
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        root.set_margin_top(10)
+        root.set_margin_bottom(10)
+        root.set_margin_start(12)
+        root.set_margin_end(12)
 
-        fs = max(8, min(20, int(font_size)))
-        title_pango_sz = int((fs + 1.5) * 1024)
-        body_pango_sz = int(fs * 1024)
+        # Compact Header Row (◀ 今天 ▶  YYYY年MM月 📍城市  ✕)
+        nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        btn_prev = Gtk.Button(label="◀")
+        btn_today = Gtk.Button(label="今")
+        btn_next = Gtk.Button(label="▶")
+        btn_close = Gtk.Button(label="✕")
+        for b in (btn_prev, btn_today, btn_next, btn_close):
+            b.set_relief(Gtk.ReliefStyle.NONE)
+            b.set_can_focus(False)
+        btn_prev.connect("clicked", lambda *_: self._shift_month(-1))
+        btn_today.connect("clicked", lambda *_: self._jump_today())
+        btn_next.connect("clicked", lambda *_: self._shift_month(1))
+        btn_close.connect("clicked", lambda *_: self.dismiss())
 
-        hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        if icon_pixbuf is not None:
-            hdr.pack_start(Gtk.Image.new_from_pixbuf(icon_pixbuf), False, False, 0)
-        lbl_title = Gtk.Label(xalign=0.0)
-        lbl_title.set_line_wrap(True)
-        lbl_title.set_max_width_chars(44)
-        lbl_title.set_markup(
-            f"<span foreground='{html.escape(self._fg_hex)}' size='{title_pango_sz}'><b>{html.escape(str(summary))}</b></span>"
-        )
-        hdr.pack_start(lbl_title, True, True, 0)
-        box.pack_start(hdr, False, False, 0)
+        self.hdr_lbl = Gtk.Label(xalign=0.0)
+        self.hdr_lbl.set_margin_start(4)
+        self._update_header()
 
-        lbl_body = Gtk.Label(xalign=0.0)
-        lbl_body.set_line_wrap(True)
-        lbl_body.set_max_width_chars(48)
-        lbl_body.set_markup(
-            f"<span foreground='{html.escape(self._fg_hex)}' size='{body_pango_sz}'>{body_markup}</span>"
-        )
-        box.pack_start(lbl_body, False, False, 0)
+        nav.pack_start(btn_prev, False, False, 0)
+        nav.pack_start(btn_today, False, False, 0)
+        nav.pack_start(btn_next, False, False, 0)
+        nav.pack_start(self.hdr_lbl, True, True, 0)
+        nav.pack_end(btn_close, False, False, 0)
+        root.pack_start(nav, False, False, 0)
 
-        self.add(box)
+        # Compact 7x6 Weather Calendar Canvas
+        self.cal_canvas = Gtk.DrawingArea()
+        self.cal_canvas.set_size_request(448, 326)
+        self.cal_canvas.connect("draw", self._on_draw_calendar)
+        root.pack_start(self.cal_canvas, True, True, 0)
+
+        self.add(root)
         self.show_all()
+
+    def _compute_month_cells(self):
+        cal = calendar.Calendar(firstweekday=0)
+        days = list(cal.itermonthdates(self.view_year, self.view_month))
+        while len(days) < 42:
+            days.append(days[-1] + timedelta(days=1))
+        self.cell_dates = days[:42]
+
+    def _update_header(self):
+        wdata = self.parent_widget.weather_data or {}
+        city = wdata.get("city") or self.parent_widget.config.get("city_name", "台北")
+        pt = int((self._font_size + 1.5) * 1024)
+        sub_pt = int(max(8.0, self._font_size - 1.0) * 1024)
+        self.hdr_lbl.set_markup(
+            f"<span foreground='{html.escape(self._fg_hex)}' size='{pt}'><b>{self.view_year} 年 {self.view_month:02d} 月</b></span>  "
+            f"<span foreground='{html.escape(self._fg_hex)}' alpha='75%' size='{sub_pt}'>📍 {html.escape(city)}</span>"
+        )
+
+    def _shift_month(self, delta):
+        m = self.view_month + delta
+        y = self.view_year
+        while m < 1:
+            m += 12
+            y -= 1
+        while m > 12:
+            m -= 12
+            y += 1
+        self.view_year = y
+        self.view_month = m
+        self._compute_month_cells()
+        self._update_header()
+        self.cal_canvas.queue_draw()
+
+    def _jump_today(self):
+        today = date.today()
+        self.view_year = today.year
+        self.view_month = today.month
+        self._compute_month_cells()
+        self._update_header()
+        self.cal_canvas.queue_draw()
 
     def start_timer(self, timeout_sec):
         self._cancel_timer()
@@ -618,9 +605,11 @@ class CustomWeatherBubbleWindow(Gtk.Window):
             self.start_timer(max(2, min(self._timeout_sec, 4)))
         return False
 
-    def _on_click(self, *_args):
-        self.dismiss()
-        return True
+    def _on_window_click(self, _widget, event):
+        if event.button == 3:
+            self.dismiss()
+            return True
+        return False
 
     def dismiss(self):
         self._cancel_timer()
@@ -630,7 +619,7 @@ class CustomWeatherBubbleWindow(Gtk.Window):
             cb(self)
         self.destroy()
 
-    def _on_draw(self, widget, ctx):
+    def _on_draw_bg(self, widget, ctx):
         alloc = widget.get_allocation()
         w, h = float(alloc.width), float(alloc.height)
         ctx.save()
@@ -640,20 +629,140 @@ class CustomWeatherBubbleWindow(Gtk.Window):
         ctx.set_operator(cairo.OPERATOR_OVER)
 
         r, g, b = self._bg_rgb
-        alpha = self._bg_alpha
-        if alpha > 0.0:
+        if self._bg_alpha > 0.0:
             draw_rounded_rect(ctx, 0.0, 0.0, max(2.0, w), max(2.0, h), 10.0)
-            ctx.set_source_rgba(r, g, b, alpha)
+            ctx.set_source_rgba(r, g, b, self._bg_alpha)
             ctx.fill()
         ctx.restore()
         return False
 
+    def _on_draw_calendar(self, widget, ctx):
+        alloc = widget.get_allocation()
+        w, h = float(alloc.width), float(alloc.height)
+        fg_r, fg_g, fg_b = self._fg_rgb
+        base_fs = float(max(8, min(16, self._font_size)))
+
+        header_h = max(20.0, base_fs * 1.9)
+        grid_x = 2.0
+        grid_y = header_h + 2.0
+        col_w = (w - 4.0) / 7.0
+        row_h = max(26.0, (h - grid_y - 2.0) / 6.0)
+
+        # Weekday header
+        ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        ctx.set_font_size(base_fs)
+        for ci, wd in enumerate(self.WEEKDAYS_ZH):
+            cx = grid_x + ci * col_w
+            ext = ctx.text_extents(wd)
+            if ci >= 5:
+                ctx.set_source_rgba(0.98, 0.56, 0.48, 0.95)
+            else:
+                ctx.set_source_rgba(fg_r, fg_g, fg_b, 0.80)
+            ctx.move_to(cx + (col_w - ext.width) / 2.0 - ext.x_bearing, header_h * 0.72)
+            ctx.show_text(wd)
+
+        today = date.today()
+        daily_map = (self.parent_widget.weather_data or {}).get("daily_by_date") or {}
+        icon_sz = max(14, min(22, int(min(col_w * 0.36, row_h * 0.44))))
+
+        for idx, d_obj in enumerate(self.cell_dates):
+            r_idx = idx // 7
+            c_idx = idx % 7
+            cx = grid_x + c_idx * col_w + 1.5
+            cy = grid_y + r_idx * row_h + 1.5
+            cw = col_w - 3.0
+            ch = row_h - 3.0
+
+            d_str = d_obj.strftime("%Y-%m-%d")
+            in_month = d_obj.month == self.view_month
+            is_today = d_obj == today
+            day_fc = daily_map.get(d_str)
+
+            draw_rounded_rect(ctx, cx, cy, cw, ch, 5.0)
+            if is_today:
+                ctx.set_source_rgba(0.14, 0.50, 0.40, 0.52)
+            elif day_fc is not None:
+                ctx.set_source_rgba(0.20, 0.34, 0.50, 0.28)
+            elif in_month:
+                ctx.set_source_rgba(fg_r, fg_g, fg_b, 0.06)
+            else:
+                ctx.set_source_rgba(fg_r, fg_g, fg_b, 0.02)
+            ctx.fill()
+
+            if is_today:
+                draw_rounded_rect(ctx, cx + 0.5, cy + 0.5, cw - 1.0, ch - 1.0, 5.0)
+                ctx.set_source_rgba(0.25, 0.85, 0.65, 0.90)
+                ctx.set_line_width(1.3)
+                ctx.stroke()
+
+            # Day number (top-left)
+            ctx.select_font_face(
+                "Sans",
+                cairo.FONT_SLANT_NORMAL,
+                cairo.FONT_WEIGHT_BOLD if (is_today or day_fc is not None) else cairo.FONT_WEIGHT_NORMAL,
+            )
+            ctx.set_font_size(base_fs)
+            if not in_month:
+                ctx.set_source_rgba(fg_r, fg_g, fg_b, 0.32)
+            elif is_today:
+                ctx.set_source_rgba(0.55, 1.00, 0.85, 1.00)
+            elif c_idx >= 5:
+                ctx.set_source_rgba(0.98, 0.62, 0.55, 0.96)
+            else:
+                ctx.set_source_rgba(fg_r, fg_g, fg_b, 0.95)
+            ctx.move_to(cx + 4.0, cy + base_fs + 2.0)
+            ctx.show_text(str(d_obj.day))
+
+            # 7-day weather icon + high/low temp + rain probability (vector raindrop)
+            if day_fc is not None:
+                _desc, icon_name = wmo_to_info(day_fc.get("code", 0), is_day=True)
+                pb = self.parent_widget.get_weather_pixbuf(icon_name, icon_sz)
+                if pb is not None:
+                    Gdk.cairo_set_source_pixbuf(ctx, pb, cx + cw - icon_sz - 3.0, cy + 2.0)
+                    ctx.paint()
+
+                tmax = day_fc.get("t_max")
+                tmin = day_fc.get("t_min")
+                pprob = day_fc.get("precip_prob")
+                show_prob = pprob is not None and ch >= 42
+
+                if tmax is not None and tmin is not None:
+                    t_str = f"{int(round(tmax))}°/{int(round(tmin))}°"
+                    t_fs = max(7.5, min(base_fs - 1.0, cw * 0.175))
+                    ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+                    ctx.set_font_size(t_fs)
+                    ctx.set_source_rgba(fg_r, fg_g, fg_b, 0.96)
+                    t_ext = ctx.text_extents(t_str)
+                    ty = cy + ch - (t_fs + 4.5 if show_prob else 4.0)
+                    ctx.move_to(cx + (cw - t_ext.width) / 2.0 - t_ext.x_bearing, ty)
+                    ctx.show_text(t_str)
+
+                if show_prob:
+                    p_str = f"{int(round(pprob))}%"
+                    p_fs = max(7.0, min(base_fs - 2.0, cw * 0.16))
+                    ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+                    ctx.set_font_size(p_fs)
+                    ctx.set_source_rgba(0.45, 0.82, 1.00, 0.95)
+                    p_ext = ctx.text_extents(p_str)
+                    drop_sz = max(5.5, p_fs * 0.85)
+                    drop_gap = 2.0
+                    total_pw = drop_sz * 0.72 + drop_gap + p_ext.width
+                    start_px = cx + (cw - total_pw) / 2.0
+                    base_py = cy + ch - 2.5
+                    draw_raindrop(ctx, start_px + drop_sz * 0.36, base_py - p_ext.height * 0.48, drop_sz)
+                    ctx.move_to(start_px + drop_sz * 0.72 + drop_gap - p_ext.x_bearing, base_py)
+                    ctx.show_text(p_str)
+        return False
+
 
 class CustomBubbleManager:
-    """Manages the weather detail RGBA bubble with strict multi-monitor clamping."""
+    """Manages the compact RGBA calendar bubble with strict multi-monitor clamping."""
 
     def __init__(self):
         self._win = None
+
+    def is_visible(self):
+        return self._win is not None and self._win.is_visible()
 
     def close_all(self):
         if self._win is not None:
@@ -670,9 +779,7 @@ class CustomBubbleManager:
 
     def show(
         self,
-        summary,
-        body_markup,
-        icon_pixbuf,
+        parent_widget,
         mon_bounds,
         position="top_right",
         offset_x=0,
@@ -689,10 +796,8 @@ class CustomBubbleManager:
         mon_h = max(200, mon_b - mon_t)
         pad = 12
 
-        win = CustomWeatherBubbleWindow(
-            summary=summary,
-            body_markup=body_markup,
-            icon_pixbuf=icon_pixbuf,
+        win = CustomCalendarBubbleWindow(
+            parent_widget=parent_widget,
             bg_hex=bg_color,
             fg_hex=fg_color,
             bg_opacity=bg_opacity,
@@ -700,8 +805,8 @@ class CustomBubbleManager:
             on_close_cb=self._on_closed,
         )
         _, nat = win.get_preferred_size()
-        bw = max(240, min(nat.width, mon_w - pad * 2))
-        bh = max(64, min(nat.height, mon_h - pad * 2))
+        bw = max(460, min(nat.width, mon_w - pad * 2))
+        bh = max(360, min(nat.height, mon_h - pad * 2))
         win.resize(bw, bh)
 
         if position == "top_left":
@@ -783,8 +888,6 @@ class ClockWeatherPopupWindow(Gtk.Window):
 
     def _hide_popup(self):
         self.hide()
-        if self.parent_widget.config.get("bubble_close_with_cal", True):
-            self.parent_widget.close_detail_bubbles()
 
     def _on_delete_hide(self, *_args):
         self._hide_popup()
@@ -839,10 +942,9 @@ class ClockWeatherPopupWindow(Gtk.Window):
         self.cal_canvas.connect("button-press-event", self._on_calendar_click)
         content.pack_start(self.cal_canvas, True, True, 0)
 
-        # Right Detailed Forecast Pane (hidden automatically in bubble modes)
+        # Right Detailed Forecast Pane
         self.right_frame = Gtk.Frame()
         self.right_frame.set_shadow_type(Gtk.ShadowType.ETCHED_IN)
-        self.right_frame.set_no_show_all(True)
         right_scroll = Gtk.ScrolledWindow()
         right_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         right_scroll.set_size_request(300, -1)
@@ -961,163 +1063,8 @@ class ClockWeatherPopupWindow(Gtk.Window):
         self.selected_date = today
         self.refresh_view()
 
-    def _sync_detail_pane_layout(self):
-        mode = self.parent_widget.config.get("detail_display_mode", "embedded")
-        is_embedded = mode == "embedded"
-        if is_embedded:
-            self.right_frame.set_no_show_all(False)
-            self.right_frame.show_all()
-            self.right_frame.set_no_show_all(True)
-            self.set_default_size(830, 480)
-            if self.is_visible():
-                self.resize(830, 480)
-        else:
-            self.right_frame.hide()
-            self.set_default_size(524, 460)
-            if self.is_visible():
-                self.resize(524, 460)
-
-    def _build_day_detail_payload(self, d_obj):
-        """Return (summary, rich_pango_markup, plain_text_body, icon_name) for a given date."""
-        d_str = d_obj.strftime("%Y-%m-%d")
-        wd_zh = self.WEEKDAYS_ZH[d_obj.weekday()]
-        is_today = d_obj == date.today()
-        wdata = self.parent_widget.weather_data or {}
-        city = wdata.get("city") or self.parent_widget.config.get("city_name", "台北")
-        daily_map = wdata.get("daily_by_date") or {}
-        day_fc = daily_map.get(d_str)
-        cur = wdata.get("current") or {}
-
-        today_tag = " (今天)" if is_today else ""
-        summary = f"{city} · {d_obj.month}/{d_obj.day} 週{wd_zh}{today_tag}"
-
-        if day_fc is None:
-            msg = "此日期超出 7 天天氣預報範圍。\n點選月曆中「今天起一週內」的日期即可檢視詳細預測。"
-            return summary, f"<span foreground='#94a3b8'>{html.escape(msg)}</span>", msg, "weather-few-clouds"
-
-        rich_lines = []
-        plain_lines = []
-
-        if is_today and cur.get("temp") is not None:
-            desc, icon_name = wmo_to_info(cur.get("code", day_fc.get("code", 0)), is_day=cur.get("is_day", True))
-            t_now = cur.get("temp")
-            t_app = cur.get("apparent")
-            hum = cur.get("humidity", "--")
-            wind = cur.get("wind", "--")
-            app_s = f" · 體感 {t_app:.1f}°C" if t_app is not None else ""
-            rich_lines.append(f"<b>{t_now:.1f}°C  {html.escape(desc)}</b>{app_s}")
-            rich_lines.append(f"<small>濕度 {hum}% · 風速 {wind} km/h</small>")
-            plain_lines.append(f"{t_now:.1f}°C {desc}{app_s} | 濕度 {hum}% | 風速 {wind} km/h")
-        else:
-            desc, icon_name = wmo_to_info(day_fc.get("code", 0), is_day=True)
-            tmax = day_fc.get("t_max")
-            tmin = day_fc.get("t_min")
-            t_rng = f"{tmax:.0f}° / {tmin:.0f}°C" if (tmax is not None and tmin is not None) else "--"
-            rich_lines.append(f"<b>{t_rng}  {html.escape(desc)}</b>")
-            plain_lines.append(f"{t_rng} {desc}")
-
-        tmax = day_fc.get("t_max")
-        tmin = day_fc.get("t_min")
-        pprob = day_fc.get("precip_prob")
-        psum = day_fc.get("precip_sum")
-        uv_max = day_fc.get("uv_max")
-        w_max = day_fc.get("wind_max")
-        sr = day_fc.get("sunrise", "--:--")
-        ss = day_fc.get("sunset", "--:--")
-
-        if tmax is not None and tmin is not None:
-            rich_lines.append(f"🌡️ 高低溫：<b>{tmax:.1f}°C / {tmin:.1f}°C</b>")
-            plain_lines.append(f"高低溫：{tmax:.1f}°C / {tmin:.1f}°C")
-        p_txt = f"{int(round(pprob)) if pprob is not None else '--'}%" + (f" ({psum:.1f} mm)" if psum is not None else "")
-        rich_lines.append(f"💧 降雨機率：<b>{html.escape(p_txt)}</b>")
-        plain_lines.append(f"降雨機率：{p_txt}")
-        if uv_max is not None and w_max is not None:
-            rich_lines.append(f"☀️ UV：<b>{uv_max:.1f}</b>  ·  💨 風速：<b>{w_max:.0f} km/h</b>")
-            plain_lines.append(f"UV：{uv_max:.1f} · 最大風速：{w_max:.0f} km/h")
-        rich_lines.append(f"🌅 日出 <b>{sr}</b>  ·  🌇 日落 <b>{ss}</b>")
-        plain_lines.append(f"日出 {sr} · 日落 {ss}")
-
-        if is_today and (cur.get("us_aqi") is not None or cur.get("pm2_5") is not None or cur.get("pm10") is not None):
-            aqi_lbl, aqi_col = aqi_to_label_color(cur.get("us_aqi"))
-            pm25 = cur.get("pm2_5")
-            pm10 = cur.get("pm10")
-            r_pm = []
-            p_pm = [f"AQI {aqi_lbl}"]
-            if pm25 is not None:
-                r_pm.append(f"PM2.5 <span foreground='{pm25_to_color(pm25)}'><b>{pm25:.1f}</b></span>")
-                p_pm.append(f"PM2.5 {pm25:.1f}")
-            if pm10 is not None:
-                r_pm.append(f"PM10 <span foreground='{pm10_to_color(pm10)}'><b>{pm10:.1f}</b></span>")
-                p_pm.append(f"PM10 {pm10:.1f}")
-            rich_lines.append(
-                f"🍃 空品：<span foreground='{aqi_col}'><b>{html.escape(aqi_lbl)}</b></span>"
-                + (f"  ({' · '.join(r_pm)} μg/m³)" if r_pm else "")
-            )
-            plain_lines.append("空品：" + " · ".join(p_pm) + " μg/m³")
-        elif day_fc.get("pm2_5_avg") is not None or day_fc.get("pm10_avg") is not None:
-            p25_a, p25_m = day_fc.get("pm2_5_avg"), day_fc.get("pm2_5_max")
-            p10_a, p10_m = day_fc.get("pm10_avg"), day_fc.get("pm10_max")
-            r_fc, p_fc = [], []
-            if p25_a is not None:
-                r_fc.append(f"PM2.5 <span foreground='{pm25_to_color(p25_a)}'><b>{p25_a:.0f}</b></span>" + (f"(高{p25_m:.0f})" if p25_m is not None else ""))
-                p_fc.append(f"PM2.5 {p25_a:.0f}" + (f"(高{p25_m:.0f})" if p25_m is not None else ""))
-            if p10_a is not None:
-                r_fc.append(f"PM10 <span foreground='{pm10_to_color(p10_a)}'><b>{p10_a:.0f}</b></span>" + (f"(高{p10_m:.0f})" if p10_m is not None else ""))
-                p_fc.append(f"PM10 {p10_a:.0f}" + (f"(高{p10_m:.0f})" if p10_m is not None else ""))
-            if r_fc:
-                rich_lines.append(f"🍃 預估空品：{' · '.join(r_fc)} μg/m³")
-                plain_lines.append(f"預估空品：{' · '.join(p_fc)} μg/m³")
-
-        slots = [h_it for h_it in (day_fc.get("hourly") or []) if h_it.get("hour", 0) % 3 == 0]
-        if slots:
-            rich_lines.append("<b>⏱ 逐時預報（每 3 小時）</b>")
-            plain_lines.append("逐時預報：")
-            for h_it in slots:
-                t_str = h_it.get("time", "--:--")
-                ht = h_it.get("temp")
-                ht_s = f"{ht:4.0f}°C" if ht is not None else "  --°C"
-                hp = int(round(h_it.get("precip_prob") or 0))
-                bar_cells = max(0, min(6, int(round(hp / 100.0 * 6))))
-                bar_txt = ("█" * bar_cells) + ("░" * (6 - bar_cells))
-                p_col = "#38bdf8" if hp >= 30 else "#94a3b8"
-                rich_lines.append(
-                    f"<tt>{html.escape(t_str)}  <b>{html.escape(ht_s)}</b>  <span foreground='{p_col}'>{bar_txt} {hp:2d}%</span></tt>"
-                )
-                plain_lines.append(f"  {t_str}  {ht_s.strip()}  降雨 {hp}%")
-
-        return summary, "\n".join(rich_lines), "\n".join(plain_lines), icon_name
-
-    def show_detail_bubble(self, d_obj=None):
-        target_d = d_obj or self.selected_date
-        mode = self.parent_widget.config.get("detail_display_mode", "embedded")
-        summary, rich_markup, plain_body, icon_name = self._build_day_detail_payload(target_d)
-        timeout_sec = int(self.parent_widget.config.get("bubble_timeout_sec", 12))
-
-        if mode == "system_dbus":
-            self.parent_widget.bubble_mgr.close_all()
-            self.parent_widget.dbus_notifier.show(summary, plain_body, icon=icon_name, timeout_sec=timeout_sec)
-        elif mode == "custom_bubble":
-            self.parent_widget.dbus_notifier.close()
-            pb = self.parent_widget.get_weather_pixbuf(icon_name, 36)
-            mon_bounds = self.parent_widget.get_active_monitor_bounds()
-            self.parent_widget.bubble_mgr.show(
-                summary=summary,
-                body_markup=rich_markup,
-                icon_pixbuf=pb,
-                mon_bounds=mon_bounds,
-                position=self.parent_widget.config.get("bubble_position", "top_right"),
-                offset_x=int(self.parent_widget.config.get("bubble_offset_x", 0)),
-                offset_y=int(self.parent_widget.config.get("bubble_offset_y", 36)),
-                bg_color=self.parent_widget.config.get("bubble_bg_color", "#182234"),
-                fg_color=self.parent_widget.config.get("bubble_fg_color", "#f0f6ff"),
-                bg_opacity=int(self.parent_widget.config.get("bubble_bg_opacity", 92)),
-                font_size=int(self.parent_widget.config.get("calendar_font_size", 11)),
-                timeout_sec=timeout_sec,
-            )
-
     def refresh_view(self):
         self._compute_month_cells()
-        self._sync_detail_pane_layout()
         wdata = self.parent_widget.weather_data or {}
         city = wdata.get("city") or self.parent_widget.config.get("city_name", "台北")
         upd = wdata.get("updated_at", "尚未更新")
@@ -1130,8 +1077,7 @@ class ClockWeatherPopupWindow(Gtk.Window):
             f"<span size='{s_pt}' foreground='#94a3b8'>📍 {html.escape(city)} · 更新：{html.escape(upd)}</span>"
         )
         self.cal_canvas.queue_draw()
-        if self.parent_widget.config.get("detail_display_mode", "embedded") == "embedded":
-            self._populate_detail_pane()
+        self._populate_detail_pane()
         self._update_world_clock_footer()
 
     def _update_world_clock_footer(self):
@@ -1176,8 +1122,6 @@ class ClockWeatherPopupWindow(Gtk.Window):
                     self.view_year = clicked_d.year
                     self.view_month = clicked_d.month
                 self.refresh_view()
-                if self.parent_widget.config.get("detail_display_mode", "embedded") != "embedded":
-                    self.show_detail_bubble(clicked_d)
                 return True
         return False
 
@@ -1544,9 +1488,7 @@ class ClockWeatherPopupWindow(Gtk.Window):
 
     def position_and_show(self):
         self.refresh_view()
-        mode = self.parent_widget.config.get("detail_display_mode", "embedded")
-        target_w = 830 if mode == "embedded" else 524
-        target_h = 480 if mode == "embedded" else 460
+        target_w, target_h = 830, 480
         display = Gdk.Display.get_default()
         gdk_win = self.parent_widget.get_window()
         if display is not None and gdk_win is not None:
@@ -1573,11 +1515,7 @@ class ClockWeatherPopupWindow(Gtk.Window):
             self.resize(target_w, target_h)
             self.set_position(Gtk.WindowPosition.CENTER)
         self.show_all()
-        if mode != "embedded":
-            self.right_frame.hide()
         self.present()
-        if mode != "embedded" and self.parent_widget.config.get("bubble_auto_on_open", False):
-            self.show_detail_bubble(self.selected_date)
 
 
 # =============================================================================
@@ -1604,8 +1542,9 @@ class ClockWeatherWidget(Gtk.EventBox):
         self.panel_size = 28
         self.popup_win = None
         self.prefs_win = None
-        self.dbus_notifier = DBusNotifier()
         self.bubble_mgr = CustomBubbleManager()
+        self._bubble_toggle_action = None
+        self._syncing_menu_toggle = False
         self._minute_timer_id = None
         self._weather_timer_id = None
         self._icon_cache = {}
@@ -1665,6 +1604,8 @@ class ClockWeatherWidget(Gtk.EventBox):
                     cfg.update(loaded)
             except Exception:
                 pass
+        if cfg.get("detail_display_mode") not in ("embedded", "custom_bubble"):
+            cfg["detail_display_mode"] = "custom_bubble" if cfg.get("detail_display_mode") == "system_dbus" else "embedded"
         return cfg
 
     def _save_config(self):
@@ -2028,7 +1969,37 @@ class ClockWeatherWidget(Gtk.EventBox):
 
     def close_detail_bubbles(self):
         self.bubble_mgr.close_all()
-        self.dbus_notifier.close()
+
+    def set_display_mode(self, mode):
+        new_mode = "custom_bubble" if mode == "custom_bubble" else "embedded"
+        self.config["detail_display_mode"] = new_mode
+        self._save_config()
+        if new_mode == "custom_bubble":
+            if self.popup_win is not None and self.popup_win.is_visible():
+                self.popup_win.hide()
+        else:
+            self.bubble_mgr.close_all()
+        if self._bubble_toggle_action is not None and not self._syncing_menu_toggle:
+            self._syncing_menu_toggle = True
+            try:
+                self._bubble_toggle_action.set_active(new_mode == "custom_bubble")
+            finally:
+                self._syncing_menu_toggle = False
+
+    def show_compact_calendar_bubble(self):
+        mon_bounds = self.get_active_monitor_bounds()
+        self.bubble_mgr.show(
+            parent_widget=self,
+            mon_bounds=mon_bounds,
+            position=self.config.get("bubble_position", "top_right"),
+            offset_x=int(self.config.get("bubble_offset_x", 0)),
+            offset_y=int(self.config.get("bubble_offset_y", 36)),
+            bg_color=self.config.get("bubble_bg_color", "#182234"),
+            fg_color=self.config.get("bubble_fg_color", "#f0f6ff"),
+            bg_opacity=int(self.config.get("bubble_bg_opacity", 92)),
+            font_size=int(self.config.get("calendar_font_size", 11)),
+            timeout_sec=int(self.config.get("bubble_timeout_sec", 12)),
+        )
 
     def get_active_monitor_bounds(self):
         display = Gdk.Display.get_default()
@@ -2051,6 +2022,17 @@ class ClockWeatherWidget(Gtk.EventBox):
         return (0, 0, 1920, 1080)
 
     def toggle_popup_window(self, *_args):
+        mode = self.config.get("detail_display_mode", "embedded")
+        if mode == "custom_bubble":
+            if self.popup_win is not None and self.popup_win.is_visible():
+                self.popup_win.hide()
+            if self.bubble_mgr.is_visible():
+                self.bubble_mgr.close_all()
+            else:
+                self.show_compact_calendar_bubble()
+            return
+
+        self.bubble_mgr.close_all()
         if self.popup_win is None:
             self.popup_win = ClockWeatherPopupWindow(self)
         if self.popup_win.is_visible():
@@ -2304,42 +2286,33 @@ class ClockWeatherWidget(Gtk.EventBox):
         pfs_row.pack_start(spin_panel_fs, False, False, 0)
         outer.pack_start(pfs_row, False, False, 0)
 
-        # --- Tab 2: Detail Display Mode & Bubble Settings (Scheme C) ---
+        # --- Tab 2: Calendar Mode & Custom RGBA Bubble Settings ---
         tab_bubble = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         tab_bubble.set_margin_top(12)
         tab_bubble.set_margin_bottom(12)
         tab_bubble.set_margin_start(14)
         tab_bubble.set_margin_end(14)
-        notebook.append_page(tab_bubble, Gtk.Label(label="詳情頁與氣泡框"))
+        notebook.append_page(tab_bubble, Gtk.Label(label="月曆與氣泡框"))
 
         bs1 = Gtk.Label(xalign=0.0)
-        bs1.set_markup("<b>1. 天氣月曆詳情頁顯示模式</b>")
+        bs1.set_markup("<b>1. 左鍵點擊面板時的天氣月曆顯示模式（亦可由右鍵選單快速切換）</b>")
         tab_bubble.pack_start(bs1, False, False, 0)
 
         mode_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         mode_row.set_margin_start(10)
         mode_row.pack_start(Gtk.Label(label="顯示方式：", xalign=0.0), False, False, 0)
         combo_detail_mode = Gtk.ComboBoxText()
-        combo_detail_mode.append("embedded", "內嵌右側詳情欄（預設雙欄月曆）")
-        combo_detail_mode.append("custom_bubble", "自訂 RGBA 氣泡框（單欄月曆，dict-calc 同款）")
-        combo_detail_mode.append("system_dbus", "原生系統 D-Bus 通知（單欄月曆，org.freedesktop.Notifications）")
-        combo_detail_mode.set_active_id(self.config.get("detail_display_mode", "embedded"))
+        combo_detail_mode.append("embedded", "完整視窗（月曆 ＋ 右側詳細天氣預報）")
+        combo_detail_mode.append("custom_bubble", "自訂 RGBA 氣泡框（精簡月曆 ＋ 一週天氣圖案／溫度／降雨機率）")
+        combo_detail_mode.set_active_id(
+            "custom_bubble" if self.config.get("detail_display_mode") == "custom_bubble" else "embedded"
+        )
         mode_row.pack_start(combo_detail_mode, True, True, 0)
         tab_bubble.pack_start(mode_row, False, False, 0)
 
-        b_opt_row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        b_opt_row.set_margin_start(10)
-        chk_b_auto_open = Gtk.CheckButton(label="氣泡模式下，開啟月曆時自動彈出今日詳情氣泡")
-        chk_b_auto_open.set_active(self.config.get("bubble_auto_on_open", False))
-        chk_b_close_cal = Gtk.CheckButton(label="關閉天氣月曆時同步關閉詳情氣泡")
-        chk_b_close_cal.set_active(self.config.get("bubble_close_with_cal", True))
-        b_opt_row.pack_start(chk_b_auto_open, False, False, 0)
-        b_opt_row.pack_start(chk_b_close_cal, False, False, 0)
-        tab_bubble.pack_start(b_opt_row, False, False, 0)
-
         b_time_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         b_time_row.set_margin_start(10)
-        b_time_row.pack_start(Gtk.Label(label="氣泡停留時間 (秒，0 = 常駐直到點擊或關閉月曆)：", xalign=0.0), False, False, 0)
+        b_time_row.pack_start(Gtk.Label(label="氣泡停留時間 (秒，0 = 常駐直到手動關閉)：", xalign=0.0), False, False, 0)
         spin_b_timeout = Gtk.SpinButton(
             adjustment=Gtk.Adjustment(
                 value=float(self.config.get("bubble_timeout_sec", 12)),
@@ -2456,9 +2429,6 @@ class ClockWeatherWidget(Gtk.EventBox):
             self.config["font_opacity"] = fop_v
             lbl_font_op.set_text(f"{fop_v}%")
             self.config["text_shadow"] = chk_shadow.get_active()
-            self.config["detail_display_mode"] = combo_detail_mode.get_active_id() or "embedded"
-            self.config["bubble_auto_on_open"] = chk_b_auto_open.get_active()
-            self.config["bubble_close_with_cal"] = chk_b_close_cal.get_active()
             self.config["bubble_timeout_sec"] = int(spin_b_timeout.get_value_as_int())
             self.config["bubble_position"] = combo_b_pos.get_active_id() or "top_right"
             self.config["bubble_offset_x"] = int(spin_b_ox.get_value_as_int())
@@ -2468,14 +2438,14 @@ class ClockWeatherWidget(Gtk.EventBox):
             bop_v = max(10, min(100, int(round(scale_b_op.get_value()))))
             self.config["bubble_bg_opacity"] = bop_v
             lbl_b_op.set_text(f"{bop_v}%")
-            self._save_config()
-            if self.config["detail_display_mode"] == "embedded":
-                self.close_detail_bubbles()
+            self.set_display_mode(combo_detail_mode.get_active_id() or "embedded")
             self._sync_weather_timer()
             self._update_canvas_size()
             self._update_tooltip()
             if self.popup_win is not None and self.popup_win.is_visible():
                 self.popup_win.refresh_view()
+            elif self.bubble_mgr.is_visible():
+                self.show_compact_calendar_bubble()
 
         def set_city(name, lat, lon):
             self.config["city_name"] = name
@@ -2570,14 +2540,8 @@ class ClockWeatherWidget(Gtk.EventBox):
             cb.connect("toggled", apply_all)
         def _on_test_bubble(*_):
             apply_all()
-            if self.popup_win is None:
-                self.popup_win = ClockWeatherPopupWindow(self)
-            mode = self.config.get("detail_display_mode", "embedded")
-            if mode == "embedded":
-                lbl_status.set_markup("<small><span foreground='#fbbf24'>⚠ 目前為「內嵌右側詳情欄」模式，請先切換為氣泡框模式即可預覽。</span></small>")
-                return
-            self.popup_win.show_detail_bubble(date.today())
-            lbl_status.set_markup("<small><span foreground='#34d399'>✔ 已彈出今日天氣詳情氣泡預覽</span></small>")
+            self.show_compact_calendar_bubble()
+            lbl_status.set_markup("<small><span foreground='#34d399'>✔ 已彈出精簡月曆 RGBA 氣泡框預覽</span></small>")
 
         btn_test_bubble.connect("clicked", _on_test_bubble)
         b_bg_btn.connect("color-set", apply_all)
@@ -2590,7 +2554,6 @@ class ClockWeatherWidget(Gtk.EventBox):
         for w in (
             chk_w_icon, chk_w_temp, chk_aqi, chk_date, chk_wd, chk_24h,
             chk_panel_fs_auto, chk_world, rb_fc_dyn, rb_fc_cus, chk_shadow,
-            chk_b_auto_open, chk_b_close_cal,
         ):
             w.connect("toggled", apply_all)
 
@@ -2646,7 +2609,7 @@ def setup_applet_context_menu(applet, widget):
                 Gtk.STOCK_INDEX,
                 "開啟天氣月曆 (_Weather Calendar)",
                 None,
-                "開啟互動月曆與 7 天詳細天氣預報",
+                "開啟天氣月曆（完整視窗或精簡氣泡框）",
                 widget.toggle_popup_window,
             ),
             (
@@ -2662,7 +2625,7 @@ def setup_applet_context_menu(applet, widget):
                 Gtk.STOCK_PREFERENCES,
                 "偏好設定 (_Preferences)...",
                 None,
-                "設定地點、外觀顏色、透明度與世界時鐘",
+                "設定地點、外觀顏色、透明度與氣泡框",
                 widget.show_preferences_dialog,
             ),
             (
@@ -2675,8 +2638,27 @@ def setup_applet_context_menu(applet, widget):
             ),
         ]
     )
+
+    toggle_act = Gtk.ToggleAction(
+        name="ToggleBubbleModeAction",
+        label="使用精簡月曆氣泡框 (_Bubble Mode)",
+        tooltip="切換「自訂 RGBA 精簡月曆氣泡框」與「完整雙欄天氣月曆視窗」",
+        stock_id=None,
+    )
+    toggle_act.set_active(widget.config.get("detail_display_mode", "embedded") == "custom_bubble")
+
+    def _on_toggle_bubble(action):
+        if widget._syncing_menu_toggle:
+            return
+        widget.set_display_mode("custom_bubble" if action.get_active() else "embedded")
+
+    toggle_act.connect("toggled", _on_toggle_bubble)
+    action_group.add_action(toggle_act)
+    widget._bubble_toggle_action = toggle_act
+
     menu_xml = (
         '<menuitem name="OpenCalendar" action="OpenCalendarAction"/>'
+        '<menuitem name="ToggleBubbleMode" action="ToggleBubbleModeAction"/>'
         '<menuitem name="RefreshWeather" action="RefreshWeatherAction"/>'
         "<separator/>"
         '<menuitem name="Preferences" action="PreferencesAction"/>'
