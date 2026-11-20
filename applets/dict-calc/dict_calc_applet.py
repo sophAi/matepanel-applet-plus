@@ -84,6 +84,8 @@ DEFAULT_PREFERRED_DICTS = [
 DEFAULT_CONFIG = {
     "display_mode": "panel_entry",       # "panel_entry" (純面板查詢輸入框，預設) or "badge" (精簡方塊圖示)
     "result_output_mode": "window",      # "window" (無焦點精簡結果視窗), "dbus_popup" (系統 D-Bus 通知泡泡), "calc_dbus_dict_window" (混合模式)
+    "dbus_popup_style": "separate",      # "separate" (每本詞典獨立泡泡，最多 N 個) or "merged" (單一泡泡以粗體分隔線區隔)
+    "dbus_popup_max_dicts": 3,           # D-Bus 泡泡最多顯示幾本命中的詞典 (1..5)
     "dbus_popup_timeout_sec": 8,         # D-Bus 通知泡泡停留秒數 (1..60)
     "panel_entry_width": 170,            # 面板內嵌查詢框寬度 (px)
     "scan_selection_enabled": False,     # 是否啟用滑鼠反白自動劃詞查詢 (Selection Primary)
@@ -104,12 +106,13 @@ DEFAULT_CONFIG = {
 class DBusNotifier:
     """
     Zero-subprocess system D-Bus notification sender (`org.freedesktop.Notifications`).
-    Tracks `replaces_id` so consecutive queries replace the same popup in-place without flooding.
+    Tracks a list of active notification IDs (`_last_ids`) so consecutive single or multi-bubble
+    queries replace previous bubbles in-place and close any leftover extra bubbles without flooding.
     """
 
     def __init__(self):
         self._proxy = None
-        self._last_id = 0
+        self._last_ids = []
 
     def _get_proxy(self):
         if self._proxy is None:
@@ -127,32 +130,61 @@ class DBusNotifier:
                 self._proxy = None
         return self._proxy
 
-    def show(self, summary, body, icon="accessories-dictionary", timeout_sec=8):
+    def _close_id(self, proxy, nid):
+        if not nid:
+            return
+        try:
+            proxy.call_sync(
+                "CloseNotification",
+                GLib.Variant("(u)", (int(nid),)),
+                Gio.DBusCallFlags.NONE,
+                1000,
+                None,
+            )
+        except Exception:
+            pass
+
+    def show_batch(self, items, timeout_sec=8):
+        """
+        Show 1 or more notifications: items = [(summary, body, icon), ...]
+        Reuses previous notification IDs in-place and closes any excess old bubbles.
+        """
         proxy = self._get_proxy()
         if proxy is None:
             return False
         timeout_ms = max(1000, int(timeout_sec) * 1000)
-        try:
-            args = GLib.Variant(
-                "(susssasa{sv}i)",
-                (
-                    "StarDict & Calc Plus",
-                    int(self._last_id),
-                    icon,
-                    str(summary),
-                    str(body),
-                    [],
-                    {},
-                    timeout_ms,
-                ),
-            )
-            res = proxy.call_sync("Notify", args, Gio.DBusCallFlags.NONE, 2000, None)
-            if res is not None:
-                self._last_id = int(res.unpack()[0])
-            return True
-        except Exception:
-            self._last_id = 0
-            return False
+        new_ids = []
+        for idx, (summary, body, icon) in enumerate(items):
+            replace_id = self._last_ids[idx] if idx < len(self._last_ids) else 0
+            try:
+                args = GLib.Variant(
+                    "(susssasa{sv}i)",
+                    (
+                        "StarDict & Calc Plus",
+                        int(replace_id),
+                        icon,
+                        str(summary),
+                        str(body),
+                        [],
+                        {},
+                        timeout_ms,
+                    ),
+                )
+                res = proxy.call_sync("Notify", args, Gio.DBusCallFlags.NONE, 2000, None)
+                nid = int(res.unpack()[0]) if res is not None else 0
+                new_ids.append(nid)
+            except Exception:
+                new_ids.append(0)
+
+        # Close any leftover bubbles from a previous query that had more dictionaries
+        for old_id in self._last_ids[len(items):]:
+            self._close_id(proxy, old_id)
+
+        self._last_ids = new_ids
+        return True
+
+    def show(self, summary, body, icon="accessories-dictionary", timeout_sec=8):
+        return self.show_batch([(summary, body, icon)], timeout_sec=timeout_sec)
 
 
 # =============================================================================
@@ -1317,6 +1349,10 @@ class DictCalcWidget(Gtk.EventBox):
 
         if use_dbus_dict:
             timeout_sec = int(self.config.get("dbus_popup_timeout_sec", 8))
+            dbus_style = self.config.get("dbus_popup_style", "separate")
+            max_dicts = max(1, min(5, int(self.config.get("dbus_popup_max_dicts", 3))))
+            book_icons = ["📘", "📗", "📙", "📕", "📓"]
+
             if not results:
                 self.dbus_notifier.show(
                     f"📖 查無詞條：{query_word}",
@@ -1324,21 +1360,44 @@ class DictCalcWidget(Gtk.EventBox):
                     icon="accessories-dictionary",
                     timeout_sec=timeout_sec,
                 )
+            elif dbus_style == "separate":
+                # Mode 1: Each dictionary gets its own crisp independent D-Bus bubble (replaced in-place next query)
+                batch = []
+                shown = results[:max_dicts]
+                for idx, item in enumerate(shown):
+                    b_emo = book_icons[idx % len(book_icons)]
+                    d_name = item["dict"]
+                    w_str = item["word"]
+                    summary = f"{b_emo} {w_str} — {d_name}"
+                    def_lines = [html.escape(ln.strip()) for ln in item["definition"].splitlines() if ln.strip()]
+                    body = "\n".join(def_lines[:8])
+                    if len(def_lines) > 8:
+                        body += "\n…"
+                    if len(body) > 480:
+                        body = body[:477] + "…"
+                    batch.append((summary, body, "accessories-dictionary"))
+                self.dbus_notifier.show_batch(batch, timeout_sec=timeout_sec)
             else:
-                # Format concise summary for D-Bus notification bubble (top 2 dictionaries, capped lines)
-                lines = []
-                for item in results[:2]:
+                # Mode 2: Single merged D-Bus bubble with clear bold divider banners and indented definitions
+                blocks = []
+                shown = results[:max_dicts]
+                for idx, item in enumerate(shown):
+                    b_emo = book_icons[idx % len(book_icons)]
                     d_esc = html.escape(item["dict"])
                     w_esc = html.escape(item["word"])
-                    lines.append(f"<b>【{d_esc}】</b> <b>{w_esc}</b>")
-                    def_lines = [html.escape(ln.strip()) for ln in item["definition"].splitlines() if ln.strip()]
-                    lines.extend(def_lines[:6])
-                    lines.append("")
-                if len(results) > 2:
-                    lines.append(f"<i>…（另有 {len(results) - 2} 套詞典命中）</i>")
-                body = "\n".join(lines).strip()
-                if len(body) > 750:
-                    body = body[:747] + "…"
+                    hdr = f"<b>━━━ {b_emo} {d_esc} ({w_esc}) ━━━</b>"
+                    def_lines = [
+                        f"  {html.escape(ln.strip())}"
+                        for ln in item["definition"].splitlines()
+                        if ln.strip()
+                    ]
+                    block_lines = [hdr] + def_lines[:6]
+                    blocks.append("\n".join(block_lines))
+                if len(results) > max_dicts:
+                    blocks.append(f"<i>…（另有 {len(results) - max_dicts} 套詞典命中）</i>")
+                body = "\n\n".join(blocks).strip()
+                if len(body) > 850:
+                    body = body[:847] + "…"
                 self.dbus_notifier.show(
                     f"📖 {query_word}",
                     body,
@@ -1628,7 +1687,31 @@ class DictCalcWidget(Gtk.EventBox):
 
         dbus_t_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         dbus_t_box.set_margin_start(14)
-        dbus_t_box.pack_start(Gtk.Label(label="D-Bus 通知泡泡停留秒數：", xalign=0.0), False, False, 0)
+        dbus_t_box.pack_start(Gtk.Label(label="D-Bus 泡泡多詞典呈現：", xalign=0.0), False, False, 0)
+        combo_dbus_style = Gtk.ComboBoxText()
+        combo_dbus_style.append("separate", "每本詞典獨立泡泡 (不洗版，最清晰)")
+        combo_dbus_style.append("merged", "單一泡泡以粗體分隔線區隔 (━━━ 📘 字典 ━━━)")
+        combo_dbus_style.set_active_id(self.config.get("dbus_popup_style", "separate"))
+        dbus_t_box.pack_start(combo_dbus_style, True, True, 0)
+        tab1.pack_start(dbus_t_box, False, False, 0)
+
+        dbus_num_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        dbus_num_box.set_margin_start(14)
+        dbus_num_box.pack_start(Gtk.Label(label="D-Bus 最多顯示詞典數：", xalign=0.0), False, False, 0)
+        spin_dbus_max = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(
+                value=float(self.config.get("dbus_popup_max_dicts", 3)),
+                lower=1.0,
+                upper=5.0,
+                step_increment=1.0,
+                page_increment=1.0,
+                page_size=0.0,
+            ),
+            climb_rate=1.0,
+            digits=0,
+        )
+        dbus_num_box.pack_start(spin_dbus_max, False, False, 0)
+        dbus_num_box.pack_start(Gtk.Label(label="泡泡停留秒數：", xalign=0.0), False, False, 0)
         spin_dbus_sec = Gtk.SpinButton(
             adjustment=Gtk.Adjustment(
                 value=float(self.config.get("dbus_popup_timeout_sec", 8)),
@@ -1641,8 +1724,8 @@ class DictCalcWidget(Gtk.EventBox):
             climb_rate=1.0,
             digits=0,
         )
-        dbus_t_box.pack_start(spin_dbus_sec, False, False, 0)
-        tab1.pack_start(dbus_t_box, False, False, 0)
+        dbus_num_box.pack_start(spin_dbus_sec, False, False, 0)
+        tab1.pack_start(dbus_num_box, False, False, 0)
 
         tab1.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
@@ -1891,6 +1974,8 @@ class DictCalcWidget(Gtk.EventBox):
             self.config["scan_modifier"] = combo_mod.get_active_id() or "ctrl"
             self.config["calc_auto_copy"] = chk_auto_copy.get_active()
             self.config["result_output_mode"] = combo_out.get_active_id() or "window"
+            self.config["dbus_popup_style"] = combo_dbus_style.get_active_id() or "separate"
+            self.config["dbus_popup_max_dicts"] = int(spin_dbus_max.get_value_as_int())
             self.config["dbus_popup_timeout_sec"] = int(spin_dbus_sec.get_value_as_int())
             self.config["display_mode"] = "badge" if rb_badge.get_active() else "panel_entry"
             self.config["panel_entry_width"] = int(spin_entry_w.get_value_as_int())
@@ -1914,6 +1999,7 @@ class DictCalcWidget(Gtk.EventBox):
         btn_apply_hk.connect("clicked", apply_tab1)
         combo_mod.connect("changed", apply_tab1)
         combo_out.connect("changed", apply_tab1)
+        combo_dbus_style.connect("changed", apply_tab1)
         col_btn.connect("color-set", lambda *_: (rb_col_cus.set_active(True), apply_tab1()))
         for w_c in (
             chk_scan_en,
@@ -1928,7 +2014,7 @@ class DictCalcWidget(Gtk.EventBox):
             chk_shadow,
         ):
             w_c.connect("toggled", apply_tab1)
-        for sp_c in (spin_dbus_sec, spin_entry_w, spin_res_fs):
+        for sp_c in (spin_dbus_max, spin_dbus_sec, spin_entry_w, spin_res_fs):
             sp_c.connect("value-changed", apply_tab1)
 
         # Bottom Close Button
