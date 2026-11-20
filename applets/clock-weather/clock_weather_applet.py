@@ -1739,7 +1739,7 @@ class HimawariSatelliteView(Gtk.Box):
         if not self._frames:
             ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
             ctx.set_font_size(14.0)
-            msg = "🛰️ 正在載入西太平洋即時衛星雲圖..." if self._loading else "點選上方「🔄 更新」載入西太平洋衛星雲圖"
+            msg = "正在載入西太平洋即時衛星雲圖..." if self._loading else "點選上方「更新」載入西太平洋衛星雲圖"
             ext = ctx.text_extents(msg)
             ctx.set_source_rgba(0.70, 0.78, 0.88, 0.90)
             ctx.move_to((w - ext.width) / 2.0 - ext.x_bearing, (h - ext.height) / 2.0 - ext.y_bearing)
