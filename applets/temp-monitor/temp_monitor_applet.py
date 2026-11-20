@@ -58,6 +58,13 @@ DEFAULT_CONFIG = {
     "custom_warn_font_color": "#fbbf24",# 自訂「中度負載」字形顏色
     "custom_crit_font_color": "#f87171",# 自訂「高溫/高負載警戒」字形顏色
     "badge_bg_style": "dark",           # "dark" (深色半透明底), "light" (淺色半透明底), "transparent" (透明無底色)
+    "custom_badge_style": True,         # 分別自訂 CPU / GPU 方塊底色、框線色與底色透明度
+    "cpu_bg_color": "#113a2b",          # CPU 方塊底色
+    "cpu_border_color": "#34d399",      # CPU 方塊框線顏色
+    "cpu_bg_opacity": 92,               # CPU 方塊底色不透明度 (0..100%)
+    "gpu_bg_color": "#162944",          # GPU 方塊底色
+    "gpu_border_color": "#38bdf8",      # GPU 方塊框線顏色
+    "gpu_bg_opacity": 92,               # GPU 方塊底色不透明度 (0..100%)
     "text_shadow": False,               # 為面板字形加上對比描邊陰影
     "show_other_sensors": True,         # 在選單中顯示 NVMe / 主機板 / 風扇等其他感測器
     "cpu_avg_cores_only": True,         # True: 僅平均實體核心 Core 0..N; False: 包含 Package id
@@ -862,29 +869,46 @@ class TempMonitorWidget(Gtk.EventBox):
         val_str,
         colors,
         side_bars=None,
+        hide_title=False,
+        custom_style=None,
     ):
         """
-        Draw a single rounded badge with a title, value text, and optional vertical side progress bars.
+        Draw a single rounded badge with optional title (or Scheme B ultra-large centered value),
+        custom per-badge background/border/opacity, and optional vertical side progress bars.
         colors: (bg_rgb, border_rgb, text_rgb, accent_hex, level)
-        side_bars: dict with optional 'left' and 'right' keys:
-          {'left': (pct_float_0_100, (r, g, b)), 'right': (pct_float_0_100, (r, g, b))}
+        custom_style: optional tuple (bg_hex, border_hex, opacity_0_100)
         """
         bg_rgb, border_rgb, text_rgb, _, level = colors
         bg_style = self.config.get("badge_bg_style", "dark")
 
         draw_rounded_rect(ctx, x + 0.5, y + 0.5, bw - 1.0, bh - 1.0, 4.5)
-        if bg_style == "dark":
+        eff_bg_rgb = bg_rgb
+        eff_bg_alpha = 0.92
+        eff_border_rgb = border_rgb
+
+        if custom_style is not None:
+            c_bg_hex, c_border_hex, c_opacity = custom_style
+            eff_bg_rgb = hex_to_rgb(c_bg_hex, default=bg_rgb)
+            eff_border_rgb = hex_to_rgb(c_border_hex, default=border_rgb)
+            eff_bg_alpha = max(0.0, min(1.0, float(c_opacity) / 100.0))
+            if eff_bg_alpha > 0.0:
+                ctx.set_source_rgba(eff_bg_rgb[0], eff_bg_rgb[1], eff_bg_rgb[2], eff_bg_alpha)
+                ctx.fill_preserve()
+        elif bg_style == "dark":
             ctx.set_source_rgba(bg_rgb[0], bg_rgb[1], bg_rgb[2], 0.92)
             ctx.fill_preserve()
         elif bg_style == "light":
-            l_r = 0.88 + bg_rgb[0] * 0.22
-            l_g = 0.88 + bg_rgb[1] * 0.22
-            l_b = 0.88 + bg_rgb[2] * 0.22
-            ctx.set_source_rgba(min(1.0, l_r), min(1.0, l_g), min(1.0, l_b), 0.92)
+            l_r = min(1.0, 0.88 + bg_rgb[0] * 0.22)
+            l_g = min(1.0, 0.88 + bg_rgb[1] * 0.22)
+            l_b = min(1.0, 0.88 + bg_rgb[2] * 0.22)
+            eff_bg_rgb = (l_r, l_g, l_b)
+            ctx.set_source_rgba(l_r, l_g, l_b, 0.92)
             ctx.fill_preserve()
+        else:
+            eff_bg_alpha = 0.0
 
-        ctx.set_source_rgba(border_rgb[0], border_rgb[1], border_rgb[2], 0.95)
-        ctx.set_line_width(1.2)
+        ctx.set_source_rgba(eff_border_rgb[0], eff_border_rgb[1], eff_border_rgb[2], 0.95)
+        ctx.set_line_width(1.25)
         ctx.stroke()
 
         # Draw vertical side progress bars inside left and right edges (bottom-up fill)
@@ -925,34 +949,49 @@ class TempMonitorWidget(Gtk.EventBox):
             title_rgb = stage_rgb
             val_rgb = stage_rgb
         else:
-            title_rgb = border_rgb
-            if bg_style == "light":
-                val_rgb = (bg_rgb[0] * 0.85, bg_rgb[1] * 0.85, bg_rgb[2] * 0.85)
+            title_rgb = eff_border_rgb
+            is_light_fill = eff_bg_alpha >= 0.30 and rgb_luminance(eff_bg_rgb) > 0.55
+            if is_light_fill:
+                val_rgb = (0.07, 0.09, 0.15)
             else:
                 val_rgb = text_rgb
 
         has_sides = has_left or has_right
         # Center text within the inner area between left and right vertical bars
-        inner_left = x + (bar_w + 3.0 if has_left else 0.0)
-        inner_right = x + bw - (bar_w + 3.0 if has_right else 0.0)
+        inner_left = x + (bar_w + 3.0 if has_left else 1.5)
+        inner_right = x + bw - (bar_w + 3.0 if has_right else 1.5)
         inner_w = max(10.0, inner_right - inner_left)
 
         ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-        header_size = max(6.5, bh * (0.24 if has_sides else 0.27))
-        ctx.set_font_size(header_size)
-        ext = ctx.text_extents(title)
-        tx = inner_left + (inner_w - ext.width) / 2.0 - ext.x_bearing
-        ty = y + header_size + 1.5
-        self._draw_styled_text(ctx, tx, ty, title, title_rgb)
+        if hide_title:
+            # Scheme B: Ultra-large centered digits (no title, no ° symbol) with dynamic width clamp
+            val_size = max(10.0, bh * 0.74)
+            ctx.set_font_size(val_size)
+            v_ext = ctx.text_extents(val_str)
+            max_w = max(8.0, inner_w - 2.0)
+            if v_ext.width > max_w and v_ext.width > 0:
+                val_size *= max_w / v_ext.width
+                ctx.set_font_size(val_size)
+                v_ext = ctx.text_extents(val_str)
+            vx = inner_left + (inner_w - v_ext.width) / 2.0 - v_ext.x_bearing
+            vy = y + (bh - v_ext.height) / 2.0 - v_ext.y_bearing
+            self._draw_styled_text(ctx, vx, vy, val_str, val_rgb)
+        else:
+            header_size = max(6.5, bh * (0.24 if has_sides else 0.27))
+            ctx.set_font_size(header_size)
+            ext = ctx.text_extents(title)
+            tx = inner_left + (inner_w - ext.width) / 2.0 - ext.x_bearing
+            ty = y + header_size + 1.5
+            self._draw_styled_text(ctx, tx, ty, title, title_rgb)
 
-        val_size = max(8.5, bh * (0.37 if has_sides else 0.41))
-        if len(val_str) >= 4:
-            val_size *= 0.88
-        ctx.set_font_size(val_size)
-        v_ext = ctx.text_extents(val_str)
-        vx = inner_left + (inner_w - v_ext.width) / 2.0 - v_ext.x_bearing
-        vy = y + bh - 3.0
-        self._draw_styled_text(ctx, vx, vy, val_str, val_rgb)
+            val_size = max(8.5, bh * (0.37 if has_sides else 0.41))
+            if len(val_str) >= 4:
+                val_size *= 0.88
+            ctx.set_font_size(val_size)
+            v_ext = ctx.text_extents(val_str)
+            vx = inner_left + (inner_w - v_ext.width) / 2.0 - v_ext.x_bearing
+            vy = y + bh - 3.0
+            self._draw_styled_text(ctx, vx, vy, val_str, val_rgb)
 
     def _draw_badge_mode(self, ctx, w, h, enabled):
         cpu_avg = self.latest_data.get("cpu_avg") if enabled else None
@@ -965,13 +1004,14 @@ class TempMonitorWidget(Gtk.EventBox):
         show_util = self.config.get("show_panel_gpu_util", True)
         show_mem = self.config.get("show_panel_gpu_mem", True)
         layout = self.config.get("gpu_badge_layout", "separate")
+        use_custom_style = bool(self.config.get("custom_badge_style", True))
 
         badges = []
 
-        cpu_val_str = "OFF" if not enabled else ("--°" if cpu_avg is None else f"{int(round(cpu_avg))}°")
+        # Scheme B: remove ° symbol and hide CPU/GPU titles for maximum temperature digit size
+        cpu_val_str = "OFF" if not enabled else ("--" if cpu_avg is None else f"{int(round(cpu_avg))}")
         cpu_side_bars = None
         if layout == "compact":
-            # In compact 2-in-1 layout, embed left (CPU avg loading %) and right (System RAM usage %) vertical bars
             _, cl_border, _, _, cl_lvl = self._get_pct_colors(cpu_load, enabled, base_hue="cyan")
             cl_bar_rgb = self._resolve_panel_text_rgb(cl_lvl, cl_border)
             _, rm_border, _, _, rm_lvl = self._get_pct_colors(ram_pct, enabled, base_hue="purple")
@@ -980,12 +1020,20 @@ class TempMonitorWidget(Gtk.EventBox):
                 "left": (cpu_load if enabled else 0.0, cl_bar_rgb),
                 "right": (ram_pct if enabled else 0.0, rm_bar_rgb),
             }
-        badges.append(("CPU", cpu_val_str, self._get_temp_colors(cpu_avg, enabled), cpu_side_bars))
+        cpu_custom = (
+            (
+                self.config.get("cpu_bg_color", "#113a2b"),
+                self.config.get("cpu_border_color", "#34d399"),
+                int(self.config.get("cpu_bg_opacity", 92)),
+            )
+            if use_custom_style
+            else None
+        )
+        badges.append(("CPU", cpu_val_str, self._get_temp_colors(cpu_avg, enabled), cpu_side_bars, True, cpu_custom))
 
-        gpu_val_str = "OFF" if not enabled else ("--°" if gpu_avg is None else f"{int(round(gpu_avg))}°")
+        gpu_val_str = "OFF" if not enabled else ("--" if gpu_avg is None else f"{int(round(gpu_avg))}")
         gpu_side_bars = None
         if layout == "compact":
-            # In compact 2-in-1 layout, always embed left (GPU-Util) and right (Memory-Usage) vertical bars
             _, u_border, _, _, u_lvl = self._get_pct_colors(gpu_util, enabled, base_hue="cyan")
             u_bar_rgb = self._resolve_panel_text_rgb(u_lvl, u_border)
             _, m_border, _, _, m_lvl = self._get_pct_colors(mem_pct, enabled, base_hue="purple")
@@ -994,15 +1042,24 @@ class TempMonitorWidget(Gtk.EventBox):
                 "left": (gpu_util if enabled else 0.0, u_bar_rgb),
                 "right": (mem_pct if enabled else 0.0, m_bar_rgb),
             }
-        badges.append(("GPU", gpu_val_str, self._get_temp_colors(gpu_avg, enabled), gpu_side_bars))
+        gpu_custom = (
+            (
+                self.config.get("gpu_bg_color", "#162944"),
+                self.config.get("gpu_border_color", "#38bdf8"),
+                int(self.config.get("gpu_bg_opacity", 92)),
+            )
+            if use_custom_style
+            else None
+        )
+        badges.append(("GPU", gpu_val_str, self._get_temp_colors(gpu_avg, enabled), gpu_side_bars, True, gpu_custom))
 
         if layout == "separate":
             if show_util:
                 util_str = "OFF" if not enabled else ("--%" if gpu_util is None else f"{int(round(gpu_util))}%")
-                badges.append(("UTL", util_str, self._get_pct_colors(gpu_util, enabled, base_hue="cyan"), None))
+                badges.append(("UTL", util_str, self._get_pct_colors(gpu_util, enabled, base_hue="cyan"), None, False, None))
             if show_mem:
                 mem_str = self._format_mem_short(enabled)
-                badges.append(("MEM", mem_str, self._get_pct_colors(mem_pct, enabled, base_hue="purple"), None))
+                badges.append(("MEM", mem_str, self._get_pct_colors(mem_pct, enabled, base_hue="purple"), None, False, None))
 
         n = len(badges)
         pad_y = 1.0
@@ -1011,8 +1068,20 @@ class TempMonitorWidget(Gtk.EventBox):
         bw = (w - gap * (n - 1) - 2.0) / float(n)
 
         cur_x = 1.0
-        for title, val_str, colors, sbars in badges:
-            self._draw_generic_badge(ctx, cur_x, pad_y, bw, bh, title, val_str, colors, side_bars=sbars)
+        for title, val_str, colors, sbars, hide_t, c_style in badges:
+            self._draw_generic_badge(
+                ctx,
+                cur_x,
+                pad_y,
+                bw,
+                bh,
+                title,
+                val_str,
+                colors,
+                side_bars=sbars,
+                hide_title=hide_t,
+                custom_style=c_style,
+            )
             cur_x += bw + gap
 
     def _draw_mini_chip_icon(self, ctx, x, y, size, label_char, border_rgb, bg_rgb):
@@ -1649,8 +1718,64 @@ class TempMonitorWidget(Gtk.EventBox):
         c_grid.attach(preset_box, 2, 1, 2, 1)
         outer.pack_start(c_grid, False, False, 0)
 
+        chk_custom_badge = Gtk.CheckButton(
+            label="分別自訂 CPU 與 GPU 方塊的底色、框線色與底色透明度（取消勾選則隨溫度變色）"
+        )
+        chk_custom_badge.set_active(self.config.get("custom_badge_style", True))
+        outer.pack_start(chk_custom_badge, False, False, 0)
+
+        cg_grid = Gtk.Grid(column_spacing=8, row_spacing=6)
+        cg_grid.set_margin_start(14)
+
+        def make_color_btn(cfg_key, default_hex):
+            btn = Gtk.ColorButton()
+            r = Gdk.RGBA()
+            if not r.parse(self.config.get(cfg_key, default_hex)):
+                r.parse(default_hex)
+            btn.set_rgba(r)
+            return btn
+
+        cpu_bg_btn = make_color_btn("cpu_bg_color", "#113a2b")
+        cpu_bd_btn = make_color_btn("cpu_border_color", "#34d399")
+        cpu_op_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 100.0, 2.0)
+        cpu_op_scale.set_digits(0)
+        cpu_op_scale.set_draw_value(False)
+        cpu_op_scale.set_size_request(110, -1)
+        cpu_op_init = max(0, min(100, int(self.config.get("cpu_bg_opacity", 92))))
+        cpu_op_scale.set_value(float(cpu_op_init))
+        lbl_cpu_op = Gtk.Label(label=f"{cpu_op_init}%")
+        lbl_cpu_op.set_width_chars(4)
+
+        gpu_bg_btn = make_color_btn("gpu_bg_color", "#162944")
+        gpu_bd_btn = make_color_btn("gpu_border_color", "#38bdf8")
+        gpu_op_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 100.0, 2.0)
+        gpu_op_scale.set_digits(0)
+        gpu_op_scale.set_draw_value(False)
+        gpu_op_scale.set_size_request(110, -1)
+        gpu_op_init = max(0, min(100, int(self.config.get("gpu_bg_opacity", 92))))
+        gpu_op_scale.set_value(float(gpu_op_init))
+        lbl_gpu_op = Gtk.Label(label=f"{gpu_op_init}%")
+        lbl_gpu_op.set_width_chars(4)
+
+        cg_grid.attach(Gtk.Label(label="CPU 底色：", xalign=0.0), 0, 0, 1, 1)
+        cg_grid.attach(cpu_bg_btn, 1, 0, 1, 1)
+        cg_grid.attach(Gtk.Label(label="框線：", xalign=0.0), 2, 0, 1, 1)
+        cg_grid.attach(cpu_bd_btn, 3, 0, 1, 1)
+        cg_grid.attach(Gtk.Label(label="透明度：", xalign=0.0), 4, 0, 1, 1)
+        cg_grid.attach(cpu_op_scale, 5, 0, 1, 1)
+        cg_grid.attach(lbl_cpu_op, 6, 0, 1, 1)
+
+        cg_grid.attach(Gtk.Label(label="GPU 底色：", xalign=0.0), 0, 1, 1, 1)
+        cg_grid.attach(gpu_bg_btn, 1, 1, 1, 1)
+        cg_grid.attach(Gtk.Label(label="框線：", xalign=0.0), 2, 1, 1, 1)
+        cg_grid.attach(gpu_bd_btn, 3, 1, 1, 1)
+        cg_grid.attach(Gtk.Label(label="透明度：", xalign=0.0), 4, 1, 1, 1)
+        cg_grid.attach(gpu_op_scale, 5, 1, 1, 1)
+        cg_grid.attach(lbl_gpu_op, 6, 1, 1, 1)
+        outer.pack_start(cg_grid, False, False, 0)
+
         bg_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        bg_lbl = Gtk.Label(label="方塊背景底色：", xalign=0.0)
+        bg_lbl = Gtk.Label(label="動態模式底色樣式：", xalign=0.0)
         rb_bg_dark = Gtk.RadioButton.new_with_label_from_widget(None, "深色底")
         rb_bg_light = Gtk.RadioButton.new_with_label_from_widget(rb_bg_dark, "淺色底")
         rb_bg_trans = Gtk.RadioButton.new_with_label_from_widget(rb_bg_dark, "完全透明 (無底色)")
@@ -1760,6 +1885,18 @@ class TempMonitorWidget(Gtk.EventBox):
             self.config["custom_font_color"] = rgba_to_hex(color_norm_btn.get_rgba())
             self.config["custom_warn_font_color"] = rgba_to_hex(color_warn_btn.get_rgba())
             self.config["custom_crit_font_color"] = rgba_to_hex(color_crit_btn.get_rgba())
+            self.config["custom_badge_style"] = chk_custom_badge.get_active()
+            self.config["cpu_bg_color"] = rgba_to_hex(cpu_bg_btn.get_rgba())
+            self.config["cpu_border_color"] = rgba_to_hex(cpu_bd_btn.get_rgba())
+            c_op = max(0, min(100, int(round(cpu_op_scale.get_value()))))
+            self.config["cpu_bg_opacity"] = c_op
+            lbl_cpu_op.set_text(f"{c_op}%")
+            self.config["gpu_bg_color"] = rgba_to_hex(gpu_bg_btn.get_rgba())
+            self.config["gpu_border_color"] = rgba_to_hex(gpu_bd_btn.get_rgba())
+            g_op = max(0, min(100, int(round(gpu_op_scale.get_value()))))
+            self.config["gpu_bg_opacity"] = g_op
+            lbl_gpu_op.set_text(f"{g_op}%")
+            cg_grid.set_sensitive(chk_custom_badge.get_active())
             if rb_bg_dark.get_active():
                 self.config["badge_bg_style"] = "dark"
             elif rb_bg_light.get_active():
@@ -1795,6 +1932,11 @@ class TempMonitorWidget(Gtk.EventBox):
 
         for c_btn in (color_norm_btn, color_warn_btn, color_crit_btn):
             c_btn.connect("color-set", on_color_picked)
+        for cg_btn in (cpu_bg_btn, cpu_bd_btn, gpu_bg_btn, gpu_bd_btn):
+            cg_btn.connect("color-set", lambda *_: (chk_custom_badge.set_active(True), apply_changes()))
+        for cg_sc in (cpu_op_scale, gpu_op_scale):
+            cg_sc.connect("value-changed", apply_changes)
+        cg_grid.set_sensitive(chk_custom_badge.get_active())
         btn_dark_theme.connect(
             "clicked", lambda *_: set_quick_theme("#ffffff", "#fbbf24", "#f87171")
         )
@@ -1814,6 +1956,7 @@ class TempMonitorWidget(Gtk.EventBox):
             rb_unit_gib,
             rb_font_dyn,
             rb_font_cus,
+            chk_custom_badge,
             rb_bg_dark,
             rb_bg_light,
             rb_bg_trans,
