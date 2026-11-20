@@ -554,7 +554,7 @@ class CustomCalendarBubbleWindow(Gtk.Window):
             b.add(lb)
             return b
 
-        # Top Tab Bar: [📅 天氣月曆]  [🛰️ 西太平洋衛星雲圖]          [✕]
+        # Top Tab Bar: [📅 天氣月曆]  [🛰️ 雲圖]  [✅ 待辦]          [✕]
         tab_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self._lbl_tab_cal = Gtk.Label()
         self._btn_tab_cal = Gtk.Button()
@@ -570,15 +570,27 @@ class CustomCalendarBubbleWindow(Gtk.Window):
         self._btn_tab_sat.add(self._lbl_tab_sat)
         self._btn_tab_sat.connect("clicked", lambda *_: self.switch_tab("satellite"))
 
+        self._lbl_tab_tw = None
+        self._btn_tab_tw = None
+        if TaskwarriorCalendarPane is not None:
+            self._lbl_tab_tw = Gtk.Label()
+            self._btn_tab_tw = Gtk.Button()
+            self._btn_tab_tw.set_relief(Gtk.ReliefStyle.NONE)
+            self._btn_tab_tw.set_can_focus(False)
+            self._btn_tab_tw.add(self._lbl_tab_tw)
+            self._btn_tab_tw.connect("clicked", lambda *_: self.switch_tab("tasks"))
+
         btn_close = _make_nav_btn("✕", "關閉氣泡框")
         btn_close.connect("clicked", lambda *_: self.dismiss())
 
         tab_bar.pack_start(self._btn_tab_cal, False, False, 0)
         tab_bar.pack_start(self._btn_tab_sat, False, False, 0)
+        if self._btn_tab_tw is not None:
+            tab_bar.pack_start(self._btn_tab_tw, False, False, 0)
         tab_bar.pack_end(btn_close, False, False, 0)
         root.pack_start(tab_bar, False, False, 0)
 
-        # Stack holding Page 1 (Compact Calendar) and Page 2 (Full Satellite Cloud Map)
+        # Stack holding Page 1 (Compact Calendar), Page 2 (Satellite), Page 3 (Taskwarrior)
         self.stack = Gtk.Stack()
         self.stack.set_homogeneous(False)
         self.stack.set_transition_type(Gtk.StackTransitionType.NONE)
@@ -613,6 +625,15 @@ class CustomCalendarBubbleWindow(Gtk.Window):
         self.sat_view = HimawariSatelliteView(self.parent_widget, canvas_size=(660, 380))
         self.stack.add_named(self.sat_view, "satellite")
 
+        # --- Page 3: Taskwarrior Calendar & Dialog Editor (Focus-free POPUP Scheme B) ---
+        self.tw_pane = None
+        if TaskwarriorCalendarPane is not None:
+            self.tw_pane = TaskwarriorCalendarPane(
+                font_size_cb=lambda: self.parent_widget.config.get("calendar_font_size", 11),
+                popup_mode=True,
+            )
+            self.stack.add_named(self.tw_pane, "tasks")
+
         root.pack_start(self.stack, True, True, 0)
         self.add(root)
         self._update_tab_labels()
@@ -620,12 +641,17 @@ class CustomCalendarBubbleWindow(Gtk.Window):
 
     def _update_tab_labels(self):
         fg = html.escape(self._fg_hex)
-        if self._active_tab == "calendar":
-            self._lbl_tab_cal.set_markup(f"<span foreground='{fg}'><b><u>📅 天氣月曆</u></b></span>")
-            self._lbl_tab_sat.set_markup(f"<span foreground='{fg}' alpha='65%'>🛰️ 西太平洋衛星雲圖</span>")
-        else:
-            self._lbl_tab_cal.set_markup(f"<span foreground='{fg}' alpha='65%'>📅 天氣月曆</span>")
-            self._lbl_tab_sat.set_markup(f"<span foreground='{fg}'><b><u>🛰️ 西太平洋衛星雲圖</u></b></span>")
+        tabs = [
+            ("calendar", self._lbl_tab_cal, "📅 天氣月曆"),
+            ("satellite", self._lbl_tab_sat, "🛰️ 雲圖"),
+        ]
+        if self._lbl_tab_tw is not None:
+            tabs.append(("tasks", self._lbl_tab_tw, "✅ 待辦月曆"))
+        for key, lbl, title in tabs:
+            if key == self._active_tab:
+                lbl.set_markup(f"<span foreground='{fg}'><b><u>{title}</u></b></span>")
+            else:
+                lbl.set_markup(f"<span foreground='{fg}' alpha='65%'>{title}</span>")
 
     def reposition(self, target_w, target_h):
         mon_l, mon_t, mon_r, mon_b = self._mon_bounds
@@ -669,10 +695,19 @@ class CustomCalendarBubbleWindow(Gtk.Window):
         self._update_tab_labels()
         if name == "satellite":
             self._cancel_timer()
+            if self.tw_pane is not None:
+                self.tw_pane.deactivate()
             self.reposition(690, 475)
             self.sat_view.activate()
+        elif name == "tasks" and self.tw_pane is not None:
+            self._cancel_timer()
+            self.sat_view.deactivate()
+            self.reposition(790, 475)
+            self.tw_pane.activate()
         else:
             self.sat_view.deactivate()
+            if self.tw_pane is not None:
+                self.tw_pane.deactivate()
             self.reposition(472, 396)
             if self._timeout_sec > 0 and not self._hovered:
                 self.start_timer(self._timeout_sec)
@@ -761,6 +796,8 @@ class CustomCalendarBubbleWindow(Gtk.Window):
         self._cancel_timer()
         if hasattr(self, "sat_view") and self.sat_view is not None:
             self.sat_view.deactivate()
+        if hasattr(self, "tw_pane") and self.tw_pane is not None:
+            self.tw_pane.deactivate()
         if self._on_close_cb is not None:
             cb = self._on_close_cb
             self._on_close_cb = None

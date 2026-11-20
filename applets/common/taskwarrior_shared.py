@@ -256,7 +256,7 @@ class TaskwarriorCalendarPane(Gtk.Box):
 
     WEEKDAYS_ZH = ["一", "二", "三", "四", "五", "六", "日"]
 
-    def __init__(self, font_size_cb=None):
+    def __init__(self, font_size_cb=None, popup_mode=False):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.set_margin_top(8)
         self.set_margin_bottom(6)
@@ -264,6 +264,7 @@ class TaskwarriorCalendarPane(Gtk.Box):
         self.set_margin_end(8)
 
         self._font_size_cb = font_size_cb
+        self._popup_mode = bool(popup_mode)
         today = date.today()
         self.view_year = today.year
         self.view_month = today.month
@@ -331,18 +332,25 @@ class TaskwarriorCalendarPane(Gtk.Box):
         self.day_hdr_lbl = Gtk.Label(xalign=0.0)
         right_vbox.pack_start(self.day_hdr_lbl, False, False, 0)
 
-        # Quick add bar (automatically binds due date to selected_date)
-        add_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        self.entry_quick_add = Gtk.Entry()
-        self.entry_quick_add.set_hexpand(True)
-        self.entry_quick_add.set_placeholder_text("新增此日任務 (Enter)...")
-        self.entry_quick_add.connect("activate", self._on_quick_add)
-        btn_add = Gtk.Button(label="＋")
-        btn_add.set_tooltip_text("新增任務至所選日期")
-        btn_add.connect("clicked", self._on_quick_add)
-        add_row.pack_start(self.entry_quick_add, True, True, 0)
-        add_row.pack_start(btn_add, False, False, 0)
-        right_vbox.pack_start(add_row, False, False, 0)
+        # Quick add bar (inline Entry in normal window; focus-safe Dialog button in POPUP bubble)
+        if self._popup_mode:
+            self.entry_quick_add = None
+            btn_add_dlg = Gtk.Button(label="＋ 新增此日任務...")
+            btn_add_dlg.set_tooltip_text("開啟新增任務對話框（自動帶入所選日期）")
+            btn_add_dlg.connect("clicked", self._open_add_dialog)
+            right_vbox.pack_start(btn_add_dlg, False, False, 0)
+        else:
+            add_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            self.entry_quick_add = Gtk.Entry()
+            self.entry_quick_add.set_hexpand(True)
+            self.entry_quick_add.set_placeholder_text("新增此日任務 (Enter)...")
+            self.entry_quick_add.connect("activate", self._on_quick_add)
+            btn_add = Gtk.Button(label="＋")
+            btn_add.set_tooltip_text("新增任務至所選日期")
+            btn_add.connect("clicked", self._on_quick_add)
+            add_row.pack_start(self.entry_quick_add, True, True, 0)
+            add_row.pack_start(btn_add, False, False, 0)
+            right_vbox.pack_start(add_row, False, False, 0)
 
         right_scroll = Gtk.ScrolledWindow()
         right_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -735,13 +743,89 @@ class TaskwarriorCalendarPane(Gtk.Box):
         return row
 
     def _on_quick_add(self, *_args):
+        if self.entry_quick_add is None or not TaskwarriorBackend.is_available():
+            return
         text = self.entry_quick_add.get_text().strip()
-        if not text or not TaskwarriorBackend.is_available():
+        if not text:
             return
         due_str = self.selected_date.strftime("%Y-%m-%d")
         TaskwarriorBackend.add_task_structured(description=text, due=due_str)
         self.entry_quick_add.set_text("")
         self.reload_tasks()
+
+    def _make_task_dialog(self, title):
+        toplevel = self.get_toplevel()
+        # Do NOT parent modal dialogs to an override-redirect POPUP window so WM grants keyboard focus cleanly
+        parent = (
+            toplevel
+            if (isinstance(toplevel, Gtk.Window) and not self._popup_mode)
+            else None
+        )
+        flags = Gtk.DialogFlags.MODAL
+        if parent is not None:
+            flags |= Gtk.DialogFlags.DESTROY_WITH_PARENT
+        dlg = Gtk.Dialog(title=title, transient_for=parent, flags=flags)
+        if parent is None:
+            dlg.set_position(Gtk.WindowPosition.CENTER)
+            dlg.set_keep_above(True)
+        dlg.add_button("取消", Gtk.ResponseType.CANCEL)
+        dlg.add_button("儲存", Gtk.ResponseType.OK)
+        dlg.set_default_response(Gtk.ResponseType.OK)
+        return dlg
+
+    def _open_add_dialog(self, *_args):
+        if not TaskwarriorBackend.is_available():
+            return
+        dlg = self._make_task_dialog("新增 Taskwarrior 任務")
+        area = dlg.get_content_area()
+        area.set_spacing(8)
+        area.set_margin_top(10)
+        area.set_margin_bottom(10)
+        area.set_margin_start(14)
+        area.set_margin_end(14)
+
+        grid = Gtk.Grid(column_spacing=10, row_spacing=8)
+        e_desc = Gtk.Entry()
+        e_desc.set_hexpand(True)
+        e_desc.set_width_chars(32)
+        e_desc.set_placeholder_text("輸入任務標題...")
+        e_desc.set_activates_default(True)
+
+        e_proj = Gtk.Entry()
+        c_pri = Gtk.ComboBoxText()
+        for pid, plbl in (("", "無"), ("H", "高 (H)"), ("M", "中 (M)"), ("L", "低 (L)")):
+            c_pri.append(pid, plbl)
+        c_pri.set_active_id("")
+
+        e_tags = Gtk.Entry()
+        e_tags.set_placeholder_text("空白分隔，如 work urgent")
+
+        e_due = Gtk.Entry()
+        e_due.set_text(self.selected_date.strftime("%Y-%m-%d"))
+        e_due.set_placeholder_text("YYYY-MM-DD（留空不設到期日）")
+
+        for ri, (lbl_txt, w_ctrl) in enumerate(
+            [("任務標題：", e_desc), ("專案：", e_proj), ("優先級：", c_pri), ("標籤：", e_tags), ("到期日：", e_due)]
+        ):
+            grid.attach(Gtk.Label(label=lbl_txt, xalign=0.0), 0, ri, 1, 1)
+            grid.attach(w_ctrl, 1, ri, 1, 1)
+
+        area.pack_start(grid, True, True, 0)
+        dlg.show_all()
+        e_desc.grab_focus()
+        if dlg.run() == Gtk.ResponseType.OK:
+            desc = e_desc.get_text().strip()
+            if desc:
+                tags = [t.strip().lstrip("+") for t in e_tags.get_text().replace(",", " ").split() if t.strip()]
+                TaskwarriorBackend.add_task_structured(
+                    description=desc,
+                    project=e_proj.get_text().strip(),
+                    priority=c_pri.get_active_id() or "",
+                    tags=tags,
+                    due=e_due.get_text().strip(),
+                )
+                self.reload_tasks()
+        dlg.destroy()
 
     def _on_undo(self, *_args):
         if TaskwarriorBackend.is_available():
@@ -749,16 +833,7 @@ class TaskwarriorCalendarPane(Gtk.Box):
             self.reload_tasks()
 
     def _open_edit_dialog(self, task):
-        toplevel = self.get_toplevel()
-        parent = toplevel if isinstance(toplevel, Gtk.Window) else None
-        dlg = Gtk.Dialog(
-            title="編輯 Taskwarrior 任務",
-            transient_for=parent,
-            flags=Gtk.DialogFlags.MODAL | Gtk.DialogFlags.DESTROY_WITH_PARENT,
-        )
-        dlg.add_button("取消", Gtk.ResponseType.CANCEL)
-        dlg.add_button("儲存", Gtk.ResponseType.OK)
-        dlg.set_default_response(Gtk.ResponseType.OK)
+        dlg = self._make_task_dialog("編輯 Taskwarrior 任務")
 
         area = dlg.get_content_area()
         area.set_spacing(8)
