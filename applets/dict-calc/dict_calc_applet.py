@@ -339,18 +339,10 @@ class CustomBubbleWindow(Gtk.Window):
 
         r, g, b = self._bg_rgb
         alpha = self._bg_alpha
-        draw_rounded_rect(ctx, 1.0, 1.0, max(2.0, w - 2.0), max(2.0, h - 2.0), 10.0)
         if alpha > 0.0:
+            draw_rounded_rect(ctx, 0.0, 0.0, max(2.0, w), max(2.0, h), 10.0)
             ctx.set_source_rgba(r, g, b, alpha)
-            ctx.fill_preserve()
-
-        # Subtle high-contrast border
-        if rgb_luminance(self._bg_rgb) > 0.55:
-            ctx.set_source_rgba(0.22, 0.48, 0.80, max(0.45, min(0.90, alpha + 0.18)))
-        else:
-            ctx.set_source_rgba(0.28, 0.72, 0.98, max(0.45, min(0.90, alpha + 0.18)))
-        ctx.set_line_width(1.25)
-        ctx.stroke()
+            ctx.fill()
         ctx.restore()
         return False
 
