@@ -40,7 +40,7 @@ import threading
 import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, GLib, GObject, Gtk
+from gi.repository import Gdk, Gio, GLib, GObject, Gtk
 import cairo
 
 try:
@@ -82,11 +82,13 @@ DEFAULT_PREFERRED_DICTS = [
 ]
 
 DEFAULT_CONFIG = {
-    "display_mode": "badge",             # "badge" (精簡方塊圖示) or "panel_entry" (面板內嵌直接查詢框)
+    "display_mode": "panel_entry",       # "panel_entry" (純面板查詢輸入框，預設) or "badge" (精簡方塊圖示)
+    "result_output_mode": "window",      # "window" (無焦點精簡結果視窗), "dbus_popup" (系統 D-Bus 通知泡泡), "calc_dbus_dict_window" (混合模式)
+    "dbus_popup_timeout_sec": 8,         # D-Bus 通知泡泡停留秒數 (1..60)
     "panel_entry_width": 170,            # 面板內嵌查詢框寬度 (px)
     "scan_selection_enabled": False,     # 是否啟用滑鼠反白自動劃詞查詢 (Selection Primary)
     "scan_modifier": "ctrl",             # 劃詞觸發修飾鍵: "none", "ctrl", "alt", "shift"
-    "hotkey_open_window": "<Ctrl><Alt>d",# 呼叫查詢/計算視窗的全域快捷鍵
+    "hotkey_open_window": "<Ctrl><Alt>d",# 聚焦面板輸入框 / 呼叫查詢的全域快捷鍵
     "hotkey_scan_selection": "<Ctrl><Alt>s", # 立即查詢目前滑鼠反白文字 (Scan Selection) 的全域快捷鍵
     "calc_auto_copy": True,              # 數學計算模式預設自動將結果存入系統剪貼簿 (可直接 Ctrl+V)
     "active_dict_group": "custom",       # "custom" (已勾選常用), "en_zh", "ja_zh", "sci_en", "all"
@@ -97,6 +99,60 @@ DEFAULT_CONFIG = {
     "badge_bg_style": "dark",            # "dark", "light", "transparent"
     "text_shadow": False,                # 面板文字描邊陰影
 }
+
+
+class DBusNotifier:
+    """
+    Zero-subprocess system D-Bus notification sender (`org.freedesktop.Notifications`).
+    Tracks `replaces_id` so consecutive queries replace the same popup in-place without flooding.
+    """
+
+    def __init__(self):
+        self._proxy = None
+        self._last_id = 0
+
+    def _get_proxy(self):
+        if self._proxy is None:
+            try:
+                self._proxy = Gio.DBusProxy.new_for_bus_sync(
+                    Gio.BusType.SESSION,
+                    Gio.DBusProxyFlags.NONE,
+                    None,
+                    "org.freedesktop.Notifications",
+                    "/org/freedesktop/Notifications",
+                    "org.freedesktop.Notifications",
+                    None,
+                )
+            except Exception:
+                self._proxy = None
+        return self._proxy
+
+    def show(self, summary, body, icon="accessories-dictionary", timeout_sec=8):
+        proxy = self._get_proxy()
+        if proxy is None:
+            return False
+        timeout_ms = max(1000, int(timeout_sec) * 1000)
+        try:
+            args = GLib.Variant(
+                "(susssasa{sv}i)",
+                (
+                    "StarDict & Calc Plus",
+                    int(self._last_id),
+                    icon,
+                    str(summary),
+                    str(body),
+                    [],
+                    {},
+                    timeout_ms,
+                ),
+            )
+            res = proxy.call_sync("Notify", args, Gio.DBusCallFlags.NONE, 2000, None)
+            if res is not None:
+                self._last_id = int(res.unpack()[0])
+            return True
+        except Exception:
+            self._last_id = 0
+            return False
 
 
 # =============================================================================
@@ -491,21 +547,23 @@ def draw_rounded_rect(ctx, x, y, w, h, r):
 
 class DictCalcPopupWindow(Gtk.Window):
     """
-    Compact Dictionary & Scientific Calculator popup window.
-    - Supports instant math formula evaluation (auto-copied to system clipboard!)
-    - Displays multi-dictionary StarDict results strictly in the user's configured priority order
-    - Press Esc to hide immediately
+    Focus-free Compact Dictionary & Scientific Calculator Result Window.
+    - No inner search entry: all keyboard input stays locked in the MATE Panel search box!
+    - `set_accept_focus(False)` & `set_focus_on_map(False)` ensure showing results NEVER steals focus.
+    - Supports instant math formula results (auto-copied to system clipboard!) & ordered StarDict results.
     """
 
     def __init__(self, parent_widget):
-        super().__init__(title="📖 StarDict 離線詞典 & 🧮 科學計算機")
+        super().__init__(title="📖 StarDict 查詢結果")
         self.parent_widget = parent_widget
-        self.set_default_size(450, 440)
+        self.set_default_size(430, 400)
         self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_accept_focus(False)
+        self.set_focus_on_map(False)
+        self.set_skip_taskbar_hint(True)
+        self.set_keep_above(True)
         self.connect("delete-event", self._on_delete_hide)
-        self.connect("key-press-event", self._on_key_press)
 
-        self._query_seq = 0
         self._last_calc_result = None
         self._build_ui()
 
@@ -513,73 +571,63 @@ class DictCalcPopupWindow(Gtk.Window):
         self.hide()
         return True
 
-    def _on_key_press(self, _widget, event):
-        if event.keyval == Gdk.KEY_Escape:
-            self.hide()
-            return True
-        return False
-
     def _build_ui(self):
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        root.set_margin_top(10)
-        root.set_margin_bottom(10)
-        root.set_margin_start(12)
-        root.set_margin_end(12)
+        root.set_margin_top(8)
+        root.set_margin_bottom(8)
+        root.set_margin_start(10)
+        root.set_margin_end(10)
 
-        # Row 1: Search / Formula Entry + Compact Action Buttons
-        top_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
-
-        self.search_entry = Gtk.Entry()
-        self.search_entry.set_hexpand(True)
-        self.search_entry.set_placeholder_text("輸入單字查詞或數學公式 (如 2^10)...")
-        self.search_entry.connect("activate", self._on_search_activate)
-        self.search_entry.connect("changed", self._on_search_changed)
-        top_box.pack_start(self.search_entry, True, True, 0)
-
-        btn_go = Gtk.Button(label="🔎")
-        btn_go.set_tooltip_text("查詢 / 計算 (Enter)")
-        btn_go.connect("clicked", self._on_search_activate)
-        top_box.pack_start(btn_go, False, False, 0)
-
-        btn_clear = Gtk.Button(label="✖")
-        btn_clear.set_tooltip_text("清除輸入")
-        btn_clear.connect("clicked", self._on_clear)
-        top_box.pack_start(btn_clear, False, False, 0)
+        # Compact Header Bar (Query title + tiny action buttons; NO search entry!)
+        hdr_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        self.query_title_lbl = Gtk.Label(xalign=0.0)
+        self.query_title_lbl.set_ellipsize(3)  # Pango.EllipsizeMode.END
+        self.query_title_lbl.set_markup("<b>📖 StarDict &amp; 🧮 計算機結果</b>")
+        hdr_box.pack_start(self.query_title_lbl, True, True, 0)
 
         self.chk_scan = Gtk.ToggleButton(label="✂")
+        self.chk_scan.set_can_focus(False)
         self.chk_scan.set_tooltip_text("開關滑鼠反白自動劃詞查詢 (Scan Selection)")
         self.chk_scan.set_active(self.parent_widget.config.get("scan_selection_enabled", False))
         self.chk_scan.connect("toggled", self._on_scan_toggled)
-        top_box.pack_start(self.chk_scan, False, False, 0)
+        hdr_box.pack_start(self.chk_scan, False, False, 0)
 
         btn_prefs = Gtk.Button(label="⚙️")
-        btn_prefs.set_tooltip_text("偏好設定（詞典順位管理 / 字型大小 / 快捷鍵）")
+        btn_prefs.set_can_focus(False)
+        btn_prefs.set_tooltip_text("偏好設定（詞典順位 / 字型大小 / 顯示方式 / 快捷鍵）")
         btn_prefs.connect("clicked", lambda *_: self.parent_widget.show_preferences_dialog())
-        top_box.pack_start(btn_prefs, False, False, 0)
+        hdr_box.pack_start(btn_prefs, False, False, 0)
 
-        root.pack_start(top_box, False, False, 0)
+        btn_close = Gtk.Button(label="✖")
+        btn_close.set_can_focus(False)
+        btn_close.set_tooltip_text("隱藏結果視窗 (或於面板輸入框按 Esc)")
+        btn_close.connect("clicked", lambda *_: self.hide())
+        hdr_box.pack_start(btn_close, False, False, 0)
 
-        # Row 3: Highlighted Calculator Result Banner (auto-shown when formula detected)
+        root.pack_start(hdr_box, False, False, 0)
+
+        # Highlighted Calculator Result Banner (auto-shown when formula evaluated)
         self.calc_frame = Gtk.Frame()
         self.calc_frame.set_shadow_type(Gtk.ShadowType.ETCHED_IN)
         calc_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        calc_hbox.set_margin_top(8)
-        calc_hbox.set_margin_bottom(8)
-        calc_hbox.set_margin_start(12)
-        calc_hbox.set_margin_end(12)
+        calc_hbox.set_margin_top(6)
+        calc_hbox.set_margin_bottom(6)
+        calc_hbox.set_margin_start(10)
+        calc_hbox.set_margin_end(10)
 
         self.calc_result_lbl = Gtk.Label(xalign=0.0)
         self.calc_result_lbl.set_selectable(True)
         calc_hbox.pack_start(self.calc_result_lbl, True, True, 0)
 
-        self.btn_copy_calc = Gtk.Button(label="📋 複製答案")
+        self.btn_copy_calc = Gtk.Button(label="📋 複製")
+        self.btn_copy_calc.set_can_focus(False)
         self.btn_copy_calc.connect("clicked", self._on_copy_calc_clicked)
         calc_hbox.pack_end(self.btn_copy_calc, False, False, 0)
 
         self.calc_frame.add(calc_hbox)
         root.pack_start(self.calc_frame, False, False, 0)
 
-        # Row 4: Scrollable Dictionary Results TextView
+        # Scrollable Dictionary Results TextView
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         scroll.set_vexpand(True)
@@ -587,18 +635,19 @@ class DictCalcPopupWindow(Gtk.Window):
         self.result_view = Gtk.TextView()
         self.result_view.set_editable(False)
         self.result_view.set_cursor_visible(False)
+        self.result_view.set_can_focus(False)
         self.result_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self.result_view.set_left_margin(10)
-        self.result_view.set_right_margin(10)
-        self.result_view.set_top_margin(8)
-        self.result_view.set_bottom_margin(8)
+        self.result_view.set_left_margin(8)
+        self.result_view.set_right_margin(8)
+        self.result_view.set_top_margin(6)
+        self.result_view.set_bottom_margin(6)
         self.result_buf = self.result_view.get_buffer()
         self._init_text_tags()
 
         scroll.add(self.result_view)
         root.pack_start(scroll, True, True, 0)
 
-        # Row 5: Status Footer
+        # Status Footer
         self.status_lbl = Gtk.Label(xalign=0.0)
         self._update_status_footer()
         root.pack_start(self.status_lbl, False, False, 0)
@@ -647,7 +696,7 @@ class DictCalcPopupWindow(Gtk.Window):
         hk_scan = self.parent_widget.config.get("hotkey_scan_selection", "<Ctrl><Alt>s")
         n_en = len(self.parent_widget.config.get("enabled_dicts", DEFAULT_PREFERRED_DICTS))
         msg = extra_msg if extra_msg else (
-            f"已啟用 {n_en} 套詞典 | 視窗:{hk_open} | 劃詞:{hk_scan} | Esc 關閉"
+            f"已啟用 {n_en} 套詞典 | 聚焦:{hk_open} | 劃詞:{hk_scan} | Esc 隱藏"
         )
         self.status_lbl.set_markup(f"<small><span foreground='#94a3b8'>{html.escape(msg)}</span></small>")
 
@@ -656,52 +705,15 @@ class DictCalcPopupWindow(Gtk.Window):
         self.update_font_size()
         self._update_status_footer()
 
-    def _on_clear(self, *_args):
-        self.search_entry.set_text("")
-        self.calc_frame.hide()
-        self.result_buf.set_text("")
-        self.search_entry.grab_focus()
-
     def _on_scan_toggled(self, chk):
         self.parent_widget.set_scan_selection_enabled(chk.get_active())
 
     def _on_copy_calc_clicked(self, *_args):
         if self._last_calc_result:
             self.parent_widget.copy_to_clipboard(self._last_calc_result)
-            self._update_status_footer(f"✅ 已將計算結果「{self._last_calc_result}」複製到系統剪貼簿 (可直接 Ctrl+V)")
+            self._update_status_footer(f"✅ 已將「{self._last_calc_result}」存入剪貼簿 (Ctrl+V 可直接貼上)")
 
-    def _on_search_changed(self, entry):
-        """Live math preview while typing mathematical formulas."""
-        txt = entry.get_text().strip()
-        if not txt:
-            self.calc_frame.hide()
-            return
-        is_math, res_str, err = self.parent_widget.calc.try_evaluate(txt, record_history=False)
-        if is_math and res_str is not None:
-            self._show_calc_banner(txt, res_str, auto_copied=False)
-        elif not is_math:
-            self.calc_frame.hide()
-
-    def _on_search_activate(self, *_args):
-        txt = self.search_entry.get_text().strip()
-        if txt:
-            self.run_query(txt, record_calc_history=True)
-
-    def _show_calc_banner(self, expr_str, res_str, auto_copied=False):
-        self._last_calc_result = res_str
-        copied_badge = (
-            "   <span foreground='#34d399'><small>✔ 已自動存入剪貼簿 (Ctrl+V 可直接貼上)</small></span>"
-            if auto_copied
-            else "   <span foreground='#94a3b8'><small>(按 Enter 計算並自動存入剪貼簿)</small></span>"
-        )
-        self.calc_result_lbl.set_markup(
-            f"🧮 <tt>{html.escape(expr_str)}</tt>  =  "
-            f"<span size='x-large' foreground='#34d399'><b>{html.escape(res_str)}</b></span>"
-            f"{copied_badge}"
-        )
-        self.calc_frame.show_all()
-
-    def present_with_query(self, text="", near_pointer=False):
+    def position_and_show(self, near_pointer=False):
         self.sync_controls()
         if near_pointer:
             display = Gdk.Display.get_default()
@@ -709,72 +721,60 @@ class DictCalcPopupWindow(Gtk.Window):
                 seat = display.get_default_seat()
                 if seat is not None and seat.get_pointer() is not None:
                     _, px, py = seat.get_pointer().get_position()
-                    self.move(max(10, px - 120), max(36, py + 18))
+                    self.move(max(10, px - 100), max(36, py + 18))
         else:
-            self.set_position(Gtk.WindowPosition.CENTER)
+            # Position cleanly near the MATE Panel search box if realized
+            gdk_win = self.parent_widget.get_window()
+            if gdk_win is not None:
+                _, ox, oy = gdk_win.get_origin()
+                alloc = self.parent_widget.get_allocation()
+                screen_h = Gdk.Screen.get_default().get_height() if Gdk.Screen.get_default() else 1080
+                win_h = self.get_size()[1] or 400
+                if oy + alloc.height + win_h + 10 < screen_h:
+                    self.move(max(10, ox), oy + alloc.height + 4)
+                else:
+                    self.move(max(10, ox), max(10, oy - win_h - 4))
+            else:
+                self.set_position(Gtk.WindowPosition.CENTER)
 
         self.show_all()
         if not self._last_calc_result:
             self.calc_frame.hide()
-        self.present_with_time(Gdk.CURRENT_TIME)
 
-        if text:
-            self.search_entry.set_text(text)
-            self.search_entry.set_position(-1)
-            self.run_query(text, record_calc_history=True)
-        else:
-            self.search_entry.grab_focus()
-            self.search_entry.select_region(0, -1)
-
-    def run_query(self, raw_text, record_calc_history=True):
-        """Evaluate math expression (if applicable) and asynchronously query StarDict."""
-        q = raw_text.strip()
-        if not q:
-            return
-
-        # 1. Check Scientific Calculator first
-        is_math, res_str, err = self.parent_widget.calc.try_evaluate(
-            q, record_history=record_calc_history
-        )
-        if is_math:
-            if res_str is not None:
-                auto_copy = bool(self.parent_widget.config.get("calc_auto_copy", True))
-                if auto_copy:
-                    self.parent_widget.copy_to_clipboard(res_str)
-                self._show_calc_banner(q, res_str, auto_copied=auto_copy)
-                self._render_calc_history_view(q, res_str, auto_copy)
-                self._update_status_footer(
-                    f"🧮 計算完成：{q} = {res_str}" + ("（已自動存入剪貼簿，可直接 Ctrl+V）" if auto_copy else "")
-                )
-                return
-            else:
-                self.calc_result_lbl.set_markup(
-                    f"🧮 <span foreground='#f87171'>算式語法錯誤：{html.escape(err or '')}</span>"
-                )
-                self.calc_frame.show_all()
-                return
-
-        # 2. Dictionary Lookup via background thread (keeps GTK UI 100% responsive)
+    def show_loading(self, q, near_pointer=False):
+        self.query_title_lbl.set_markup(f"<b>📖 查詢：{html.escape(q)}</b>")
         self.calc_frame.hide()
         self._last_calc_result = None
-        self._query_seq += 1
-        seq = self._query_seq
-
         self.result_buf.set_text("")
         self.result_buf.insert_with_tags(
             self.result_buf.get_end_iter(), f"🔎 正在查詢「{q}」...", self.tag_muted
         )
+        self.position_and_show(near_pointer=near_pointer)
 
-        custom_list = self.parent_widget.config.get("enabled_dicts", DEFAULT_PREFERRED_DICTS)
-        dict_names = self.parent_widget.dict_mgr.get_ordered_enabled_dicts(custom_list)
+    def show_calc_result(self, expr_str, res_str, auto_copied, err=None, near_pointer=False):
+        self.query_title_lbl.set_markup(f"<b>🧮 計算：{html.escape(expr_str)}</b>")
+        if err is not None:
+            self._last_calc_result = None
+            self.calc_result_lbl.set_markup(
+                f"🧮 <span foreground='#f87171'>算式語法錯誤：{html.escape(err)}</span>"
+            )
+            self.calc_frame.show_all()
+            self.position_and_show(near_pointer=near_pointer)
+            return
 
-        def worker():
-            results = self.parent_widget.dict_mgr.query_sync(q, dict_names=dict_names)
-            GLib.idle_add(self._on_dict_results_ready, seq, q, results)
+        self._last_calc_result = res_str
+        copied_badge = (
+            "   <span foreground='#34d399'><small>✔ 已存入剪貼簿 (Ctrl+V)</small></span>"
+            if auto_copied
+            else ""
+        )
+        self.calc_result_lbl.set_markup(
+            f"🧮 <tt>{html.escape(expr_str)}</tt> = "
+            f"<span size='x-large' foreground='#34d399'><b>{html.escape(res_str)}</b></span>"
+            f"{copied_badge}"
+        )
+        self.calc_frame.show_all()
 
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _render_calc_history_view(self, expr_str, res_str, auto_copied):
         buf = self.result_buf
         buf.set_text("")
         buf.insert_with_tags(buf.get_end_iter(), "🧮 科學計算機模式\n", self.tag_dict_hdr)
@@ -784,22 +784,21 @@ class DictCalcPopupWindow(Gtk.Window):
             + ("狀態：✔ 已自動存入系統剪貼簿，可直接按 Ctrl+V 貼上\n\n" if auto_copied else "\n"),
             self.tag_body,
         )
-        buf.insert_with_tags(
-            buf.get_end_iter(),
-            "💡 支援語法：+ - * / // % ^ (次方) | ans (上筆答案) | pi, e | "
-            "sqrt(), cbrt(), sin(), cos(), tan(), log(), log10(), ln(), exp(), rad(), deg(), factorial(), hex(), bin()\n\n",
-            self.tag_muted,
-        )
         if self.parent_widget.calc.history:
             buf.insert_with_tags(buf.get_end_iter(), "📜 最近計算歷史紀錄：\n", self.tag_word)
             for h_expr, h_res in self.parent_widget.calc.history[:10]:
                 buf.insert_with_tags(
                     buf.get_end_iter(), f"  • {h_expr}  =  {h_res}\n", self.tag_body
                 )
+        self._update_status_footer(
+            f"🧮 {expr_str} = {res_str}" + ("（已自動複製）" if auto_copied else "")
+        )
+        self.position_and_show(near_pointer=near_pointer)
 
-    def _on_dict_results_ready(self, seq, query_word, results):
-        if seq != self._query_seq:
-            return False
+    def show_dict_results(self, query_word, results, near_pointer=False):
+        self.query_title_lbl.set_markup(f"<b>📖 查詢：{html.escape(query_word)}</b>")
+        self.calc_frame.hide()
+        self._last_calc_result = None
 
         buf = self.result_buf
         buf.set_text("")
@@ -814,7 +813,8 @@ class DictCalcPopupWindow(Gtk.Window):
                 self.tag_muted,
             )
             self._update_status_footer(f"查詢「{query_word}」：0 筆結果")
-            return False
+            self.position_and_show(near_pointer=near_pointer)
+            return
 
         for idx, item in enumerate(results):
             if idx > 0:
@@ -831,7 +831,7 @@ class DictCalcPopupWindow(Gtk.Window):
 
         self.result_view.scroll_to_iter(buf.get_start_iter(), 0.0, False, 0.0, 0.0)
         self._update_status_footer(f"查詢「{query_word}」：共找到 {len(results)} 筆詞典釋義")
-        return False
+        self.position_and_show(near_pointer=near_pointer)
 
 
 # =============================================================================
@@ -867,6 +867,7 @@ class DictCalcWidget(Gtk.EventBox):
         self.config = self._load_config()
         self.dict_mgr = StarDictManager()
         self.calc = SafeMathCalculator()
+        self.dbus_notifier = DBusNotifier()
 
         self.panel_size = 28
         self.popup_win = None
@@ -874,6 +875,7 @@ class DictCalcWidget(Gtk.EventBox):
         self.active_menu = None
         self._bound_hotkeys = []
         self._last_scanned_text = ""
+        self._query_seq = 0
 
         # Container supporting both 'badge' mode and 'panel_entry' inline search box mode
         self.root_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
@@ -989,10 +991,26 @@ class DictCalcWidget(Gtk.EventBox):
                 pass
 
     def _on_hotkey_open_window(self, _keystr):
-        GLib.idle_add(self.toggle_popup_window)
+        GLib.idle_add(self.focus_panel_search_box)
 
     def _on_hotkey_scan_selection(self, _keystr):
         GLib.idle_add(self.trigger_scan_selection_now)
+
+    def focus_panel_search_box(self, timestamp=None):
+        """Force keyboard focus directly into the MATE Panel search box so the cursor stays there."""
+        if self.config.get("display_mode", "panel_entry") != "panel_entry":
+            # Ensure inline entry is visible when focusing via hotkey
+            self.config["display_mode"] = "panel_entry"
+            self._save_config()
+            self._apply_panel_layout()
+        ts = timestamp if timestamp is not None else Gdk.CURRENT_TIME
+        if self.applet is not None:
+            try:
+                self.applet.request_focus(ts)
+            except Exception:
+                pass
+        self.panel_entry.grab_focus()
+        self.panel_entry.select_region(0, -1)
 
     # =========================================================================
     # Scan Selection (Mouse Highlight PRIMARY Clipboard Lookup)
@@ -1162,8 +1180,131 @@ class DictCalcWidget(Gtk.EventBox):
         txt = entry.get_text().strip()
         if not txt:
             return
-        self.open_popup_window(txt, near_pointer=False)
+        self.execute_query(txt, near_pointer=False, keep_panel_focus=True)
         entry.select_region(0, -1)
+
+    def execute_query(self, raw_text, near_pointer=False, keep_panel_focus=False):
+        """
+        Central query & calculator dispatcher.
+        Routes results to either:
+          - Focus-free Compact Result Window ('window')
+          - System D-Bus Notification Popup ('dbus_popup')
+          - Hybrid Mode: Calculator via D-Bus Popup, Dictionary via Window ('calc_dbus_dict_window')
+        Always keeps keyboard focus locked in the MATE Panel search box!
+        """
+        q = raw_text.strip()
+        if not q:
+            return
+
+        out_mode = self.config.get("result_output_mode", "window")
+        timeout_sec = int(self.config.get("dbus_popup_timeout_sec", 8))
+
+        # 1. Check Scientific Calculator first
+        is_math, res_str, err = self.calc.try_evaluate(q, record_history=True)
+        if is_math:
+            auto_copy = bool(self.config.get("calc_auto_copy", True))
+            if res_str is not None and auto_copy:
+                self.copy_to_clipboard(res_str)
+
+            use_dbus = out_mode in ("dbus_popup", "calc_dbus_dict_window")
+            if use_dbus:
+                if err is not None:
+                    self.dbus_notifier.show(
+                        f"🧮 算式錯誤：{q}",
+                        str(err),
+                        icon="dialog-error",
+                        timeout_sec=timeout_sec,
+                    )
+                else:
+                    body = f"{q} = {res_str}" + (
+                        "\n✔ 已自動存入系統剪貼簿 (Ctrl+V 可直接貼上)" if auto_copy else ""
+                    )
+                    self.dbus_notifier.show(
+                        f"🧮 計算結果：{res_str}",
+                        body,
+                        icon="accessories-calculator",
+                        timeout_sec=timeout_sec,
+                    )
+            else:
+                win = self._ensure_popup_window()
+                win.show_calc_result(q, res_str, auto_copy, err=err, near_pointer=near_pointer)
+
+            if keep_panel_focus:
+                GLib.idle_add(self._refocus_panel_entry)
+            return
+
+        # 2. StarDict Asynchronous Lookup
+        use_dbus_dict = out_mode == "dbus_popup"
+        self._query_seq += 1
+        seq = self._query_seq
+
+        if not use_dbus_dict:
+            win = self._ensure_popup_window()
+            win.show_loading(q, near_pointer=near_pointer)
+            if keep_panel_focus:
+                GLib.idle_add(self._refocus_panel_entry)
+
+        custom_list = self.config.get("enabled_dicts", DEFAULT_PREFERRED_DICTS)
+        dict_names = self.dict_mgr.get_ordered_enabled_dicts(custom_list)
+
+        def worker():
+            results = self.dict_mgr.query_sync(q, dict_names=dict_names)
+            GLib.idle_add(
+                self._on_query_dict_done,
+                seq,
+                q,
+                results,
+                near_pointer,
+                use_dbus_dict,
+                keep_panel_focus,
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _refocus_panel_entry(self):
+        if self.config.get("display_mode", "panel_entry") == "panel_entry":
+            self.panel_entry.grab_focus()
+        return False
+
+    def _on_query_dict_done(self, seq, query_word, results, near_pointer, use_dbus_dict, keep_panel_focus):
+        if seq != self._query_seq:
+            return False
+
+        if use_dbus_dict:
+            timeout_sec = int(self.config.get("dbus_popup_timeout_sec", 8))
+            if not results:
+                self.dbus_notifier.show(
+                    f"📖 查無詞條：{query_word}",
+                    "請檢查拼字，或在偏好設定的「詞典管理」勾選更多詞典。",
+                    icon="accessories-dictionary",
+                    timeout_sec=timeout_sec,
+                )
+            else:
+                # Format concise summary for D-Bus notification bubble (top 2 dictionaries, capped lines)
+                lines = []
+                for item in results[:2]:
+                    lines.append(f"【{item['dict']}】 {item['word']}")
+                    def_lines = [ln.strip() for ln in item["definition"].splitlines() if ln.strip()]
+                    lines.extend(def_lines[:6])
+                    lines.append("")
+                if len(results) > 2:
+                    lines.append(f"…（另有 {len(results) - 2} 套詞典命中）")
+                body = "\n".join(lines).strip()
+                if len(body) > 650:
+                    body = body[:647] + "…"
+                self.dbus_notifier.show(
+                    f"📖 {query_word}",
+                    body,
+                    icon="accessories-dictionary",
+                    timeout_sec=timeout_sec,
+                )
+        else:
+            win = self._ensure_popup_window()
+            win.show_dict_results(query_word, results, near_pointer=near_pointer)
+
+        if keep_panel_focus:
+            GLib.idle_add(self._refocus_panel_entry)
+        return False
 
     def _update_tooltip(self):
         scan_on = self.config.get("scan_selection_enabled", False)
@@ -1314,15 +1455,21 @@ class DictCalcWidget(Gtk.EventBox):
         return self.popup_win
 
     def toggle_popup_window(self, *_args):
+        if self.config.get("display_mode", "panel_entry") == "panel_entry":
+            self.focus_panel_search_box()
+            return
         win = self._ensure_popup_window()
         if win.is_visible():
             win.hide()
         else:
-            win.present_with_query("", near_pointer=False)
+            win.position_and_show(near_pointer=False)
 
     def open_popup_window(self, text="", near_pointer=False):
-        win = self._ensure_popup_window()
-        win.present_with_query(text, near_pointer=near_pointer)
+        if text:
+            self.panel_entry.set_text(text)
+            self.execute_query(text, near_pointer=near_pointer, keep_panel_focus=False)
+        else:
+            self.focus_panel_search_box()
 
     # =========================================================================
     # Preferences Window (Hotkeys + Scan Selection + Calculator + 41 Dicts)
@@ -1417,6 +1564,38 @@ class DictCalcWidget(Gtk.EventBox):
         )
         chk_auto_copy.set_active(self.config.get("calc_auto_copy", True))
         tab1.pack_start(chk_auto_copy, False, False, 0)
+
+        out_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        out_box.set_margin_start(14)
+        out_box.pack_start(Gtk.Label(label="查詢/計算結果顯示方式：", xalign=0.0), False, False, 0)
+        combo_out = Gtk.ComboBoxText()
+        for o_id, o_lbl in (
+            ("window", "無焦點精簡結果視窗 (可捲動看完整詞典，不搶面板游標)"),
+            ("dbus_popup", "系統 D-Bus 通知泡泡 (org.freedesktop.Notifications，不洗版)"),
+            ("calc_dbus_dict_window", "混合模式 (計算機用 D-Bus 泡泡秒出，查詞用無焦點視窗)"),
+        ):
+            combo_out.append(o_id, o_lbl)
+        combo_out.set_active_id(self.config.get("result_output_mode", "window"))
+        out_box.pack_start(combo_out, True, True, 0)
+        tab1.pack_start(out_box, False, False, 0)
+
+        dbus_t_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        dbus_t_box.set_margin_start(14)
+        dbus_t_box.pack_start(Gtk.Label(label="D-Bus 通知泡泡停留秒數：", xalign=0.0), False, False, 0)
+        spin_dbus_sec = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(
+                value=float(self.config.get("dbus_popup_timeout_sec", 8)),
+                lower=1.0,
+                upper=60.0,
+                step_increment=1.0,
+                page_increment=5.0,
+                page_size=0.0,
+            ),
+            climb_rate=1.0,
+            digits=0,
+        )
+        dbus_t_box.pack_start(spin_dbus_sec, False, False, 0)
+        tab1.pack_start(dbus_t_box, False, False, 0)
 
         tab1.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
@@ -1664,6 +1843,8 @@ class DictCalcWidget(Gtk.EventBox):
             self.config["scan_selection_enabled"] = chk_scan_en.get_active()
             self.config["scan_modifier"] = combo_mod.get_active_id() or "ctrl"
             self.config["calc_auto_copy"] = chk_auto_copy.get_active()
+            self.config["result_output_mode"] = combo_out.get_active_id() or "window"
+            self.config["dbus_popup_timeout_sec"] = int(spin_dbus_sec.get_value_as_int())
             self.config["display_mode"] = "badge" if rb_badge.get_active() else "panel_entry"
             self.config["panel_entry_width"] = int(spin_entry_w.get_value_as_int())
             self.config["result_font_size"] = int(spin_res_fs.get_value_as_int())
@@ -1685,6 +1866,7 @@ class DictCalcWidget(Gtk.EventBox):
 
         btn_apply_hk.connect("clicked", apply_tab1)
         combo_mod.connect("changed", apply_tab1)
+        combo_out.connect("changed", apply_tab1)
         col_btn.connect("color-set", lambda *_: (rb_col_cus.set_active(True), apply_tab1()))
         for w_c in (
             chk_scan_en,
@@ -1699,7 +1881,7 @@ class DictCalcWidget(Gtk.EventBox):
             chk_shadow,
         ):
             w_c.connect("toggled", apply_tab1)
-        for sp_c in (spin_entry_w, spin_res_fs):
+        for sp_c in (spin_dbus_sec, spin_entry_w, spin_res_fs):
             sp_c.connect("value-changed", apply_tab1)
 
         # Bottom Close Button
