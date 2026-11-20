@@ -53,6 +53,17 @@ Custom MATE Panel Applets collection and development repository for Linux deskto
 
 ---
 
+## 4. 月曆、時鐘與天氣預報 Plus (`ClockWeatherApplet`)
+
+取代 MATE Panel 內建時鐘、月曆與天氣的小程式（零外部套件依賴、精準每分鐘重繪 `0.0%` 閒置 CPU）：
+- **桌面主題天氣圖示 + 簡潔時鐘**：自動採用當前桌面 GTK Icon Theme 天氣圖示（晴天、多雲、陰天、霧氣、陣雨、雷雨、降雪等），顯示即時溫度、日期／星期與 `HH:MM`（不顯示秒數），並支援自訂底色、外框色、背景透明度、字色與描邊陰影。
+- **7 天互動天氣月曆 + 點擊詳細預測（Open-Meteo 免 API Key）**：
+  - 預設城市為 **台北**（偏好設定內建台灣主要城市快選與全球城市搜尋）。
+  - 左側 7×6 月曆於「今日起往後一週」的日期格內直接嵌入桌面主題天氣圖示、高低溫與降雨機率；點選任一天即於右側 0ms 切換詳細預報（即時氣溫／體感／PM2.5／AQI、日出日落與每 3 小時逐時氣溫與降雨機率條）。
+  - 底部可選顯示多時區世界時鐘。
+
+---
+
 ## 系統需求
 
 - MATE Desktop (`gir1.2-matepanelapplet-4.0`, `python3-gi`, `python3-gi-cairo`)
@@ -70,15 +81,18 @@ Custom MATE Panel Applets collection and development repository for Linux deskto
 ./install.sh test-dict
 ./install.sh test-task
 ./install.sh test-temp
+./install.sh test-clock
 
 # 2. 註冊並安裝至系統 MATE Panel (需 sudo)
-./install.sh install        # 安裝全部三款 Applets
+./install.sh install        # 安裝全部四款 Applets
+./install.sh install clock  # 僅安裝「月曆、時鐘與天氣預報 Plus」
 ./install.sh install dict   # 僅安裝「StarDict 離線詞典與計算機 Plus」
 ./install.sh install task   # 僅安裝「Taskwarrior 任務管理 Plus」
 ./install.sh install temp   # 僅安裝「CPU/GPU 溫度監控 Plus」
 
 # 3. 更新程式碼後重新載入 Applet（免 sudo，MATE Panel 會自動重啟）
-./install.sh reload         # 重載全部三款 Applets
+./install.sh reload         # 重載全部四款 Applets
+./install.sh reload clock   # 僅重載「月曆、時鐘與天氣預報 Plus」
 ./install.sh reload dict    # 僅重載「StarDict 離線詞典與計算機 Plus」
 ./install.sh reload temp    # 僅重載「CPU/GPU 溫度監控 Plus」
 ./install.sh reload task    # 僅重載「Taskwarrior 任務管理 Plus」

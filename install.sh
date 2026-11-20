@@ -24,18 +24,25 @@ DICT_EXEC="${DICT_DIR}/dict_calc_applet.py"
 DICT_APPLET_FILE="org.mate.panel.DictCalcApplet.mate-panel-applet"
 DICT_SERVICE_FILE="org.mate.panel.applet.DictCalcAppletFactory.service"
 
+# 4. Clock & Weather Calendar Applet definitions
+CLOCK_DIR="${REPO_DIR}/applets/clock-weather"
+CLOCK_EXEC="${CLOCK_DIR}/clock_weather_applet.py"
+CLOCK_APPLET_FILE="org.mate.panel.ClockWeatherApplet.mate-panel-applet"
+CLOCK_SERVICE_FILE="org.mate.panel.applet.ClockWeatherAppletFactory.service"
+
 usage() {
     cat <<EOF
-用法: $0 [install|uninstall|reload|test|test-temp|test-task|test-dict] [all|temp|task|dict]
+用法: $0 [install|uninstall|reload|test|test-temp|test-task|test-dict|test-clock] [all|temp|task|dict|clock]
 
 指令:
-  install [all|temp|task|dict]    將 Applet 註冊至系統 MATE Panel 與 D-Bus 並自動重載 (預設: all，需要 sudo)
-  uninstall [all|temp|task|dict]  從系統移除 Applet 註冊檔並停止舊行程 (預設: all，需要 sudo)
-  reload [all|temp|task|dict]     以 pkill -f 重新載入正在執行的 matepanel-applet-plus Applets (預設: all，免 sudo)
-  test [temp|task|dict]           啟動獨立 GTK 預覽視窗測試 Applet (不需 sudo)
-  test-temp                       啟動「CPU/GPU 溫度與負載監控 Plus」獨立預覽視窗
-  test-task                       啟動「Taskwarrior 任務管理與番茄鐘 Plus」獨立預覽視窗
-  test-dict                       啟動「StarDict 離線詞典與計算機 Plus」獨立預覽視窗
+  install [all|temp|task|dict|clock]    將 Applet 註冊至系統 MATE Panel 與 D-Bus 並自動重載 (預設: all，需要 sudo)
+  uninstall [all|temp|task|dict|clock]  從系統移除 Applet 註冊檔並停止舊行程 (預設: all，需要 sudo)
+  reload [all|temp|task|dict|clock]     以 pkill -f 重新載入正在執行的 matepanel-applet-plus Applets (預設: all，免 sudo)
+  test [temp|task|dict|clock]           啟動獨立 GTK 預覽視窗測試 Applet (不需 sudo)
+  test-temp                             啟動「CPU/GPU 溫度與負載監控 Plus」獨立預覽視窗
+  test-task                             啟動「Taskwarrior 任務管理與番茄鐘 Plus」獨立預覽視窗
+  test-dict                             啟動「StarDict 離線詞典與計算機 Plus」獨立預覽視窗
+  test-clock                            啟動「月曆、時鐘與天氣預報 Plus」獨立預覽視窗
 EOF
 }
 
@@ -98,11 +105,15 @@ case "${ACTION}" in
         if [[ "${TARGET}" == "all" || "${TARGET}" == "dict" ]]; then
             install_one "${DICT_DIR}" "${DICT_EXEC}" "${DICT_APPLET_FILE}" "${DICT_SERVICE_FILE}" "StarDict 離線詞典與計算機 Plus"
         fi
+        if [[ "${TARGET}" == "all" || "${TARGET}" == "clock" ]]; then
+            install_one "${CLOCK_DIR}" "${CLOCK_EXEC}" "${CLOCK_APPLET_FILE}" "${CLOCK_SERVICE_FILE}" "月曆、時鐘與天氣預報 Plus"
+        fi
         echo "✅ 安裝完成！"
         echo "👉 現在可以在 MATE 面板空白處按「右鍵」->「加入面板 (Add to Panel...)」，搜尋："
         echo "   • CPU/GPU 溫度監控 Plus"
         echo "   • Taskwarrior 任務管理 Plus"
         echo "   • StarDict 離線詞典與計算機 Plus"
+        echo "   • 月曆、時鐘與天氣預報 Plus"
         ;;
     uninstall)
         if [[ "${TARGET}" == "all" || "${TARGET}" == "temp" ]]; then
@@ -113,6 +124,9 @@ case "${ACTION}" in
         fi
         if [[ "${TARGET}" == "all" || "${TARGET}" == "dict" ]]; then
             uninstall_one "${DICT_EXEC}" "${DICT_APPLET_FILE}" "${DICT_SERVICE_FILE}" "StarDict 離線詞典與計算機 Plus"
+        fi
+        if [[ "${TARGET}" == "all" || "${TARGET}" == "clock" ]]; then
+            uninstall_one "${CLOCK_EXEC}" "${CLOCK_APPLET_FILE}" "${CLOCK_SERVICE_FILE}" "月曆、時鐘與天氣預報 Plus"
         fi
         echo "✅ 移除完成！"
         ;;
@@ -126,6 +140,9 @@ case "${ACTION}" in
         if [[ "${TARGET}" == "all" || "${TARGET}" == "dict" ]]; then
             reload_one "${DICT_EXEC}" "StarDict 離線詞典與計算機 Plus"
         fi
+        if [[ "${TARGET}" == "all" || "${TARGET}" == "clock" ]]; then
+            reload_one "${CLOCK_EXEC}" "月曆、時鐘與天氣預報 Plus"
+        fi
         echo "✅ 重載完成（MATE Panel 會自動重啟已加入面板的 Applets）！"
         ;;
     test)
@@ -133,6 +150,8 @@ case "${ACTION}" in
             exec /usr/bin/python3 "${TEMP_EXEC}" --window
         elif [[ "${TARGET}" == "dict" ]]; then
             exec /usr/bin/python3 "${DICT_EXEC}" --window
+        elif [[ "${TARGET}" == "clock" ]]; then
+            exec /usr/bin/python3 "${CLOCK_EXEC}" --window
         else
             exec /usr/bin/python3 "${TASK_EXEC}" --window
         fi
@@ -145,6 +164,9 @@ case "${ACTION}" in
         ;;
     test-dict)
         exec /usr/bin/python3 "${DICT_EXEC}" --window
+        ;;
+    test-clock)
+        exec /usr/bin/python3 "${CLOCK_EXEC}" --window
         ;;
     *)
         usage

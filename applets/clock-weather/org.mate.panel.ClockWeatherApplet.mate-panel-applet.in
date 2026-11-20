@@ -1,0 +1,13 @@
+[Applet Factory]
+Id=ClockWeatherAppletFactory
+InProcess=false
+Location=@APPLET_EXEC@
+Name=Clock & Weather Calendar Applet Factory
+Description=Factory for Clock, Weather Calendar and Forecast Applet
+
+[ClockWeatherApplet]
+Name=Clock & Weather Calendar Plus
+Name[zh_TW]=月曆、時鐘與天氣預報 Plus
+Description=Desktop-theme weather icon, clock, and interactive 7-day weather calendar powered by Open-Meteo
+Description[zh_TW]=採用桌面主題天氣圖示與 Open-Meteo 7 天天氣預報的整合時鐘與互動天氣月曆
+Icon=weather-few-clouds
