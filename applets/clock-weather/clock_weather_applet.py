@@ -404,17 +404,15 @@ class ClockWeatherPopupWindow(Gtk.Window):
         self.month_lbl = Gtk.Label(xalign=0.0)
         self.month_lbl.set_margin_start(6)
 
-        self.btn_refresh = Gtk.Button(label="🔄 更新天氣")
-        self.btn_refresh.connect("clicked", lambda *_: self.parent_widget.fetch_weather_async(force=True))
-        btn_prefs = Gtk.Button(label="⚙️ 設定")
-        btn_prefs.connect("clicked", lambda *_: self.parent_widget.show_preferences_dialog())
+        btn_close = Gtk.Button(label="✕ 關閉")
+        btn_close.set_tooltip_text("關閉天氣月曆視窗 (Esc)")
+        btn_close.connect("clicked", lambda *_: self.hide())
 
         nav.pack_start(btn_prev, False, False, 0)
         nav.pack_start(btn_today, False, False, 0)
         nav.pack_start(btn_next, False, False, 0)
         nav.pack_start(self.month_lbl, True, True, 0)
-        nav.pack_end(btn_prefs, False, False, 0)
-        nav.pack_end(self.btn_refresh, False, False, 0)
+        nav.pack_end(btn_close, False, False, 0)
         root.pack_start(nav, False, False, 0)
 
         # Main two-column split: Left = 7x6 Weather Calendar, Right = Selected Day Detailed Forecast
