@@ -101,10 +101,18 @@ DEFAULT_CONFIG = {
     "panel_entry_width": 170,            # 面板內嵌查詢框寬度 (px)
     "scan_selection_enabled": False,     # 是否啟用滑鼠反白自動劃詞查詢 (Selection Primary)
     "scan_modifier": "ctrl",             # 劃詞觸發修飾鍵: "none", "ctrl", "alt", "shift"
-    "google_translate_enabled": True,    # 句子/段落自動改用 Google 翻譯 (雙向翻譯)
-    "google_translate_fallback": True,   # 離線詞典查無短片語時自動 Fallback 至 Google 翻譯
+    "google_translate_enabled": True,    # 句子/段落自動使用線上/本機翻譯 (雙向翻譯)
+    "google_translate_fallback": True,   # 離線詞典查無短片語時自動 Fallback 至翻譯引擎
     "google_translate_target": "zh-TW",  # 外文翻譯目標語言 ("zh-TW", "zh-CN", "ja", "en")
     "google_translate_reverse": "en",    # 中文反向翻譯目標語言 ("en", "ja")
+    "translate_engine": "google",        # "google", "gemini", "openai_compat", "deepl"
+    "translate_fallback_google": True,   # 所選引擎超額或連線失敗時自動降級回 Google 翻譯
+    "gemini_api_key": "",                # Gemini API Free Tier Key (Google AI Studio)
+    "gemini_model": "gemini-2.5-flash-lite",
+    "openai_base_url": "https://api.groq.com/openai/v1",  # 支援 Groq / OpenRouter / 本機 Ollama
+    "openai_api_key": "",
+    "openai_model": "llama-3.3-70b-versatile",
+    "deepl_api_key": "",                 # DeepL API Free (:fx) 或 Pro Key
     "hotkey_open_window": "<Ctrl><Alt>d",# 聚焦面板輸入框 / 呼叫查詢的全域快捷鍵
     "hotkey_scan_selection": "<Ctrl><Alt>s", # 立即查詢目前滑鼠反白文字 (Scan Selection) 的全域快捷鍵
     "calc_auto_copy": True,              # 數學計算模式預設自動將結果存入系統剪貼簿 (可直接 Ctrl+V)
@@ -521,27 +529,27 @@ class GoogleTranslator:
     def lang_label(cls, code):
         return cls.LANG_LABELS.get(code, code)
 
-    def translate_sync(self, text, primary_tl="zh-TW", reverse_tl="en", timeout=6.0):
-        """
-        Translate `text` synchronously. Intended to be called from a background thread.
-        Returns: (translated_text, detected_src_lang, target_lang, error_msg)
-        """
-        tl = self.detect_target_lang(text, primary_tl=primary_tl, reverse_tl=reverse_tl)
-        cache_key = (text, tl)
-        with self._lock:
-            if cache_key in self._cache:
-                self._cache.move_to_end(cache_key)
-                tr_text, src_lang = self._cache[cache_key]
-                return tr_text, src_lang, tl, None
+    def _build_llm_prompt(self, target_lang):
+        tgt_name = self.lang_label(target_lang)
+        if target_lang == "zh-TW":
+            style = "自然流暢的台灣繁體中文，貼近母語語氣與慣用語，保留專有名詞與技術縮寫"
+        elif target_lang == "zh-CN":
+            style = "自然流畅的简体中文，保留专有名词与技术缩写"
+        else:
+            style = f"natural, idiomatic {tgt_name}, preserving proper nouns and technical terms"
+        return (
+            f"You are a professional translator. Translate the user's text into {style}. "
+            f"Output ONLY the translation itself, with no explanations, quotes, or extra commentary. "
+            f"Preserve original paragraph breaks."
+        )
 
+    def _translate_google(self, text, tl, timeout=6.0):
         headers = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
         }
         payload = urllib.parse.urlencode({"q": text}).encode("utf-8")
         last_err = None
-
-        # Try primary endpoint (clients5 dict-chrome-ex) first, then fallback to gtx
         endpoints = [
             ("chrome_ex", f"{self.PRIMARY_ENDPOINT}?client=dict-chrome-ex&sl=auto&tl={urllib.parse.quote(tl)}"),
             ("gtx", f"{self.FALLBACK_ENDPOINT}?client=gtx&sl=auto&tl={urllib.parse.quote(tl)}&dt=t"),
@@ -555,7 +563,6 @@ class GoogleTranslator:
                 translated = ""
                 src_lang = "auto"
                 if ep_kind == "chrome_ex":
-                    # Response format: [["translated text", "src_lang"]] or ["translated text"]
                     if isinstance(data, list) and data:
                         first = data[0]
                         if isinstance(first, list) and first:
@@ -571,25 +578,210 @@ class GoogleTranslator:
                     )
                     if isinstance(data, list) and len(data) > 2 and data[2]:
                         src_lang = str(data[2])
-
                 if translated.strip():
                     if src_lang == tl and any("\u4e00" <= ch <= "\u9fff" for ch in text):
                         src_lang = "zh"
-                    with self._lock:
-                        self._cache[cache_key] = (translated, src_lang)
-                        self._cache.move_to_end(cache_key)
-                        while len(self._cache) > self._cache_size:
-                            self._cache.popitem(last=False)
-                    return translated, src_lang, tl, None
+                    return translated.strip(), src_lang, None
                 last_err = "Google 翻譯未回傳譯文"
             except urllib.error.HTTPError as exc:
-                last_err = f"HTTP 錯誤 ({exc.code})，請稍後再試"
+                last_err = f"Google HTTP 錯誤 ({exc.code})"
             except urllib.error.URLError as exc:
-                last_err = f"網路連線失敗：{exc.reason}"
+                last_err = f"Google 網路連線失敗：{exc.reason}"
             except Exception as exc:
-                last_err = f"翻譯失敗：{exc}"
+                last_err = f"Google 翻譯失敗：{exc}"
+        return None, "auto", last_err or "Google 翻譯失敗"
 
-        return None, "auto", tl, last_err or "翻譯失敗"
+    def _translate_gemini(self, text, tl, api_key, model, timeout=10.0):
+        api_key = (api_key or "").strip()
+        if not api_key:
+            return None, "auto", "尚未設定 Gemini API Key"
+        model_id = (model or "gemini-2.5-flash-lite").strip()
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{urllib.parse.quote(model_id)}:generateContent?key={urllib.parse.quote(api_key)}"
+        )
+        body_obj = {
+            "system_instruction": {"parts": [{"text": self._build_llm_prompt(tl)}]},
+            "contents": [{"role": "user", "parts": [{"text": text}]}],
+            "generationConfig": {"temperature": 0.2},
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body_obj).encode("utf-8"),
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            cands = data.get("candidates") or []
+            if cands:
+                parts = cands[0].get("content", {}).get("parts") or []
+                translated = "".join(str(p.get("text", "")) for p in parts).strip()
+                if translated:
+                    src = "zh" if tl == "en" and any("\u4e00" <= c <= "\u9fff" for c in text) else "auto"
+                    return translated, src, None
+            return None, "auto", "Gemini 未回傳譯文"
+        except urllib.error.HTTPError as exc:
+            return None, "auto", f"Gemini HTTP 錯誤 ({exc.code})"
+        except urllib.error.URLError as exc:
+            return None, "auto", f"Gemini 連線失敗：{exc.reason}"
+        except Exception as exc:
+            return None, "auto", f"Gemini 錯誤：{exc}"
+
+    def _translate_openai_compat(self, text, tl, base_url, api_key, model, timeout=12.0):
+        base = (base_url or "https://api.groq.com/openai/v1").strip().rstrip("/")
+        if not base.endswith("/chat/completions"):
+            url = base + "/chat/completions"
+        else:
+            url = base
+        is_local = ("127.0.0.1" in base) or ("localhost" in base)
+        api_key = (api_key or "").strip()
+        if not api_key and not is_local:
+            return None, "auto", "尚未設定 OpenAI 相容 API Key"
+        model_id = (model or "llama-3.3-70b-versatile").strip()
+        body_obj = {
+            "model": model_id,
+            "temperature": 0.2,
+            "messages": [
+                {"role": "system", "content": self._build_llm_prompt(tl)},
+                {"role": "user", "content": text},
+            ],
+        }
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "User-Agent": "MatePanel-DictCalc/1.0",
+        }
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body_obj).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            choices = data.get("choices") or []
+            if choices:
+                translated = str(choices[0].get("message", {}).get("content", "")).strip()
+                # Strip accidental <think>...</think> reasoning blocks if a reasoning model is selected
+                translated = re.sub(r"<think>.*?</think>\s*", "", translated, flags=re.DOTALL).strip()
+                if translated:
+                    src = "zh" if tl == "en" and any("\u4e00" <= c <= "\u9fff" for c in text) else "auto"
+                    return translated, src, None
+            return None, "auto", "OpenAI 相容端點未回傳譯文"
+        except urllib.error.HTTPError as exc:
+            return None, "auto", f"LLM API HTTP 錯誤 ({exc.code})"
+        except urllib.error.URLError as exc:
+            return None, "auto", f"LLM API 連線失敗：{exc.reason}"
+        except Exception as exc:
+            return None, "auto", f"LLM API 錯誤：{exc}"
+
+    def _translate_deepl(self, text, tl, api_key, timeout=8.0):
+        api_key = (api_key or "").strip()
+        if not api_key:
+            return None, "auto", "尚未設定 DeepL API Key"
+        url = (
+            "https://api-free.deepl.com/v2/translate"
+            if api_key.endswith(":fx")
+            else "https://api.deepl.com/v2/translate"
+        )
+        tl_map = {"zh-TW": "ZH-HANT", "zh-CN": "ZH-HANS", "en": "EN-US", "ja": "JA"}
+        dl_tl = tl_map.get(tl, tl.upper())
+        req = urllib.request.Request(
+            url,
+            data=json.dumps({"text": [text], "target_lang": dl_tl}).encode("utf-8"),
+            headers={
+                "Authorization": f"DeepL-Auth-Key {api_key}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            trs = data.get("translations") or []
+            if trs:
+                translated = str(trs[0].get("text", "")).strip()
+                src = str(trs[0].get("detected_source_language", "auto")).lower()
+                if translated:
+                    return translated, src, None
+            return None, "auto", "DeepL 未回傳譯文"
+        except urllib.error.HTTPError as exc:
+            return None, "auto", f"DeepL HTTP 錯誤 ({exc.code})"
+        except urllib.error.URLError as exc:
+            return None, "auto", f"DeepL 連線失敗：{exc.reason}"
+        except Exception as exc:
+            return None, "auto", f"DeepL 錯誤：{exc}"
+
+    def translate_sync(self, text, primary_tl="zh-TW", reverse_tl="en", config=None, timeout=8.0):
+        """
+        Multi-engine synchronous translator (Google / Gemini / OpenAI-compat / DeepL)
+        with automatic fallback to Google Translate.
+        Returns: (translated_text, detected_src_lang, target_lang, engine_label, error_msg)
+        """
+        cfg = config or {}
+        engine = cfg.get("translate_engine", "google")
+        fallback_google = bool(cfg.get("translate_fallback_google", True))
+        tl = self.detect_target_lang(text, primary_tl=primary_tl, reverse_tl=reverse_tl)
+
+        model_tag = ""
+        if engine == "gemini":
+            model_tag = cfg.get("gemini_model", "gemini-2.5-flash-lite")
+        elif engine == "openai_compat":
+            model_tag = cfg.get("openai_model", "llama-3.3-70b-versatile")
+        cache_key = (engine, model_tag, text, tl)
+        with self._lock:
+            if cache_key in self._cache:
+                self._cache.move_to_end(cache_key)
+                tr_text, src_lang, eng_lbl = self._cache[cache_key]
+                return tr_text, src_lang, tl, eng_lbl, None
+
+        eng_lbl = "Google 翻譯"
+        if engine == "gemini":
+            eng_lbl = "Gemini"
+            tr_text, src_lang, err = self._translate_gemini(
+                text, tl, cfg.get("gemini_api_key", ""), cfg.get("gemini_model", "gemini-2.5-flash-lite"), timeout=max(timeout, 10.0)
+            )
+        elif engine == "openai_compat":
+            base_u = cfg.get("openai_base_url", "https://api.groq.com/openai/v1")
+            if "groq.com" in base_u:
+                eng_lbl = "Groq LLM"
+            elif "127.0.0.1" in base_u or "localhost" in base_u:
+                eng_lbl = "本機 Ollama"
+            elif "openrouter.ai" in base_u:
+                eng_lbl = "OpenRouter"
+            else:
+                eng_lbl = "OpenAI 相容"
+            tr_text, src_lang, err = self._translate_openai_compat(
+                text, tl, base_u, cfg.get("openai_api_key", ""), cfg.get("openai_model", "llama-3.3-70b-versatile"), timeout=max(timeout, 12.0)
+            )
+        elif engine == "deepl":
+            eng_lbl = "DeepL"
+            tr_text, src_lang, err = self._translate_deepl(
+                text, tl, cfg.get("deepl_api_key", ""), timeout=timeout
+            )
+        else:
+            tr_text, src_lang, err = self._translate_google(text, tl, timeout=timeout)
+
+        # Automatic fallback to Google Translate if primary engine fails
+        if (err is not None or not tr_text) and engine != "google" and fallback_google:
+            g_text, g_src, g_err = self._translate_google(text, tl, timeout=6.0)
+            if g_err is None and g_text:
+                tr_text, src_lang, err = g_text, g_src, None
+                eng_lbl = "Google 翻譯 (備援)"
+
+        if err is None and tr_text:
+            with self._lock:
+                self._cache[cache_key] = (tr_text, src_lang, eng_lbl)
+                self._cache.move_to_end(cache_key)
+                while len(self._cache) > self._cache_size:
+                    self._cache.popitem(last=False)
+            return tr_text, src_lang, tl, eng_lbl, None
+
+        return None, "auto", tl, eng_lbl, err or "翻譯失敗"
 
 
 # =============================================================================
@@ -1284,6 +1476,7 @@ class DictCalcPopupWindow(Gtk.Window):
         translated_text,
         src_lang,
         target_lang,
+        engine_label="Google 翻譯",
         err=None,
         is_fallback=False,
         near_pointer=False,
@@ -1291,7 +1484,7 @@ class DictCalcPopupWindow(Gtk.Window):
         short_q = original_text.replace("\n", " ")
         if len(short_q) > 26:
             short_q = short_q[:24] + "…"
-        self.query_title_lbl.set_markup(f"<b>🌐 Google 翻譯：{html.escape(short_q)}</b>")
+        self.query_title_lbl.set_markup(f"<b>🌐 {html.escape(engine_label)}：{html.escape(short_q)}</b>")
 
         buf = self.result_buf
         buf.set_text("")
@@ -1301,11 +1494,11 @@ class DictCalcPopupWindow(Gtk.Window):
             self.calc_frame.hide()
             buf.insert_with_tags(
                 buf.get_end_iter(),
-                f"⚠️ Google 翻譯失敗：{err or '無回傳內容'}\n\n",
+                f"⚠️ {engine_label} 失敗：{err or '無回傳內容'}\n\n",
                 self.tag_word,
             )
             buf.insert_with_tags(buf.get_end_iter(), f"原文：\n{original_text}\n", self.tag_muted)
-            self._update_status_footer("🌐 Google 翻譯失敗")
+            self._update_status_footer(f"🌐 {engine_label} 失敗")
             self.position_and_show(near_pointer=near_pointer)
             return
 
@@ -1315,7 +1508,7 @@ class DictCalcPopupWindow(Gtk.Window):
 
         self._last_calc_result = translated_text
         self.calc_result_lbl.set_markup(
-            f"🌐 <b>Google 翻譯</b>  <span foreground='#38bdf8'>{html.escape(src_lbl)} → {html.escape(tgt_lbl)}</span>"
+            f"🌐 <b>{html.escape(engine_label)}</b>  <span foreground='#38bdf8'>{html.escape(src_lbl)} → {html.escape(tgt_lbl)}</span>"
             f"<small><span foreground='#94a3b8'>{html.escape(fb_note)}</span></small>"
         )
         self.calc_frame.show_all()
@@ -1328,7 +1521,7 @@ class DictCalcPopupWindow(Gtk.Window):
 
         self.result_view.scroll_to_iter(buf.get_start_iter(), 0.0, False, 0.0, 0.0)
         self._update_status_footer(
-            f"🌐 Google 翻譯 ({src_lbl} → {tgt_lbl}) | 共 {len(original_text)} 字 | 點右上 📋 複製譯文"
+            f"🌐 {engine_label} ({src_lbl} → {tgt_lbl}) | 共 {len(original_text)} 字 | 點右上 📋 複製譯文"
         )
         self.position_and_show(near_pointer=near_pointer)
 
@@ -1995,7 +2188,7 @@ class DictCalcWidget(Gtk.EventBox):
         threading.Thread(target=worker, daemon=True).start()
 
     def _start_google_translate(self, seq, text, near_pointer, use_dbus_dict, keep_panel_focus, is_fallback=False):
-        """Run Google Translate asynchronously; follows user's result_output_mode (focus-free window or D-Bus bubble)."""
+        """Run selected translation engine asynchronously; follows user's result_output_mode."""
         use_dbus_tr = use_dbus_dict
 
         if not use_dbus_tr:
@@ -2006,10 +2199,11 @@ class DictCalcWidget(Gtk.EventBox):
 
         primary_tl = self.config.get("google_translate_target", "zh-TW")
         reverse_tl = self.config.get("google_translate_reverse", "en")
+        cfg_snapshot = dict(self.config)
 
         def tr_worker():
-            translated, src_lang, tgt_lang, err = self.translator.translate_sync(
-                text, primary_tl=primary_tl, reverse_tl=reverse_tl
+            translated, src_lang, tgt_lang, eng_lbl, err = self.translator.translate_sync(
+                text, primary_tl=primary_tl, reverse_tl=reverse_tl, config=cfg_snapshot
             )
             GLib.idle_add(
                 self._on_translate_done,
@@ -2018,6 +2212,7 @@ class DictCalcWidget(Gtk.EventBox):
                 translated,
                 src_lang,
                 tgt_lang,
+                eng_lbl,
                 err,
                 near_pointer,
                 use_dbus_tr,
@@ -2034,6 +2229,7 @@ class DictCalcWidget(Gtk.EventBox):
         translated_text,
         src_lang,
         target_lang,
+        engine_label,
         err,
         near_pointer,
         use_dbus_tr,
@@ -2047,7 +2243,7 @@ class DictCalcWidget(Gtk.EventBox):
             timeout_sec = int(self.config.get("dbus_popup_timeout_sec", 8))
             if err is not None or not translated_text:
                 self._notify_dbus(
-                    "🌐 Google 翻譯失敗",
+                    f"🌐 {engine_label} 失敗",
                     self._wrap_dbus_font(html.escape(str(err or "無回傳內容"))),
                     icon="dialog-error",
                     timeout_sec=timeout_sec,
@@ -2066,7 +2262,7 @@ class DictCalcWidget(Gtk.EventBox):
                     f"<b>{html.escape(tr_disp)}</b>\n<i>{html.escape(short_orig)}</i>"
                 )
                 self._notify_dbus(
-                    f"🌐 Google 翻譯 ({src_lbl} → {tgt_lbl}{fb_tag})",
+                    f"🌐 {engine_label} ({src_lbl} → {tgt_lbl}{fb_tag})",
                     body,
                     icon="accessories-dictionary",
                     timeout_sec=timeout_sec,
@@ -2078,6 +2274,7 @@ class DictCalcWidget(Gtk.EventBox):
                 translated_text,
                 src_lang,
                 target_lang,
+                engine_label=engine_label,
                 err=err,
                 is_fallback=is_fallback,
                 near_pointer=near_pointer,
@@ -2438,44 +2635,6 @@ class DictCalcWidget(Gtk.EventBox):
         chk_auto_copy.set_active(self.config.get("calc_auto_copy", True))
         tab1.pack_start(chk_auto_copy, False, False, 0)
 
-        chk_gt_en = Gtk.CheckButton(
-            label="🌐 句子 / 段落自動使用 Google 翻譯 (雙向翻譯，依上方顯示方式呈現)"
-        )
-        chk_gt_en.set_active(self.config.get("google_translate_enabled", True))
-        tab1.pack_start(chk_gt_en, False, False, 0)
-
-        chk_gt_fb = Gtk.CheckButton(
-            label="離線詞典查無單字 / 短片語時，自動 Fallback 至 Google 翻譯"
-        )
-        chk_gt_fb.set_margin_start(14)
-        chk_gt_fb.set_active(self.config.get("google_translate_fallback", True))
-        tab1.pack_start(chk_gt_fb, False, False, 0)
-
-        gt_lang_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        gt_lang_box.set_margin_start(14)
-        gt_lang_box.pack_start(Gtk.Label(label="外文翻譯目標：", xalign=0.0), False, False, 0)
-        combo_gt_tl = Gtk.ComboBoxText()
-        for l_id, l_lbl in (
-            ("zh-TW", "繁體中文 (zh-TW)"),
-            ("zh-CN", "簡體中文 (zh-CN)"),
-            ("ja", "日文 (ja)"),
-            ("en", "英文 (en)"),
-        ):
-            combo_gt_tl.append(l_id, l_lbl)
-        combo_gt_tl.set_active_id(self.config.get("google_translate_target", "zh-TW"))
-        gt_lang_box.pack_start(combo_gt_tl, True, True, 0)
-
-        gt_lang_box.pack_start(Gtk.Label(label="中文反向翻譯：", xalign=0.0), False, False, 0)
-        combo_gt_rev = Gtk.ComboBoxText()
-        for l_id, l_lbl in (
-            ("en", "英文 (en)"),
-            ("ja", "日文 (ja)"),
-        ):
-            combo_gt_rev.append(l_id, l_lbl)
-        combo_gt_rev.set_active_id(self.config.get("google_translate_reverse", "en"))
-        gt_lang_box.pack_start(combo_gt_rev, False, False, 0)
-        tab1.pack_start(gt_lang_box, False, False, 0)
-
         out_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         out_box.set_margin_start(14)
         out_box.pack_start(Gtk.Label(label="查詢/計算結果顯示方式：", xalign=0.0), False, False, 0)
@@ -2797,6 +2956,187 @@ class DictCalcWidget(Gtk.EventBox):
 
         notebook.append_page(tab_bubble, Gtk.Label(label="💬 氣泡框設定"))
 
+        # ---------------- Tab 3: Multi-Engine Translation Settings ----------------
+        tab_tr = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        tab_tr.set_margin_top(12)
+        tab_tr.set_margin_bottom(12)
+        tab_tr.set_margin_start(14)
+        tab_tr.set_margin_end(14)
+
+        tr_s1 = Gtk.Label(xalign=0.0)
+        tr_s1.set_markup("<b>1. 智慧分流與雙向翻譯設定</b>")
+        tab_tr.pack_start(tr_s1, False, False, 0)
+
+        chk_gt_en = Gtk.CheckButton(
+            label="🌐 句子 / 段落自動翻譯 (雙向翻譯，依「顯示方式」以氣泡框或視窗呈現)"
+        )
+        chk_gt_en.set_active(self.config.get("google_translate_enabled", True))
+        tab_tr.pack_start(chk_gt_en, False, False, 0)
+
+        chk_gt_fb = Gtk.CheckButton(
+            label="離線詞典查無單字 / 短片語時，自動 Fallback 至翻譯引擎"
+        )
+        chk_gt_fb.set_margin_start(14)
+        chk_gt_fb.set_active(self.config.get("google_translate_fallback", True))
+        tab_tr.pack_start(chk_gt_fb, False, False, 0)
+
+        gt_lang_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        gt_lang_box.set_margin_start(14)
+        gt_lang_box.pack_start(Gtk.Label(label="外文翻譯目標：", xalign=0.0), False, False, 0)
+        combo_gt_tl = Gtk.ComboBoxText()
+        for l_id, l_lbl in (
+            ("zh-TW", "繁體中文 (zh-TW)"),
+            ("zh-CN", "簡體中文 (zh-CN)"),
+            ("ja", "日文 (ja)"),
+            ("en", "英文 (en)"),
+        ):
+            combo_gt_tl.append(l_id, l_lbl)
+        combo_gt_tl.set_active_id(self.config.get("google_translate_target", "zh-TW"))
+        gt_lang_box.pack_start(combo_gt_tl, True, True, 0)
+
+        gt_lang_box.pack_start(Gtk.Label(label="中文反向翻譯：", xalign=0.0), False, False, 0)
+        combo_gt_rev = Gtk.ComboBoxText()
+        for l_id, l_lbl in (
+            ("en", "英文 (en)"),
+            ("ja", "日文 (ja)"),
+        ):
+            combo_gt_rev.append(l_id, l_lbl)
+        combo_gt_rev.set_active_id(self.config.get("google_translate_reverse", "en"))
+        gt_lang_box.pack_start(combo_gt_rev, False, False, 0)
+        tab_tr.pack_start(gt_lang_box, False, False, 0)
+
+        tab_tr.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+
+        tr_s2 = Gtk.Label(xalign=0.0)
+        tr_s2.set_markup("<b>2. 翻譯引擎選擇與自動備援</b>")
+        tab_tr.pack_start(tr_s2, False, False, 0)
+
+        eng_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        eng_box.set_margin_start(12)
+        eng_box.pack_start(Gtk.Label(label="主力翻譯引擎：", xalign=0.0), False, False, 0)
+        combo_tr_engine = Gtk.ComboBoxText()
+        for e_id, e_lbl in (
+            ("google", "Google 翻譯 (免 Key，預設)"),
+            ("gemini", "Gemini API Free (最通順、免綁卡，Google AI Studio)"),
+            ("openai_compat", "OpenAI 相容端點 (Groq 極速免費 / OpenRouter / 本機 Ollama)"),
+            ("deepl", "DeepL API Free / Pro (每月 50 萬字)"),
+        ):
+            combo_tr_engine.append(e_id, e_lbl)
+        combo_tr_engine.set_active_id(self.config.get("translate_engine", "google"))
+        eng_box.pack_start(combo_tr_engine, True, True, 0)
+        tab_tr.pack_start(eng_box, False, False, 0)
+
+        chk_tr_fb_google = Gtk.CheckButton(
+            label="所選引擎超額、未填 Key 或連線逾時時，自動降級備援回 Google 翻譯"
+        )
+        chk_tr_fb_google.set_margin_start(12)
+        chk_tr_fb_google.set_active(self.config.get("translate_fallback_google", True))
+        tab_tr.pack_start(chk_tr_fb_google, False, False, 0)
+
+        # Engine credential frames
+        chk_show_keys = Gtk.CheckButton(label="顯示 API Key 明文")
+        chk_show_keys.set_margin_start(12)
+        tab_tr.pack_start(chk_show_keys, False, False, 0)
+
+        # Gemini Frame
+        gem_frame = Gtk.Frame(label=" ✨ Gemini API (Google AI Studio 免費 Key) ")
+        gem_grid = Gtk.Grid(column_spacing=8, row_spacing=6)
+        gem_grid.set_margin_top(6)
+        gem_grid.set_margin_bottom(6)
+        gem_grid.set_margin_start(10)
+        gem_grid.set_margin_end(10)
+        entry_gem_key = Gtk.Entry()
+        entry_gem_key.set_visibility(False)
+        entry_gem_key.set_hexpand(True)
+        entry_gem_key.set_placeholder_text("AIza...")
+        entry_gem_key.set_text(self.config.get("gemini_api_key", ""))
+        entry_gem_model = Gtk.Entry()
+        entry_gem_model.set_hexpand(True)
+        entry_gem_model.set_text(self.config.get("gemini_model", "gemini-2.5-flash-lite"))
+        gem_grid.attach(Gtk.Label(label="API Key：", xalign=0.0), 0, 0, 1, 1)
+        gem_grid.attach(entry_gem_key, 1, 0, 1, 1)
+        gem_grid.attach(Gtk.Label(label="模型：", xalign=0.0), 0, 1, 1, 1)
+        gem_grid.attach(entry_gem_model, 1, 1, 1, 1)
+        gem_frame.add(gem_grid)
+        tab_tr.pack_start(gem_frame, False, False, 0)
+
+        # OpenAI-Compatible Frame (Groq / OpenRouter / Local Ollama)
+        oai_frame = Gtk.Frame(label=" ⚡ OpenAI 相容端點 (Groq / OpenRouter / 本機 Ollama) ")
+        oai_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        oai_vbox.set_margin_top(6)
+        oai_vbox.set_margin_bottom(6)
+        oai_vbox.set_margin_start(10)
+        oai_vbox.set_margin_end(10)
+
+        oai_preset_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        oai_preset_box.pack_start(Gtk.Label(label="快速套用：", xalign=0.0), False, False, 0)
+        btn_oai_groq = Gtk.Button(label="Groq 免費極速")
+        btn_oai_ollama = Gtk.Button(label="本機 Ollama (免 Key)")
+        btn_oai_or = Gtk.Button(label="OpenRouter")
+        oai_preset_box.pack_start(btn_oai_groq, False, False, 0)
+        oai_preset_box.pack_start(btn_oai_ollama, False, False, 0)
+        oai_preset_box.pack_start(btn_oai_or, False, False, 0)
+        oai_vbox.pack_start(oai_preset_box, False, False, 0)
+
+        oai_grid = Gtk.Grid(column_spacing=8, row_spacing=6)
+        entry_oai_url = Gtk.Entry()
+        entry_oai_url.set_hexpand(True)
+        entry_oai_url.set_text(self.config.get("openai_base_url", "https://api.groq.com/openai/v1"))
+        entry_oai_key = Gtk.Entry()
+        entry_oai_key.set_visibility(False)
+        entry_oai_key.set_hexpand(True)
+        entry_oai_key.set_placeholder_text("gsk_... (本機 Ollama 可留空)")
+        entry_oai_key.set_text(self.config.get("openai_api_key", ""))
+        entry_oai_model = Gtk.Entry()
+        entry_oai_model.set_hexpand(True)
+        entry_oai_model.set_text(self.config.get("openai_model", "llama-3.3-70b-versatile"))
+        oai_grid.attach(Gtk.Label(label="Base URL：", xalign=0.0), 0, 0, 1, 1)
+        oai_grid.attach(entry_oai_url, 1, 0, 1, 1)
+        oai_grid.attach(Gtk.Label(label="API Key：", xalign=0.0), 0, 1, 1, 1)
+        oai_grid.attach(entry_oai_key, 1, 1, 1, 1)
+        oai_grid.attach(Gtk.Label(label="模型：", xalign=0.0), 0, 2, 1, 1)
+        oai_grid.attach(entry_oai_model, 1, 2, 1, 1)
+        oai_vbox.pack_start(oai_grid, False, False, 0)
+        oai_frame.add(oai_vbox)
+        tab_tr.pack_start(oai_frame, False, False, 0)
+
+        # DeepL Frame
+        dl_frame = Gtk.Frame(label=" 📘 DeepL API (Free 結尾為 :fx，自動辨識端點) ")
+        dl_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        dl_box.set_margin_top(6)
+        dl_box.set_margin_bottom(6)
+        dl_box.set_margin_start(10)
+        dl_box.set_margin_end(10)
+        dl_box.pack_start(Gtk.Label(label="Auth Key：", xalign=0.0), False, False, 0)
+        entry_dl_key = Gtk.Entry()
+        entry_dl_key.set_visibility(False)
+        entry_dl_key.set_hexpand(True)
+        entry_dl_key.set_placeholder_text("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx:fx")
+        entry_dl_key.set_text(self.config.get("deepl_api_key", ""))
+        dl_box.pack_start(entry_dl_key, True, True, 0)
+        dl_frame.add(dl_box)
+        tab_tr.pack_start(dl_frame, False, False, 0)
+
+        # Live Translation Test Row
+        tr_test_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        entry_tr_test = Gtk.Entry()
+        entry_tr_test.set_hexpand(True)
+        entry_tr_test.set_text("Agreed, their 2.0 era releases in general are just that good.")
+        btn_tr_test = Gtk.Button(label="🔔 立即測試翻譯")
+        tr_test_box.pack_start(entry_tr_test, True, True, 0)
+        tr_test_box.pack_start(btn_tr_test, False, False, 0)
+        tab_tr.pack_start(tr_test_box, False, False, 0)
+
+        lbl_tr_test_out = Gtk.Label(xalign=0.0)
+        lbl_tr_test_out.set_line_wrap(True)
+        lbl_tr_test_out.set_markup("<small><span foreground='#94a3b8'>輸入金鑰後點「立即測試翻譯」即可驗證目前引擎與譯文流暢度。</span></small>")
+        tab_tr.pack_start(lbl_tr_test_out, False, False, 0)
+
+        tab_tr_scroll = Gtk.ScrolledWindow()
+        tab_tr_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        tab_tr_scroll.add(tab_tr)
+        notebook.append_page(tab_tr_scroll, Gtk.Label(label="🌐 翻譯引擎"))
+
         # ---------------- Tab 2: StarDict Dictionaries Manager (3 Independent Profiles) ----------------
         tab2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         tab2.set_margin_top(10)
@@ -3024,7 +3364,19 @@ class DictCalcWidget(Gtk.EventBox):
             self.config["google_translate_fallback"] = chk_gt_fb.get_active()
             self.config["google_translate_target"] = combo_gt_tl.get_active_id() or "zh-TW"
             self.config["google_translate_reverse"] = combo_gt_rev.get_active_id() or "en"
+            self.config["translate_engine"] = combo_tr_engine.get_active_id() or "google"
+            self.config["translate_fallback_google"] = chk_tr_fb_google.get_active()
+            self.config["gemini_api_key"] = entry_gem_key.get_text().strip()
+            self.config["gemini_model"] = entry_gem_model.get_text().strip() or "gemini-2.5-flash-lite"
+            self.config["openai_base_url"] = entry_oai_url.get_text().strip() or "https://api.groq.com/openai/v1"
+            self.config["openai_api_key"] = entry_oai_key.get_text().strip()
+            self.config["openai_model"] = entry_oai_model.get_text().strip() or "llama-3.3-70b-versatile"
+            self.config["deepl_api_key"] = entry_dl_key.get_text().strip()
             chk_gt_fb.set_sensitive(chk_gt_en.get_active())
+            cur_eng = self.config["translate_engine"]
+            gem_frame.set_sensitive(cur_eng == "gemini")
+            oai_frame.set_sensitive(cur_eng == "openai_compat")
+            dl_frame.set_sensitive(cur_eng == "deepl")
             self.config["result_output_mode"] = combo_out.get_active_id() or "window"
             self.config["dbus_popup_style"] = combo_dbus_style.get_active_id() or "separate"
             self.config["dbus_popup_max_dicts"] = int(spin_dbus_max.get_value_as_int())
@@ -3073,10 +3425,53 @@ class DictCalcWidget(Gtk.EventBox):
             scale_bubble_alpha.set_value(float(opacity_val))
             apply_tab1()
 
+        def apply_oai_preset(url_str, model_str):
+            combo_tr_engine.set_active_id("openai_compat")
+            entry_oai_url.set_text(url_str)
+            entry_oai_model.set_text(model_str)
+            apply_tab1()
+
+        def on_toggle_show_keys(chk):
+            vis = chk.get_active()
+            entry_gem_key.set_visibility(vis)
+            entry_oai_key.set_visibility(vis)
+            entry_dl_key.set_visibility(vis)
+
+        def on_test_translate_clicked(*_):
+            apply_tab1()
+            sample = entry_tr_test.get_text().strip() or "Hello world, how are you today?"
+            lbl_tr_test_out.set_markup("<small>⏳ 翻譯測試中...</small>")
+            btn_tr_test.set_sensitive(False)
+            cfg_snap = dict(self.config)
+            p_tl = cfg_snap.get("google_translate_target", "zh-TW")
+            r_tl = cfg_snap.get("google_translate_reverse", "en")
+
+            def _t_worker():
+                tr_txt, src_l, tgt_l, eng_l, err_m = self.translator.translate_sync(
+                    sample, primary_tl=p_tl, reverse_tl=r_tl, config=cfg_snap
+                )
+
+                def _done():
+                    btn_tr_test.set_sensitive(True)
+                    if err_m or not tr_txt:
+                        lbl_tr_test_out.set_markup(
+                            f"<small><span foreground='#f87171'>❌ [{html.escape(eng_l)}] {html.escape(str(err_m or '失敗'))}</span></small>"
+                        )
+                    else:
+                        lbl_tr_test_out.set_markup(
+                            f"<small><span foreground='#34d399'>✔ [{html.escape(eng_l)}]</span> {html.escape(tr_txt)}</small>"
+                        )
+                    return False
+
+                GLib.idle_add(_done)
+
+            threading.Thread(target=_t_worker, daemon=True).start()
+
         btn_apply_hk.connect("clicked", apply_tab1)
         combo_mod.connect("changed", apply_tab1)
         combo_gt_tl.connect("changed", apply_tab1)
         combo_gt_rev.connect("changed", apply_tab1)
+        combo_tr_engine.connect("changed", apply_tab1)
         combo_out.connect("changed", apply_tab1)
         combo_dbus_style.connect("changed", apply_tab1)
         combo_bubble_pos.connect("changed", apply_tab1)
@@ -3092,11 +3487,19 @@ class DictCalcWidget(Gtk.EventBox):
         btn_b_dark.connect("clicked", lambda *_: apply_bubble_preset("#182234", "#f0f6ff", 92))
         btn_b_light.connect("clicked", lambda *_: apply_bubble_preset("#f8fafc", "#111827", 95))
         btn_b_oled.connect("clicked", lambda *_: apply_bubble_preset("#0b0f17", "#ffffff", 82))
+        btn_oai_groq.connect("clicked", lambda *_: apply_oai_preset("https://api.groq.com/openai/v1", "llama-3.3-70b-versatile"))
+        btn_oai_ollama.connect("clicked", lambda *_: apply_oai_preset("http://127.0.0.1:11434/v1", "qwen2.5:7b"))
+        btn_oai_or.connect("clicked", lambda *_: apply_oai_preset("https://openrouter.ai/api/v1", "google/gemma-3-27b-it:free"))
+        chk_show_keys.connect("toggled", on_toggle_show_keys)
+        btn_tr_test.connect("clicked", on_test_translate_clicked)
+        for ent_tr in (entry_gem_key, entry_gem_model, entry_oai_url, entry_oai_key, entry_oai_model, entry_dl_key):
+            ent_tr.connect("changed", apply_tab1)
         for w_c in (
             chk_scan_en,
             chk_auto_copy,
             chk_gt_en,
             chk_gt_fb,
+            chk_tr_fb_google,
             rb_badge,
             rb_entry,
             rb_col_dyn,
@@ -3104,6 +3507,11 @@ class DictCalcWidget(Gtk.EventBox):
             chk_shadow,
         ):
             w_c.connect("toggled", apply_tab1)
+        # Initialize frame sensitivity to match active engine
+        cur_eng0 = self.config.get("translate_engine", "google")
+        gem_frame.set_sensitive(cur_eng0 == "gemini")
+        oai_frame.set_sensitive(cur_eng0 == "openai_compat")
+        dl_frame.set_sensitive(cur_eng0 == "deepl")
         for sp_c in (
             spin_dbus_max,
             spin_dbus_sec,
