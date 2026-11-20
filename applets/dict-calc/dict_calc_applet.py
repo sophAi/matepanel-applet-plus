@@ -108,7 +108,7 @@ DEFAULT_CONFIG = {
     "translate_engine": "google",        # "google", "gemini", "openai_compat", "deepl"
     "translate_fallback_google": True,   # 所選引擎超額或連線失敗時自動降級回 Google 翻譯
     "gemini_api_key": "",                # Gemini API Free Tier Key (Google AI Studio)
-    "gemini_model": "gemini-2.5-flash-lite",
+    "gemini_model": "gemini-3.1-flash-lite",
     "openai_base_url": "https://api.groq.com/openai/v1",  # 支援 Groq / OpenRouter / 本機 Ollama
     "openai_api_key": "",
     "openai_model": "llama-3.3-70b-versatile",
@@ -591,43 +591,65 @@ class GoogleTranslator:
                 last_err = f"Google 翻譯失敗：{exc}"
         return None, "auto", last_err or "Google 翻譯失敗"
 
-    def _translate_gemini(self, text, tl, api_key, model, timeout=10.0):
+    def _translate_gemini(self, text, tl, api_key, model, timeout=12.0):
         api_key = (api_key or "").strip()
         if not api_key:
             return None, "auto", "尚未設定 Gemini API Key"
-        model_id = (model or "gemini-2.5-flash-lite").strip()
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{urllib.parse.quote(model_id)}:generateContent?key={urllib.parse.quote(api_key)}"
-        )
-        body_obj = {
-            "system_instruction": {"parts": [{"text": self._build_llm_prompt(tl)}]},
-            "contents": [{"role": "user", "parts": [{"text": text}]}],
-            "generationConfig": {"temperature": 0.2},
-        }
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(body_obj).encode("utf-8"),
-            headers={"Content-Type": "application/json; charset=utf-8"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8", errors="replace"))
-            cands = data.get("candidates") or []
-            if cands:
-                parts = cands[0].get("content", {}).get("parts") or []
-                translated = "".join(str(p.get("text", "")) for p in parts).strip()
-                if translated:
-                    src = "zh" if tl == "en" and any("\u4e00" <= c <= "\u9fff" for c in text) else "auto"
-                    return translated, src, None
-            return None, "auto", "Gemini 未回傳譯文"
-        except urllib.error.HTTPError as exc:
-            return None, "auto", f"Gemini HTTP 錯誤 ({exc.code})"
-        except urllib.error.URLError as exc:
-            return None, "auto", f"Gemini 連線失敗：{exc.reason}"
-        except Exception as exc:
-            return None, "auto", f"Gemini 錯誤：{exc}"
+        primary_model = (model or "gemini-3.1-flash-lite").strip()
+        # If an older/retired model (e.g. gemini-2.5-flash-lite) returns 404, auto-retry with gemini-3.1-flash-lite
+        models_to_try = [primary_model]
+        if primary_model != "gemini-3.1-flash-lite":
+            models_to_try.append("gemini-3.1-flash-lite")
+
+        last_err = None
+        for model_id in models_to_try:
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{urllib.parse.quote(model_id)}:generateContent?key={urllib.parse.quote(api_key)}"
+            )
+            gen_cfg = {"temperature": 0.2}
+            if "flash" in model_id:
+                gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
+            body_obj = {
+                "system_instruction": {"parts": [{"text": self._build_llm_prompt(tl)}]},
+                "contents": [{"role": "user", "parts": [{"text": text}]}],
+                "generationConfig": gen_cfg,
+            }
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(body_obj).encode("utf-8"),
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                cands = data.get("candidates") or []
+                if cands:
+                    parts = cands[0].get("content", {}).get("parts") or []
+                    translated = "".join(str(p.get("text", "")) for p in parts).strip()
+                    if translated:
+                        src = "zh" if tl == "en" and any("\u4e00" <= c <= "\u9fff" for c in text) else "auto"
+                        return translated, src, None
+                last_err = "Gemini 未回傳譯文"
+            except urllib.error.HTTPError as exc:
+                detail = ""
+                try:
+                    err_j = json.loads(exc.read().decode("utf-8", errors="replace"))
+                    detail = str(err_j.get("error", {}).get("message", ""))[:120]
+                except Exception:
+                    pass
+                last_err = f"Gemini HTTP 錯誤 ({exc.code})" + (f": {detail}" if detail else "")
+                if exc.code == 404 and model_id != "gemini-3.1-flash-lite":
+                    continue
+                break
+            except urllib.error.URLError as exc:
+                last_err = f"Gemini 連線失敗：{exc.reason}"
+                break
+            except Exception as exc:
+                last_err = f"Gemini 錯誤：{exc}"
+                break
+        return None, "auto", last_err or "Gemini 翻譯失敗"
 
     def _translate_openai_compat(self, text, tl, base_url, api_key, model, timeout=12.0):
         base = (base_url or "https://api.groq.com/openai/v1").strip().rstrip("/")
@@ -729,7 +751,7 @@ class GoogleTranslator:
 
         model_tag = ""
         if engine == "gemini":
-            model_tag = cfg.get("gemini_model", "gemini-2.5-flash-lite")
+            model_tag = cfg.get("gemini_model", "gemini-3.1-flash-lite")
         elif engine == "openai_compat":
             model_tag = cfg.get("openai_model", "llama-3.3-70b-versatile")
         cache_key = (engine, model_tag, text, tl)
@@ -743,7 +765,7 @@ class GoogleTranslator:
         if engine == "gemini":
             eng_lbl = "Gemini"
             tr_text, src_lang, err = self._translate_gemini(
-                text, tl, cfg.get("gemini_api_key", ""), cfg.get("gemini_model", "gemini-2.5-flash-lite"), timeout=max(timeout, 10.0)
+                text, tl, cfg.get("gemini_api_key", ""), cfg.get("gemini_model", "gemini-3.1-flash-lite"), timeout=max(timeout, 12.0)
             )
         elif engine == "openai_compat":
             base_u = cfg.get("openai_base_url", "https://api.groq.com/openai/v1")
@@ -3052,7 +3074,7 @@ class DictCalcWidget(Gtk.EventBox):
         entry_gem_key.set_text(self.config.get("gemini_api_key", ""))
         entry_gem_model = Gtk.Entry()
         entry_gem_model.set_hexpand(True)
-        entry_gem_model.set_text(self.config.get("gemini_model", "gemini-2.5-flash-lite"))
+        entry_gem_model.set_text(self.config.get("gemini_model", "gemini-3.1-flash-lite"))
         gem_grid.attach(Gtk.Label(label="API Key：", xalign=0.0), 0, 0, 1, 1)
         gem_grid.attach(entry_gem_key, 1, 0, 1, 1)
         gem_grid.attach(Gtk.Label(label="模型：", xalign=0.0), 0, 1, 1, 1)
@@ -3367,7 +3389,7 @@ class DictCalcWidget(Gtk.EventBox):
             self.config["translate_engine"] = combo_tr_engine.get_active_id() or "google"
             self.config["translate_fallback_google"] = chk_tr_fb_google.get_active()
             self.config["gemini_api_key"] = entry_gem_key.get_text().strip()
-            self.config["gemini_model"] = entry_gem_model.get_text().strip() or "gemini-2.5-flash-lite"
+            self.config["gemini_model"] = entry_gem_model.get_text().strip() or "gemini-3.1-flash-lite"
             self.config["openai_base_url"] = entry_oai_url.get_text().strip() or "https://api.groq.com/openai/v1"
             self.config["openai_api_key"] = entry_oai_key.get_text().strip()
             self.config["openai_model"] = entry_oai_model.get_text().strip() or "llama-3.3-70b-versatile"
