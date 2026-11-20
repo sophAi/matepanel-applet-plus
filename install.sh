@@ -15,6 +15,8 @@ TEMP_SERVICE_FILE="org.mate.panel.applet.TempMonitorAppletFactory.service"
 # 2. Taskwarrior Applet definitions
 TASK_DIR="${REPO_DIR}/applets/taskwarrior"
 TASK_EXEC="${TASK_DIR}/taskwarrior_applet.py"
+TASK_DESKTOP_EXEC="${TASK_DIR}/taskwarrior_desktop_widget.py"
+TASK_DESKTOP_AUTOSTART="${HOME}/.config/autostart/taskwarrior-desktop-widget.desktop"
 TASK_APPLET_FILE="org.mate.panel.TaskwarriorApplet.mate-panel-applet"
 TASK_SERVICE_FILE="org.mate.panel.applet.TaskwarriorAppletFactory.service"
 
@@ -43,6 +45,9 @@ usage() {
   test-task                             啟動「Taskwarrior 任務管理與番茄鐘 Plus」獨立預覽視窗
   test-dict                             啟動「StarDict 離線詞典與計算機 Plus」獨立預覽視窗
   test-clock                            啟動「月曆、時鐘與天氣預報 Plus」獨立預覽視窗
+  install-desktop                       安裝並啟動「Taskwarrior 桌面嵌入式月曆」開機自啟 (免 sudo)
+  uninstall-desktop                     移除並停止「Taskwarrior 桌面嵌入式月曆」開機自啟 (免 sudo)
+  reload-desktop                        重新啟動「Taskwarrior 桌面嵌入式月曆」(免 sudo)
 EOF
 }
 
@@ -167,6 +172,33 @@ case "${ACTION}" in
         ;;
     test-clock)
         exec /usr/bin/python3 "${CLOCK_EXEC}" --window
+        ;;
+    install-desktop)
+        chmod +x "${TASK_DESKTOP_EXEC}"
+        mkdir -p "$(dirname "${TASK_DESKTOP_AUTOSTART}")"
+        cat > "${TASK_DESKTOP_AUTOSTART}" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Taskwarrior Desktop Calendar
+Comment=Interactive Taskwarrior monthly calendar embedded on MATE desktop
+Exec=/usr/bin/python3 ${TASK_DESKTOP_EXEC}
+Terminal=false
+X-MATE-Autostart-enabled=true
+X-MATE-Autostart-Delay=2
+EOF
+        pkill -f "taskwarrior_desktop_widget.py" 2>/dev/null || true
+        nohup /usr/bin/python3 "${TASK_DESKTOP_EXEC}" >/dev/null 2>&1 &
+        echo "✅ 已安裝開機自啟並啟動「Taskwarrior 桌面嵌入式月曆」(${TASK_DESKTOP_AUTOSTART})"
+        ;;
+    uninstall-desktop)
+        rm -f "${TASK_DESKTOP_AUTOSTART}"
+        pkill -f "taskwarrior_desktop_widget.py" 2>/dev/null || true
+        echo "✅ 已移除並停止「Taskwarrior 桌面嵌入式月曆」"
+        ;;
+    reload-desktop)
+        pkill -f "taskwarrior_desktop_widget.py" 2>/dev/null || true
+        nohup /usr/bin/python3 "${TASK_DESKTOP_EXEC}" >/dev/null 2>&1 &
+        echo "🔄 已重新啟動「Taskwarrior 桌面嵌入式月曆」"
         ;;
     *)
         usage
