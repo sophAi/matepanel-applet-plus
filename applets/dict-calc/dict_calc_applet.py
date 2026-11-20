@@ -881,8 +881,9 @@ class DictCalcWidget(Gtk.EventBox):
         self.root_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         self.add(self.root_box)
 
-        # 1. Cairo Badge Canvas (always shown, or next to inline entry)
+        # 1. Cairo Badge Canvas (set_no_show_all so applet.show_all() never forces both Mode A & B visible)
         self.canvas = Gtk.DrawingArea()
+        self.canvas.set_no_show_all(True)
         self.canvas.add_events(
             Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
         )
@@ -890,8 +891,9 @@ class DictCalcWidget(Gtk.EventBox):
         self.canvas.connect("button-press-event", self._on_button_press)
         self.root_box.pack_start(self.canvas, False, False, 0)
 
-        # 2. Pure Inline Panel Search/Calc Entry (click-to-type with request_focus + integrated icons & popup menu)
+        # 2. Pure Inline Panel Search/Calc Entry (click-to-type with request_focus + left scan icon + right-click menu)
         self.panel_entry = Gtk.Entry()
+        self.panel_entry.set_no_show_all(True)
         self.panel_entry.set_name("dict-calc-panel-entry")
         self.entry_css_provider = Gtk.CssProvider()
         self.panel_entry.get_style_context().add_provider(
@@ -901,14 +903,8 @@ class DictCalcWidget(Gtk.EventBox):
         self.panel_entry.set_icon_from_icon_name(
             Gtk.EntryIconPosition.PRIMARY, "edit-find-symbolic"
         )
-        self.panel_entry.set_icon_from_icon_name(
-            Gtk.EntryIconPosition.SECONDARY, "emblem-system-symbolic"
-        )
         self.panel_entry.set_icon_tooltip_text(
             Gtk.EntryIconPosition.PRIMARY, "點此開關滑鼠劃詞查詢 (Scan Selection)"
-        )
-        self.panel_entry.set_icon_tooltip_text(
-            Gtk.EntryIconPosition.SECONDARY, "開啟查詢視窗 / 偏好設定與詞典管理"
         )
         self.panel_entry.connect("activate", self._on_panel_entry_activate)
         self.panel_entry.connect("button-press-event", self._on_panel_entry_button_press)
@@ -1200,9 +1196,6 @@ class DictCalcWidget(Gtk.EventBox):
         if icon_pos == Gtk.EntryIconPosition.PRIMARY:
             # Left icon toggles Scan Selection
             self.toggle_scan_selection()
-        elif icon_pos == Gtk.EntryIconPosition.SECONDARY:
-            # Right gear icon opens Preferences & Dictionary Manager
-            self.show_preferences_dialog()
 
     def _on_panel_entry_populate_popup(self, _entry, menu):
         """Integrate Applet controls (Preferences, Scan Selection, Open Window) into the Entry right-click menu."""
@@ -2059,6 +2052,7 @@ def applet_fill(applet):
 
     applet.add(widget)
     applet.show_all()
+    widget._sync_entry_visibility()
 
 
 def applet_factory(applet, iid, _data):
