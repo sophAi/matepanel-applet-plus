@@ -87,6 +87,7 @@ DEFAULT_CONFIG = {
     "dbus_popup_style": "separate",      # "separate" (每本詞典獨立泡泡，最多 N 個) or "merged" (單一泡泡以粗體分隔線區隔)
     "dbus_popup_max_dicts": 3,           # D-Bus 泡泡最多顯示幾本命中的詞典 (1..5)
     "dbus_popup_timeout_sec": 8,         # D-Bus 通知泡泡停留秒數 (1..60)
+    "dbus_popup_font_size": 11,          # D-Bus 氣泡框字型大小 (pt)
     "panel_entry_width": 170,            # 面板內嵌查詢框寬度 (px)
     "scan_selection_enabled": False,     # 是否啟用滑鼠反白自動劃詞查詢 (Selection Primary)
     "scan_modifier": "ctrl",             # 劃詞觸發修飾鍵: "none", "ctrl", "alt", "shift"
@@ -94,7 +95,9 @@ DEFAULT_CONFIG = {
     "hotkey_scan_selection": "<Ctrl><Alt>s", # 立即查詢目前滑鼠反白文字 (Scan Selection) 的全域快捷鍵
     "calc_auto_copy": True,              # 數學計算模式預設自動將結果存入系統剪貼簿 (可直接 Ctrl+V)
     "active_dict_group": "custom",       # "custom" (已勾選常用), "en_zh", "ja_zh", "sci_en", "all"
-    "enabled_dicts": list(DEFAULT_PREFERRED_DICTS),
+    "enabled_dicts": list(DEFAULT_PREFERRED_DICTS),           # 無焦點查詢視窗詞典清單 (含順位)
+    "enabled_dicts_dbus": list(DEFAULT_PREFERRED_DICTS[:5]),  # D-Bus 氣泡框詞典清單 (含順位)
+    "enabled_dicts_scan": list(DEFAULT_PREFERRED_DICTS[:5]),  # Scan Selection 劃詞詞典清單 (含順位)
     "result_font_size": 11,              # 結果視窗字型大小 (pt)
     "font_color_mode": "dynamic",        # "dynamic" or "custom"
     "custom_font_color": "#ffffff",      # 自訂面板字形顏色
@@ -968,14 +971,22 @@ class DictCalcWidget(Gtk.EventBox):
 
     def _load_config(self):
         cfg = dict(DEFAULT_CONFIG)
+        user_cfg = {}
         if os.path.exists(CONFIG_PATH):
             try:
                 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                    user_cfg = json.load(f)
-                if isinstance(user_cfg, dict):
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    user_cfg = loaded
                     cfg.update(user_cfg)
             except Exception:
                 pass
+        # Backward-compatible migration: if separate D-Bus / Scan profiles aren't saved yet,
+        # inherit from the user's existing enabled_dicts list.
+        if "enabled_dicts_dbus" not in user_cfg and "enabled_dicts" in user_cfg:
+            cfg["enabled_dicts_dbus"] = list(cfg["enabled_dicts"])
+        if "enabled_dicts_scan" not in user_cfg and "enabled_dicts" in user_cfg:
+            cfg["enabled_dicts_scan"] = list(cfg["enabled_dicts"])
         return cfg
 
     def _save_config(self):
@@ -1106,7 +1117,7 @@ class DictCalcWidget(Gtk.EventBox):
         if not force_from_hotkey and cleaned == self._last_scanned_text:
             return
         self._last_scanned_text = cleaned
-        self.open_popup_window(cleaned, near_pointer=True)
+        self.open_popup_window(cleaned, near_pointer=True, source="scan")
 
     # =========================================================================
     # Panel Layout, Drawing & Events
@@ -1260,13 +1271,22 @@ class DictCalcWidget(Gtk.EventBox):
         self.execute_query(txt, near_pointer=False, keep_panel_focus=True)
         entry.select_region(0, -1)
 
-    def execute_query(self, raw_text, near_pointer=False, keep_panel_focus=False):
+    def _wrap_dbus_font(self, markup_body):
+        """Wrap valid Pango markup body with user-configured D-Bus bubble font size (in 1/1024 pt)."""
+        fs = max(8, min(22, int(self.config.get("dbus_popup_font_size", 11))))
+        return f"<span size='{fs * 1024}'>{markup_body}</span>"
+
+    def execute_query(self, raw_text, near_pointer=False, keep_panel_focus=False, source="panel"):
         """
         Central query & calculator dispatcher.
         Routes results to either:
           - Focus-free Compact Result Window ('window')
           - System D-Bus Notification Popup ('dbus_popup')
           - Hybrid Mode: Calculator via D-Bus Popup, Dictionary via Window ('calc_dbus_dict_window')
+        Selects dictionary profile independently for:
+          - Scan Selection ('enabled_dicts_scan')
+          - D-Bus Notification Popup ('enabled_dicts_dbus')
+          - Focus-free Result Window ('enabled_dicts')
         Always keeps keyboard focus locked in the MATE Panel search box!
         """
         q = raw_text.strip()
@@ -1288,17 +1308,17 @@ class DictCalcWidget(Gtk.EventBox):
                 if err is not None:
                     self.dbus_notifier.show(
                         f"🧮 算式錯誤：{q}",
-                        str(err),
+                        self._wrap_dbus_font(html.escape(str(err))),
                         icon="dialog-error",
                         timeout_sec=timeout_sec,
                     )
                 else:
-                    body = f"{q} = {res_str}" + (
+                    body_markup = f"{html.escape(q)} = <b>{html.escape(str(res_str))}</b>" + (
                         "\n✔ 已自動存入系統剪貼簿 (Ctrl+V 可直接貼上)" if auto_copy else ""
                     )
                     self.dbus_notifier.show(
                         f"🧮 計算結果：{res_str}",
-                        body,
+                        self._wrap_dbus_font(body_markup),
                         icon="accessories-calculator",
                         timeout_sec=timeout_sec,
                     )
@@ -1321,7 +1341,18 @@ class DictCalcWidget(Gtk.EventBox):
             if keep_panel_focus:
                 GLib.idle_add(self._refocus_panel_entry)
 
-        custom_list = self.config.get("enabled_dicts", DEFAULT_PREFERRED_DICTS)
+        if source == "scan":
+            custom_list = self.config.get(
+                "enabled_dicts_scan",
+                self.config.get("enabled_dicts", DEFAULT_PREFERRED_DICTS),
+            )
+        elif use_dbus_dict:
+            custom_list = self.config.get(
+                "enabled_dicts_dbus",
+                self.config.get("enabled_dicts", DEFAULT_PREFERRED_DICTS),
+            )
+        else:
+            custom_list = self.config.get("enabled_dicts", DEFAULT_PREFERRED_DICTS)
         dict_names = self.dict_mgr.get_ordered_enabled_dicts(custom_list)
 
         def worker():
@@ -1356,7 +1387,7 @@ class DictCalcWidget(Gtk.EventBox):
             if not results:
                 self.dbus_notifier.show(
                     f"📖 查無詞條：{query_word}",
-                    "請檢查拼字，或在偏好設定的「詞典管理」勾選更多詞典。",
+                    self._wrap_dbus_font("請檢查拼字，或在偏好設定的「詞典管理」勾選更多詞典。"),
                     icon="accessories-dictionary",
                     timeout_sec=timeout_sec,
                 )
@@ -1369,35 +1400,39 @@ class DictCalcWidget(Gtk.EventBox):
                     d_name = item["dict"]
                     w_str = item["word"]
                     summary = f"{b_emo} {w_str} — {d_name}"
-                    def_lines = [html.escape(ln.strip()) for ln in item["definition"].splitlines() if ln.strip()]
-                    body = "\n".join(def_lines[:8])
-                    if len(def_lines) > 8:
-                        body += "\n…"
-                    if len(body) > 480:
-                        body = body[:477] + "…"
+                    raw_lines = [ln.strip() for ln in item["definition"].splitlines() if ln.strip()]
+                    raw_body = "\n".join(raw_lines[:8])
+                    if len(raw_lines) > 8:
+                        raw_body += "\n…"
+                    if len(raw_body) > 460:
+                        raw_body = raw_body[:457] + "…"
+                    body = self._wrap_dbus_font(html.escape(raw_body))
                     batch.append((summary, body, "accessories-dictionary"))
                 self.dbus_notifier.show_batch(batch, timeout_sec=timeout_sec)
             else:
                 # Mode 2: Single merged D-Bus bubble with clear bold divider banners and indented definitions
                 blocks = []
                 shown = results[:max_dicts]
+                total_chars = 0
                 for idx, item in enumerate(shown):
                     b_emo = book_icons[idx % len(book_icons)]
                     d_esc = html.escape(item["dict"])
                     w_esc = html.escape(item["word"])
                     hdr = f"<b>━━━ {b_emo} {d_esc} ({w_esc}) ━━━</b>"
-                    def_lines = [
-                        f"  {html.escape(ln.strip())}"
-                        for ln in item["definition"].splitlines()
-                        if ln.strip()
-                    ]
-                    block_lines = [hdr] + def_lines[:6]
-                    blocks.append("\n".join(block_lines))
+                    raw_lines = [ln.strip() for ln in item["definition"].splitlines() if ln.strip()]
+                    kept_lines = []
+                    for ln in raw_lines[:6]:
+                        if total_chars + len(ln) > 760 and kept_lines:
+                            kept_lines.append("  …")
+                            break
+                        kept_lines.append(f"  {html.escape(ln)}")
+                        total_chars += len(ln)
+                    blocks.append("\n".join([hdr] + kept_lines))
+                    if total_chars >= 760:
+                        break
                 if len(results) > max_dicts:
                     blocks.append(f"<i>…（另有 {len(results) - max_dicts} 套詞典命中）</i>")
-                body = "\n\n".join(blocks).strip()
-                if len(body) > 850:
-                    body = body[:847] + "…"
+                body = self._wrap_dbus_font("\n\n".join(blocks).strip())
                 self.dbus_notifier.show(
                     f"📖 {query_word}",
                     body,
@@ -1570,10 +1605,10 @@ class DictCalcWidget(Gtk.EventBox):
         else:
             win.position_and_show(near_pointer=False)
 
-    def open_popup_window(self, text="", near_pointer=False):
+    def open_popup_window(self, text="", near_pointer=False, source="panel"):
         if text:
             self.panel_entry.set_text(text)
-            self.execute_query(text, near_pointer=near_pointer, keep_panel_focus=False)
+            self.execute_query(text, near_pointer=near_pointer, keep_panel_focus=False, source=source)
         else:
             self.focus_panel_search_box()
 
@@ -1695,9 +1730,9 @@ class DictCalcWidget(Gtk.EventBox):
         dbus_t_box.pack_start(combo_dbus_style, True, True, 0)
         tab1.pack_start(dbus_t_box, False, False, 0)
 
-        dbus_num_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        dbus_num_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         dbus_num_box.set_margin_start(14)
-        dbus_num_box.pack_start(Gtk.Label(label="D-Bus 最多顯示詞典數：", xalign=0.0), False, False, 0)
+        dbus_num_box.pack_start(Gtk.Label(label="最多詞典數：", xalign=0.0), False, False, 0)
         spin_dbus_max = Gtk.SpinButton(
             adjustment=Gtk.Adjustment(
                 value=float(self.config.get("dbus_popup_max_dicts", 3)),
@@ -1711,7 +1746,7 @@ class DictCalcWidget(Gtk.EventBox):
             digits=0,
         )
         dbus_num_box.pack_start(spin_dbus_max, False, False, 0)
-        dbus_num_box.pack_start(Gtk.Label(label="泡泡停留秒數：", xalign=0.0), False, False, 0)
+        dbus_num_box.pack_start(Gtk.Label(label="停留秒數：", xalign=0.0), False, False, 0)
         spin_dbus_sec = Gtk.SpinButton(
             adjustment=Gtk.Adjustment(
                 value=float(self.config.get("dbus_popup_timeout_sec", 8)),
@@ -1725,6 +1760,36 @@ class DictCalcWidget(Gtk.EventBox):
             digits=0,
         )
         dbus_num_box.pack_start(spin_dbus_sec, False, False, 0)
+        dbus_num_box.pack_start(Gtk.Label(label="氣泡字型 (pt)：", xalign=0.0), False, False, 0)
+        spin_dbus_fs = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(
+                value=float(self.config.get("dbus_popup_font_size", 11)),
+                lower=8.0,
+                upper=22.0,
+                step_increment=1.0,
+                page_increment=2.0,
+                page_size=0.0,
+            ),
+            climb_rate=1.0,
+            digits=0,
+        )
+        dbus_num_box.pack_start(spin_dbus_fs, False, False, 0)
+        btn_test_dbus = Gtk.Button(label="🔔 測試")
+        btn_test_dbus.set_tooltip_text("發送測試 D-Bus 氣泡以預覽字型大小")
+        btn_test_dbus.connect(
+            "clicked",
+            lambda *_: self.dbus_notifier.show(
+                f"📘 氣泡字型預覽 ({self.config.get('dbus_popup_font_size', 11)} pt)",
+                self._wrap_dbus_font(
+                    "<b>━━━ 📘 DrEye4.1 (example) ━━━</b>\n"
+                    "  n. 範例；實例；榜樣\n"
+                    "  目前 D-Bus 氣泡框字型大小預覽測試。"
+                ),
+                icon="accessories-dictionary",
+                timeout_sec=4,
+            ),
+        )
+        dbus_num_box.pack_start(btn_test_dbus, False, False, 0)
         tab1.pack_start(dbus_num_box, False, False, 0)
 
         tab1.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
@@ -1820,7 +1885,7 @@ class DictCalcWidget(Gtk.EventBox):
 
         notebook.append_page(tab1, Gtk.Label(label="⚙️ 一般、快捷鍵與外觀"))
 
-        # ---------------- Tab 2: StarDict Dictionaries Manager (with Priority Ordering) ----------------
+        # ---------------- Tab 2: StarDict Dictionaries Manager (3 Independent Profiles) ----------------
         tab2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         tab2.set_margin_top(10)
         tab2.set_margin_bottom(10)
@@ -1829,132 +1894,202 @@ class DictCalcWidget(Gtk.EventBox):
 
         d_hdr = Gtk.Label(xalign=0.0)
         d_hdr.set_markup(
-            f"<b>已掃描到 {len(self.dict_mgr.all_dicts)} 套離線 StarDict 詞典</b> "
-            f"<small>(勾選啟用詞典，並使用右側按鈕或拖曳調整顯示順位，越上方越優先顯示)</small>"
+            f"<b>已掃描到 {len(self.dict_mgr.all_dicts)} 套離線 StarDict 詞典（三種查詢情境獨立管理）</b>\n"
+            f"<small>可分別為「無焦點查詢視窗」、「D-Bus 氣泡框」與「Scan Selection 劃詞」設定不同詞典與顯示順位（支援右側按鈕與滑鼠拖曳）</small>"
         )
         tab2.pack_start(d_hdr, False, False, 0)
 
-        # Build ordered list: enabled dicts in saved priority order first, then remaining disabled dicts
-        store = Gtk.ListStore(bool, str, str, int)
-        saved_enabled = list(self.config.get("enabled_dicts", DEFAULT_PREFERRED_DICTS))
         dict_by_name = {d["bookname"]: d for d in self.dict_mgr.all_dicts}
         grp_labels = {"en_zh": "英漢/漢英", "ja_zh": "日漢/漢日", "sci_en": "科技/英英"}
+        dict_notebook = Gtk.Notebook()
 
-        added_names = set()
-        for name in saved_enabled:
-            if name in dict_by_name and name not in added_names:
-                d = dict_by_name[name]
-                store.append([True, d["bookname"], grp_labels.get(d["group"], d["group"]), d["wordcount"]])
-                added_names.add(name)
-        for d in self.dict_mgr.all_dicts:
-            if d["bookname"] not in added_names:
-                store.append([False, d["bookname"], grp_labels.get(d["group"], d["group"]), d["wordcount"]])
-                added_names.add(d["bookname"])
+        def build_dict_profile_page(config_key, profile_desc, default_preset, allow_copy_win=False):
+            page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            page.set_margin_top(8)
+            page.set_margin_bottom(6)
+            page.set_margin_start(8)
+            page.set_margin_end(8)
 
-        def save_dict_order_from_store(*_):
-            self.config["enabled_dicts"] = [row[1] for row in store if row[0]]
-            self._save_config()
-            if self.popup_win is not None:
-                self.popup_win.sync_controls()
+            info_lbl = Gtk.Label(xalign=0.0)
+            page.pack_start(info_lbl, False, False, 0)
 
-        tree = Gtk.TreeView(model=store)
-        tree.set_reorderable(True)  # Also supports mouse drag-and-drop reordering!
-        store.connect("rows-reordered", lambda *_: GLib.idle_add(save_dict_order_from_store))
-        store.connect("row-deleted", lambda *_: GLib.idle_add(save_dict_order_from_store))
+            store = Gtk.ListStore(bool, str, str, int)
 
-        rend_toggle = Gtk.CellRendererToggle()
+            def populate_store_from_list(enabled_list):
+                store.clear()
+                added = set()
+                for name in enabled_list:
+                    if name in dict_by_name and name not in added:
+                        d = dict_by_name[name]
+                        store.append([True, d["bookname"], grp_labels.get(d["group"], d["group"]), d["wordcount"]])
+                        added.add(name)
+                for d in self.dict_mgr.all_dicts:
+                    if d["bookname"] not in added:
+                        store.append([False, d["bookname"], grp_labels.get(d["group"], d["group"]), d["wordcount"]])
+                        added.add(d["bookname"])
 
-        def on_dict_row_toggled(_cell, path_str):
-            store[path_str][0] = not store[path_str][0]
-            save_dict_order_from_store()
+            def update_count_label():
+                n_en = sum(1 for row in store if row[0])
+                info_lbl.set_markup(
+                    f"<small>{html.escape(profile_desc)} — 目前已啟用 <b>{n_en}</b> 套詞典</small>"
+                )
 
-        rend_toggle.connect("toggled", on_dict_row_toggled)
-        tree.append_column(Gtk.TreeViewColumn("啟用", rend_toggle, active=0))
-        col_name = Gtk.TreeViewColumn("詞典名稱 (Bookname)", Gtk.CellRendererText(), text=1)
-        col_name.set_expand(True)
-        tree.append_column(col_name)
-        tree.append_column(Gtk.TreeViewColumn("分類", Gtk.CellRendererText(), text=2))
-        tree.append_column(Gtk.TreeViewColumn("詞條數", Gtk.CellRendererText(), text=3))
+            saved_enabled = list(self.config.get(config_key, default_preset))
+            populate_store_from_list(saved_enabled)
+            update_count_label()
 
-        # Horizontal container: TreeView on left + Up/Down/Top/Bottom priority buttons on right
-        list_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        d_scroll = Gtk.ScrolledWindow()
-        d_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        d_scroll.set_vexpand(True)
-        d_scroll.set_hexpand(True)
-        d_scroll.add(tree)
-        list_hbox.pack_start(d_scroll, True, True, 0)
+            rebuilding = [False]
 
-        order_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        btn_top = Gtk.Button(label="⏫ 置頂")
-        btn_up = Gtk.Button(label="▲ 上移")
-        btn_down = Gtk.Button(label="▼ 下移")
-        btn_bottom = Gtk.Button(label="⏬ 置底")
+            def save_order(*_):
+                if rebuilding[0]:
+                    return False
+                self.config[config_key] = [row[1] for row in store if row[0]]
+                self._save_config()
+                update_count_label()
+                if self.popup_win is not None:
+                    self.popup_win.sync_controls()
+                return False
 
-        def move_selected_row(direction):
-            sel = tree.get_selection()
-            model, it = sel.get_selected()
-            if it is None:
-                return
-            path = model.get_path(it)
-            idx = path.get_indices()[0]
-            total = len(model)
-            if direction == "up" and idx > 0:
-                prev_it = model.get_iter(Gtk.TreePath.new_from_indices([idx - 1]))
-                model.swap(it, prev_it)
-                new_idx = idx - 1
-            elif direction == "down" and idx < total - 1:
-                next_it = model.get_iter(Gtk.TreePath.new_from_indices([idx + 1]))
-                model.swap(it, next_it)
-                new_idx = idx + 1
-            elif direction == "top" and idx > 0:
-                first_it = model.get_iter_first()
-                model.move_before(it, first_it)
-                new_idx = 0
-            elif direction == "bottom" and idx < total - 1:
-                last_it = model.get_iter(Gtk.TreePath.new_from_indices([total - 1]))
-                model.move_after(it, last_it)
-                new_idx = total - 1
-            else:
-                return
-            new_path = Gtk.TreePath.new_from_indices([new_idx])
-            sel.select_path(new_path)
-            tree.scroll_to_cell(new_path, None, False, 0.0, 0.0)
-            save_dict_order_from_store()
+            tree = Gtk.TreeView(model=store)
+            tree.set_reorderable(True)
+            store.connect("rows-reordered", lambda *_: GLib.idle_add(save_order))
+            store.connect("row-deleted", lambda *_: GLib.idle_add(save_order))
 
-        btn_top.connect("clicked", lambda *_: move_selected_row("top"))
-        btn_up.connect("clicked", lambda *_: move_selected_row("up"))
-        btn_down.connect("clicked", lambda *_: move_selected_row("down"))
-        btn_bottom.connect("clicked", lambda *_: move_selected_row("bottom"))
+            rend_toggle = Gtk.CellRendererToggle()
 
-        for b_ord in (btn_top, btn_up, btn_down, btn_bottom):
-            order_vbox.pack_start(b_ord, False, False, 0)
-        list_hbox.pack_start(order_vbox, False, False, 0)
+            def on_row_toggled(_cell, path_str):
+                store[path_str][0] = not store[path_str][0]
+                save_order()
 
-        tab2.pack_start(list_hbox, True, True, 0)
+            rend_toggle.connect("toggled", on_row_toggled)
+            tree.append_column(Gtk.TreeViewColumn("啟用", rend_toggle, active=0))
+            col_name = Gtk.TreeViewColumn("詞典名稱 (Bookname)", Gtk.CellRendererText(), text=1)
+            col_name.set_expand(True)
+            tree.append_column(col_name)
+            tree.append_column(Gtk.TreeViewColumn("分類", Gtk.CellRendererText(), text=2))
+            tree.append_column(Gtk.TreeViewColumn("詞條數", Gtk.CellRendererText(), text=3))
 
-        d_btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        btn_sel_all = Gtk.Button(label="全部勾選")
-        btn_sel_none = Gtk.Button(label="全部取消")
-        btn_sel_def = Gtk.Button(label="恢復推薦常用詞典")
+            list_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            d_scroll = Gtk.ScrolledWindow()
+            d_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+            d_scroll.set_vexpand(True)
+            d_scroll.set_hexpand(True)
+            d_scroll.add(tree)
+            list_hbox.pack_start(d_scroll, True, True, 0)
 
-        def set_dict_selection(mode_sel):
-            for row in store:
-                if mode_sel == "all":
-                    row[0] = True
-                elif mode_sel == "none":
-                    row[0] = False
+            order_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            btn_top = Gtk.Button(label="⏫ 置頂")
+            btn_up = Gtk.Button(label="▲ 上移")
+            btn_down = Gtk.Button(label="▼ 下移")
+            btn_bottom = Gtk.Button(label="⏬ 置底")
+
+            def move_selected_row(direction):
+                sel = tree.get_selection()
+                model, it = sel.get_selected()
+                if it is None:
+                    return
+                path = model.get_path(it)
+                idx = path.get_indices()[0]
+                total = len(model)
+                if direction == "up" and idx > 0:
+                    prev_it = model.get_iter(Gtk.TreePath.new_from_indices([idx - 1]))
+                    model.swap(it, prev_it)
+                    new_idx = idx - 1
+                elif direction == "down" and idx < total - 1:
+                    next_it = model.get_iter(Gtk.TreePath.new_from_indices([idx + 1]))
+                    model.swap(it, next_it)
+                    new_idx = idx + 1
+                elif direction == "top" and idx > 0:
+                    first_it = model.get_iter_first()
+                    model.move_before(it, first_it)
+                    new_idx = 0
+                elif direction == "bottom" and idx < total - 1:
+                    last_it = model.get_iter(Gtk.TreePath.new_from_indices([total - 1]))
+                    model.move_after(it, last_it)
+                    new_idx = total - 1
                 else:
-                    row[0] = row[1] in DEFAULT_PREFERRED_DICTS
-            save_dict_order_from_store()
+                    return
+                new_path = Gtk.TreePath.new_from_indices([new_idx])
+                sel.select_path(new_path)
+                tree.scroll_to_cell(new_path, None, False, 0.0, 0.0)
+                save_order()
 
-        btn_sel_all.connect("clicked", lambda *_: set_dict_selection("all"))
-        btn_sel_none.connect("clicked", lambda *_: set_dict_selection("none"))
-        btn_sel_def.connect("clicked", lambda *_: set_dict_selection("default"))
-        d_btn_box.pack_start(btn_sel_all, False, False, 0)
-        d_btn_box.pack_start(btn_sel_none, False, False, 0)
-        d_btn_box.pack_start(btn_sel_def, False, False, 0)
-        tab2.pack_start(d_btn_box, False, False, 0)
+            btn_top.connect("clicked", lambda *_: move_selected_row("top"))
+            btn_up.connect("clicked", lambda *_: move_selected_row("up"))
+            btn_down.connect("clicked", lambda *_: move_selected_row("down"))
+            btn_bottom.connect("clicked", lambda *_: move_selected_row("bottom"))
+            for b_ord in (btn_top, btn_up, btn_down, btn_bottom):
+                order_vbox.pack_start(b_ord, False, False, 0)
+            list_hbox.pack_start(order_vbox, False, False, 0)
+
+            page.pack_start(list_hbox, True, True, 0)
+
+            d_btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            btn_sel_all = Gtk.Button(label="全部勾選")
+            btn_sel_none = Gtk.Button(label="全部取消")
+            btn_sel_def = Gtk.Button(label="恢復推薦詞典")
+
+            def set_dict_selection(mode_sel):
+                if mode_sel == "copy_win":
+                    rebuilding[0] = True
+                    try:
+                        populate_store_from_list(
+                            list(self.config.get("enabled_dicts", DEFAULT_PREFERRED_DICTS))
+                        )
+                    finally:
+                        rebuilding[0] = False
+                    save_order()
+                    return
+                for row in store:
+                    if mode_sel == "all":
+                        row[0] = True
+                    elif mode_sel == "none":
+                        row[0] = False
+                    else:
+                        row[0] = row[1] in default_preset
+                save_order()
+
+            btn_sel_all.connect("clicked", lambda *_: set_dict_selection("all"))
+            btn_sel_none.connect("clicked", lambda *_: set_dict_selection("none"))
+            btn_sel_def.connect("clicked", lambda *_: set_dict_selection("default"))
+            d_btn_box.pack_start(btn_sel_all, False, False, 0)
+            d_btn_box.pack_start(btn_sel_none, False, False, 0)
+            d_btn_box.pack_start(btn_sel_def, False, False, 0)
+            if allow_copy_win:
+                btn_copy_win = Gtk.Button(label="📋 複製自查詢視窗")
+                btn_copy_win.connect("clicked", lambda *_: set_dict_selection("copy_win"))
+                d_btn_box.pack_end(btn_copy_win, False, False, 0)
+            page.pack_start(d_btn_box, False, False, 0)
+            return page
+
+        dict_notebook.append_page(
+            build_dict_profile_page(
+                "enabled_dicts",
+                "用於面板輸入框以「無焦點查詢視窗」顯示結果時",
+                DEFAULT_PREFERRED_DICTS,
+                allow_copy_win=False,
+            ),
+            Gtk.Label(label="🪟 無焦點查詢視窗"),
+        )
+        dict_notebook.append_page(
+            build_dict_profile_page(
+                "enabled_dicts_dbus",
+                "用於面板輸入框以「D-Bus 氣泡框」顯示結果時（建議精選 2~5 套簡明詞典）",
+                DEFAULT_PREFERRED_DICTS[:5],
+                allow_copy_win=True,
+            ),
+            Gtk.Label(label="💬 D-Bus 氣泡框"),
+        )
+        dict_notebook.append_page(
+            build_dict_profile_page(
+                "enabled_dicts_scan",
+                "用於滑鼠反白自動劃詞或快捷鍵 Scan Selection 查詢時",
+                DEFAULT_PREFERRED_DICTS[:5],
+                allow_copy_win=True,
+            ),
+            Gtk.Label(label="✂ Scan Selection 劃詞"),
+        )
+        tab2.pack_start(dict_notebook, True, True, 0)
 
         notebook.append_page(tab2, Gtk.Label(label=f"📚 詞典管理 ({len(self.dict_mgr.all_dicts)} 套)"))
 
@@ -1977,6 +2112,7 @@ class DictCalcWidget(Gtk.EventBox):
             self.config["dbus_popup_style"] = combo_dbus_style.get_active_id() or "separate"
             self.config["dbus_popup_max_dicts"] = int(spin_dbus_max.get_value_as_int())
             self.config["dbus_popup_timeout_sec"] = int(spin_dbus_sec.get_value_as_int())
+            self.config["dbus_popup_font_size"] = int(spin_dbus_fs.get_value_as_int())
             self.config["display_mode"] = "badge" if rb_badge.get_active() else "panel_entry"
             self.config["panel_entry_width"] = int(spin_entry_w.get_value_as_int())
             self.config["result_font_size"] = int(spin_res_fs.get_value_as_int())
@@ -2014,7 +2150,7 @@ class DictCalcWidget(Gtk.EventBox):
             chk_shadow,
         ):
             w_c.connect("toggled", apply_tab1)
-        for sp_c in (spin_dbus_max, spin_dbus_sec, spin_entry_w, spin_res_fs):
+        for sp_c in (spin_dbus_max, spin_dbus_sec, spin_dbus_fs, spin_entry_w, spin_res_fs):
             sp_c.connect("value-changed", apply_tab1)
 
         # Bottom Close Button
