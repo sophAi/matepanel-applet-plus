@@ -144,6 +144,7 @@ DEFAULT_CONFIG = {
     "custom_font_color": "#ffffff",      # 自訂面板字形顏色
     "badge_bg_style": "dark",            # (舊版相容欄位)
     "badge_bg_color": "#182234",         # 自訂方塊/輸入框背景底色
+    "badge_border_color": "#48b8fa",     # 自訂方塊/輸入框外框顏色
     "badge_bg_opacity": 90,              # 背景不透明度 (0=完全透明 ~ 100=完全不透明)
     "text_shadow": False,                # 面板文字描邊陰影
 }
@@ -2583,7 +2584,12 @@ class DictCalcWidget(Gtk.EventBox):
         custom_hex = self.config.get("custom_font_color", "#ffffff")
         shadow_on = bool(self.config.get("text_shadow", False))
 
-        border_col = "rgba(56, 130, 210, 0.78)" if is_light_bg else "rgba(72, 184, 250, 0.78)"
+        bd_hex = self.config.get("badge_border_color", "#48b8fa")
+        bd_rgb = hex_to_rgb(bd_hex, default=(0.282, 0.722, 0.980))
+        br255 = int(round(bd_rgb[0] * 255))
+        bg255 = int(round(bd_rgb[1] * 255))
+        bb255 = int(round(bd_rgb[2] * 255))
+        border_col = f"rgba({br255}, {bg255}, {bb255}, 0.85)"
         if opacity == 0:
             bg_css = (
                 f"background-color: transparent; background-image: none; "
@@ -3375,12 +3381,10 @@ class DictCalcWidget(Gtk.EventBox):
         custom_bg_rgb = hex_to_rgb(bg_hex, default=(0.094, 0.133, 0.204))
         is_light_bg = opacity >= 30 and rgb_luminance(custom_bg_rgb) > 0.55
 
-        if scan_on:
-            border_rgb = (0.20, 0.84, 0.62)
-            text_rgb = (0.94, 1.00, 0.98)
-        else:
-            border_rgb = (0.28, 0.72, 0.98)
-            text_rgb = (0.94, 0.98, 1.00)
+        bd_hex = self.config.get("badge_border_color", "#48b8fa")
+        default_bd = (0.20, 0.84, 0.62) if scan_on else (0.28, 0.72, 0.98)
+        border_rgb = hex_to_rgb(bd_hex, default=default_bd)
+        text_rgb = (0.94, 1.00, 0.98) if scan_on else (0.94, 0.98, 1.00)
 
         draw_rounded_rect(ctx, x + 0.5, y + 0.5, bw - 1.0, bh - 1.0, 4.5)
         if alpha > 0.0:
@@ -3679,6 +3683,15 @@ class DictCalcWidget(Gtk.EventBox):
         bg_col_btn.set_rgba(bg_rgba0)
         bg_col_btn.set_tooltip_text("點擊自訂方塊 / 輸入框背景底色")
         bg_box.pack_start(bg_col_btn, False, False, 0)
+
+        bg_box.pack_start(Gtk.Label(label="外框：", xalign=0.0), False, False, 0)
+        bd_col_btn = Gtk.ColorButton()
+        bd_rgba0 = Gdk.RGBA()
+        if not bd_rgba0.parse(self.config.get("badge_border_color", "#48b8fa")):
+            bd_rgba0.parse("#48b8fa")
+        bd_col_btn.set_rgba(bd_rgba0)
+        bd_col_btn.set_tooltip_text("點擊自訂圖示方塊與輸入框的外框顏色")
+        bg_box.pack_start(bd_col_btn, False, False, 0)
 
         bg_box.pack_start(Gtk.Label(label="不透明度：", xalign=0.0), False, False, 0)
         scale_bg_alpha = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 100.0, 5.0)
@@ -4732,6 +4745,7 @@ class DictCalcWidget(Gtk.EventBox):
             self.config["font_color_mode"] = "dynamic" if rb_col_dyn.get_active() else "custom"
             self.config["custom_font_color"] = rgba_to_hex(col_btn.get_rgba())
             self.config["badge_bg_color"] = rgba_to_hex(bg_col_btn.get_rgba())
+            self.config["badge_border_color"] = rgba_to_hex(bd_col_btn.get_rgba())
             bg_op = max(0, min(100, int(round(scale_bg_alpha.get_value()))))
             self.config["badge_bg_opacity"] = bg_op
             lbl_bg_alpha.set_text(f"{bg_op}%")
@@ -4897,6 +4911,7 @@ class DictCalcWidget(Gtk.EventBox):
         combo_epub_layout.connect("changed", apply_tab1)
         col_btn.connect("color-set", lambda *_: (rb_col_cus.set_active(True), apply_tab1()))
         bg_col_btn.connect("color-set", apply_tab1)
+        bd_col_btn.connect("color-set", apply_tab1)
         bubble_bg_btn.connect("color-set", apply_tab1)
         bubble_fg_btn.connect("color-set", apply_tab1)
         scale_bg_alpha.connect("value-changed", apply_tab1)
