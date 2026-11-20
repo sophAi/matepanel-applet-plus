@@ -89,10 +89,15 @@ DEFAULT_CONFIG = {
     "display_mode": "panel_entry",       # "panel_entry" (純面板查詢輸入框，預設) or "badge" (精簡方塊圖示)
     "result_output_mode": "window",      # "window" (無焦點精簡結果視窗), "dbus_popup" (系統 D-Bus 通知泡泡), "calc_dbus_dict_window" (混合模式)
     "dbus_popup_style": "separate",      # "separate" (每本詞典獨立泡泡，最多 N 個) or "merged" (單一泡泡以粗體分隔線區隔)
-    "dbus_popup_max_dicts": 3,           # D-Bus 泡泡最多顯示幾本命中的詞典 (1..5)
-    "dbus_popup_timeout_sec": 8,         # D-Bus 通知泡泡停留秒數 (1..60)
-    "dbus_popup_font_size": 11,          # D-Bus 氣泡框字型大小 (pt)
-    "dbus_popup_y_offset": 24,           # D-Bus 氣泡框與面板/輸入框的垂直安全間距 (px)
+    "dbus_popup_max_dicts": 3,           # 氣泡框最多顯示幾本命中的詞典 (1..5)
+    "dbus_popup_timeout_sec": 8,         # 氣泡框停留秒數 (1..60)
+    "dbus_popup_font_size": 11,          # 氣泡框字型大小 (pt)
+    "dbus_popup_position": "top_center", # "top_center"(置中上方), "top_left"(左上角), "top_right"(右上角), "bottom_right"(右下角), "bottom_left"(左下角)
+    "dbus_popup_x_offset": 0,            # 氣泡框水平偏移 (-500..+500 px)
+    "dbus_popup_y_offset": 36,           # 氣泡框垂直偏移 (-300..+500 px)
+    "dbus_popup_bg_color": "#182234",    # 氣泡框背景顏色
+    "dbus_popup_fg_color": "#f0f6ff",    # 氣泡框字形顏色
+    "dbus_popup_bg_opacity": 92,         # 氣泡框背景不透明度 (0..100%)
     "panel_entry_width": 170,            # 面板內嵌查詢框寬度 (px)
     "scan_selection_enabled": False,     # 是否啟用滑鼠反白自動劃詞查詢 (Selection Primary)
     "scan_modifier": "ctrl",             # 劃詞觸發修飾鍵: "none", "ctrl", "alt", "shift"
@@ -207,6 +212,242 @@ class DBusNotifier:
     def show(self, summary, body, icon="accessories-dictionary", timeout_sec=8, position=None):
         positions = [position] if position is not None else None
         return self.show_batch([(summary, body, icon)], timeout_sec=timeout_sec, positions=positions)
+
+
+class CustomBubbleWindow(Gtk.Window):
+    """
+    Borderless, focus-free, RGBA-composited overlay notification bubble rendered with Cairo.
+    Provides pixel-exact multi-monitor clamping (zero cross-monitor bleed), custom background
+    color, custom background opacity (0..100%), custom font color, click-to-dismiss, and
+    hover-to-pause auto-dismiss.
+    """
+
+    def __init__(self, summary, body_markup, bg_hex, fg_hex, bg_opacity, font_size, on_close_cb=None):
+        super().__init__(type=Gtk.WindowType.POPUP)
+        self.set_decorated(False)
+        self.set_accept_focus(False)
+        self.set_focus_on_map(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_type_hint(Gdk.WindowTypeHint.NOTIFICATION)
+        self.set_resizable(False)
+
+        self._on_close_cb = on_close_cb
+        self._bg_rgb = hex_to_rgb(bg_hex, default=(0.094, 0.133, 0.204))
+        self._bg_alpha = max(0.0, min(1.0, float(bg_opacity) / 100.0))
+        self._fg_hex = fg_hex or "#f0f6ff"
+        self._timeout_id = None
+        self._timeout_sec = 8
+        self._hovered = False
+
+        screen = self.get_screen()
+        if screen is not None:
+            visual = screen.get_rgba_visual()
+            if visual is not None and screen.is_composited():
+                self.set_visual(visual)
+        self.set_app_paintable(True)
+        self.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.ENTER_NOTIFY_MASK
+            | Gdk.EventMask.LEAVE_NOTIFY_MASK
+        )
+        self.connect("draw", self._on_draw)
+        self.connect("button-press-event", self._on_click)
+        self.connect("enter-notify-event", self._on_enter)
+        self.connect("leave-notify-event", self._on_leave)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        box.set_margin_top(10)
+        box.set_margin_bottom(10)
+        box.set_margin_start(14)
+        box.set_margin_end(14)
+
+        fs = max(8, min(22, int(font_size)))
+        title_pango_sz = (fs + 1) * 1024
+        body_pango_sz = fs * 1024
+        max_chars = max(32, min(52, int(520.0 / max(8.5, fs * 0.9))))
+
+        lbl_title = Gtk.Label(xalign=0.0)
+        lbl_title.set_line_wrap(True)
+        lbl_title.set_max_width_chars(max_chars)
+        lbl_title.set_markup(
+            f"<span foreground='{html.escape(self._fg_hex)}' size='{title_pango_sz}'><b>{html.escape(str(summary))}</b></span>"
+        )
+        box.pack_start(lbl_title, False, False, 0)
+
+        lbl_body = Gtk.Label(xalign=0.0)
+        lbl_body.set_line_wrap(True)
+        lbl_body.set_max_width_chars(max_chars)
+        lbl_body.set_markup(
+            f"<span foreground='{html.escape(self._fg_hex)}' size='{body_pango_sz}'>{body_markup}</span>"
+        )
+        box.pack_start(lbl_body, False, False, 0)
+
+        self.add(box)
+        self.show_all()
+
+    def start_timer(self, timeout_sec):
+        self._timeout_sec = max(1, int(timeout_sec))
+        self._cancel_timer()
+        self._timeout_id = GLib.timeout_add(self._timeout_sec * 1000, self._on_timeout)
+
+    def _cancel_timer(self):
+        if self._timeout_id is not None:
+            try:
+                GLib.source_remove(self._timeout_id)
+            except Exception:
+                pass
+            self._timeout_id = None
+
+    def _on_timeout(self):
+        self._timeout_id = None
+        if not self._hovered:
+            self.dismiss()
+        return False
+
+    def _on_enter(self, *_args):
+        self._hovered = True
+        self._cancel_timer()
+        return False
+
+    def _on_leave(self, *_args):
+        self._hovered = False
+        self.start_timer(max(2, min(self._timeout_sec, 4)))
+        return False
+
+    def _on_click(self, *_args):
+        self.dismiss()
+        return True
+
+    def dismiss(self):
+        self._cancel_timer()
+        if self._on_close_cb is not None:
+            cb = self._on_close_cb
+            self._on_close_cb = None
+            cb(self)
+        self.destroy()
+
+    def _on_draw(self, widget, ctx):
+        alloc = widget.get_allocation()
+        w, h = float(alloc.width), float(alloc.height)
+        ctx.save()
+        ctx.set_operator(cairo.OPERATOR_SOURCE)
+        ctx.set_source_rgba(0.0, 0.0, 0.0, 0.0)
+        ctx.paint()
+        ctx.set_operator(cairo.OPERATOR_OVER)
+
+        r, g, b = self._bg_rgb
+        alpha = self._bg_alpha
+        draw_rounded_rect(ctx, 1.0, 1.0, max(2.0, w - 2.0), max(2.0, h - 2.0), 10.0)
+        if alpha > 0.0:
+            ctx.set_source_rgba(r, g, b, alpha)
+            ctx.fill_preserve()
+
+        # Subtle high-contrast border
+        if rgb_luminance(self._bg_rgb) > 0.55:
+            ctx.set_source_rgba(0.22, 0.48, 0.80, max(0.45, min(0.90, alpha + 0.18)))
+        else:
+            ctx.set_source_rgba(0.28, 0.72, 0.98, max(0.45, min(0.90, alpha + 0.18)))
+        ctx.set_line_width(1.25)
+        ctx.stroke()
+        ctx.restore()
+        return False
+
+
+class CustomBubbleManager:
+    """
+    Manages one or more CustomBubbleWindow popups with pixel-exact multi-monitor positioning.
+    Strictly clamps every bubble inside the active monitor's bounds so it never spills across
+    adjacent monitors.
+    """
+
+    def __init__(self):
+        self._windows = []
+
+    def close_all(self):
+        for w in list(self._windows):
+            try:
+                w.dismiss()
+            except Exception:
+                pass
+        self._windows = []
+
+    def _on_bubble_closed(self, win):
+        if win in self._windows:
+            self._windows.remove(win)
+
+    def show_batch(
+        self,
+        items,
+        mon_bounds,
+        position="top_center",
+        offset_x=0,
+        offset_y=36,
+        bg_color="#182234",
+        fg_color="#f0f6ff",
+        bg_opacity=92,
+        font_size=11,
+        timeout_sec=8,
+    ):
+        self.close_all()
+        if not items:
+            return False
+
+        mon_left, mon_top, mon_right, mon_bottom = mon_bounds
+        mon_w = max(240, mon_right - mon_left)
+        mon_h = max(200, mon_bottom - mon_top)
+        pad = 12
+        stack_gap = 10
+
+        created = []
+        for summary, body_markup, _icon in items:
+            win = CustomBubbleWindow(
+                summary=summary,
+                body_markup=body_markup,
+                bg_hex=bg_color,
+                fg_hex=fg_color,
+                bg_opacity=bg_opacity,
+                font_size=font_size,
+                on_close_cb=self._on_bubble_closed,
+            )
+            _, nat = win.get_preferred_size()
+            bw = max(180, min(nat.width, mon_w - pad * 2))
+            bh = max(48, min(nat.height, mon_h - pad * 2))
+            win.resize(bw, bh)
+            created.append((win, bw, bh))
+
+        is_bottom = position in ("bottom_left", "bottom_right")
+        if is_bottom:
+            cur_bottom = mon_bottom - offset_y
+            for win, bw, bh in created:
+                if position == "bottom_left":
+                    px = mon_left + pad + offset_x
+                else:
+                    px = mon_right - bw - pad + offset_x
+                px = max(mon_left + pad, min(px, mon_right - bw - pad))
+                py = max(mon_top + pad, min(cur_bottom - bh, mon_bottom - bh - pad))
+                win.move(int(px), int(py))
+                win.start_timer(timeout_sec)
+                self._windows.append(win)
+                cur_bottom = py - stack_gap
+        else:
+            cur_y = mon_top + offset_y
+            for win, bw, bh in created:
+                if position == "top_left":
+                    px = mon_left + pad + offset_x
+                elif position == "top_right":
+                    px = mon_right - bw - pad + offset_x
+                else:  # top_center
+                    px = mon_left + (mon_w - bw) // 2 + offset_x
+                px = max(mon_left + pad, min(px, mon_right - bw - pad))
+                py = max(mon_top + pad, min(cur_y, mon_bottom - bh - pad))
+                win.move(int(px), int(py))
+                win.start_timer(timeout_sec)
+                self._windows.append(win)
+                cur_y = py + bh + stack_gap
+
+        return True
 
 
 class GoogleTranslator:
@@ -1134,6 +1375,7 @@ class DictCalcWidget(Gtk.EventBox):
         self.dict_mgr = StarDictManager()
         self.calc = SafeMathCalculator()
         self.dbus_notifier = DBusNotifier()
+        self.bubble_mgr = CustomBubbleManager()
         self.translator = GoogleTranslator()
 
         self.panel_size = 28
@@ -1499,6 +1741,7 @@ class DictCalcWidget(Gtk.EventBox):
             entry.set_text("")
             if self.popup_win is not None and self.popup_win.is_visible():
                 self.popup_win.hide()
+            self.bubble_mgr.close_all()
             return True
         return False
 
@@ -1539,19 +1782,14 @@ class DictCalcWidget(Gtk.EventBox):
         entry.select_region(0, -1)
 
     def _wrap_dbus_font(self, markup_body):
-        """Wrap valid Pango markup body with user-configured D-Bus bubble font size (in 1/1024 pt)."""
-        fs = max(8, min(22, int(self.config.get("dbus_popup_font_size", 11))))
-        return f"<span size='{fs * 1024}'>{markup_body}</span>"
+        """Return clean Pango markup body (font size & foreground color are applied by CustomBubbleWindow)."""
+        return markup_body
 
-    def _compute_dbus_positions(self, items):
-        """
-        Compute safe (x, y) coordinates for D-Bus notification bubbles so they NEVER overlap
-        mate-panel or the inline search box, and NEVER spill across monitor boundaries in
-        multi-monitor setups.
-        """
+    def _get_active_monitor_bounds(self):
+        """Return strict (mon_left, mon_top, mon_right, mon_bottom) of the monitor containing the applet."""
         display = Gdk.Display.get_default()
         if display is None:
-            return None
+            return (0, 0, 1920, 1080)
         gdk_win = self.get_window()
         if gdk_win is not None:
             _, ox, oy = gdk_win.get_origin()
@@ -1560,84 +1798,32 @@ class DictCalcWidget(Gtk.EventBox):
             cy = int(oy + max(1, alloc.height) / 2)
             monitor = display.get_monitor_at_point(cx, cy) or display.get_monitor_at_window(gdk_win)
         else:
-            ox, oy = 0, 0
-            alloc = None
             monitor = display.get_primary_monitor() or display.get_monitor(0)
         if monitor is None:
-            return None
-
+            return (0, 0, 1920, 1080)
         geo = monitor.get_geometry()
         wa = monitor.get_workarea()
-        # Intersect workarea with the exact monitor geometry so multi-monitor bounds are strict
         mon_left = max(geo.x, wa.x)
         mon_right = min(geo.x + geo.width, wa.x + wa.width)
         mon_top = max(geo.y, wa.y)
         mon_bottom = min(geo.y + geo.height, wa.y + wa.height)
-        mon_w = max(300, mon_right - mon_left)
-        mon_h = max(300, mon_bottom - mon_top)
-
-        fs = max(8, min(22, int(self.config.get("dbus_popup_font_size", 11))))
-        gap = max(0, min(300, int(self.config.get("dbus_popup_y_offset", 24))))
-
-        # Estimate realistic max bubble width (coco/standard themes grow with font size & text width)
-        max_line_eff = 28
-        for summary, body, _icon in items:
-            s_eff = sum(2 if ord(ch) > 127 else 1 for ch in str(summary))
-            if s_eff > max_line_eff:
-                max_line_eff = s_eff
-            plain = html.unescape(re.sub(r"<[^>]+>", "", str(body)))
-            for ln in plain.splitlines():
-                l_eff = sum(2 if ord(ch) > 127 else 1 for ch in ln)
-                if l_eff > max_line_eff:
-                    max_line_eff = l_eff
-        est_w = max(460, min(640, int(130 + min(max_line_eff, 58) * (fs * 0.85))))
-        est_w = min(est_w, max(260, mon_w - 28))
-
-        if gdk_win is not None:
-            px = max(mon_left + 12, min(ox, mon_right - est_w - 20))
-            panel_at_top = (oy + (alloc.height / 2.0)) < (geo.y + geo.height / 2.0)
-        else:
-            px = max(mon_left + 12, mon_right - est_w - 20)
-            panel_at_top = (mon_top - geo.y) >= ((geo.y + geo.height) - mon_bottom)
-
-        # Estimate each bubble height based on visible wrapped lines + font size
-        heights = []
-        chars_per_line = max(16, int((est_w - 90) / max(8.0, fs * 0.82)))
-        line_h = fs * 1.65 + 2.5
-        for _summary, body, _icon in items:
-            plain = html.unescape(re.sub(r"<[^>]+>", "", str(body)))
-            vis_lines = 0
-            for ln in plain.splitlines():
-                eff_len = sum(2 if ord(ch) > 127 else 1 for ch in ln)
-                vis_lines += max(1, (eff_len + chars_per_line - 1) // chars_per_line)
-            est_h = int(72 + max(1, vis_lines) * line_h)
-            est_h = max(96, min(est_h, max(120, mon_h - 60)))
-            heights.append(est_h)
-
-        positions = []
-        if panel_at_top:
-            safe_top = (max(mon_top, oy + alloc.height) if gdk_win is not None else mon_top) + gap
-            cur_y = safe_top
-            for est_h in heights:
-                py = min(cur_y, mon_bottom - est_h - 8)
-                py = max(safe_top, py)
-                positions.append((int(px), int(py)))
-                cur_y += est_h + 12
-        else:
-            safe_bottom = (min(mon_bottom, oy) if gdk_win is not None else mon_bottom) - gap
-            cur_bottom = safe_bottom
-            for est_h in heights:
-                py = cur_bottom - est_h
-                py = max(mon_top + 10, py)
-                positions.append((int(px), int(py)))
-                cur_bottom = py - 12
-
-        return positions
+        return (mon_left, mon_top, mon_right, mon_bottom)
 
     def _notify_dbus_batch(self, items, timeout_sec=None):
         t_sec = int(self.config.get("dbus_popup_timeout_sec", 8)) if timeout_sec is None else int(timeout_sec)
-        positions = self._compute_dbus_positions(items)
-        return self.dbus_notifier.show_batch(items, timeout_sec=t_sec, positions=positions)
+        mon_bounds = self._get_active_monitor_bounds()
+        return self.bubble_mgr.show_batch(
+            items,
+            mon_bounds=mon_bounds,
+            position=self.config.get("dbus_popup_position", "top_center"),
+            offset_x=int(self.config.get("dbus_popup_x_offset", 0)),
+            offset_y=int(self.config.get("dbus_popup_y_offset", 36)),
+            bg_color=self.config.get("dbus_popup_bg_color", "#182234"),
+            fg_color=self.config.get("dbus_popup_fg_color", "#f0f6ff"),
+            bg_opacity=int(self.config.get("dbus_popup_bg_opacity", 92)),
+            font_size=int(self.config.get("dbus_popup_font_size", 11)),
+            timeout_sec=t_sec,
+        )
 
     def _notify_dbus(self, summary, body, icon="accessories-dictionary", timeout_sec=None):
         return self._notify_dbus_batch([(summary, body, icon)], timeout_sec=timeout_sec)
@@ -2236,100 +2422,13 @@ class DictCalcWidget(Gtk.EventBox):
         combo_out = Gtk.ComboBoxText()
         for o_id, o_lbl in (
             ("window", "無焦點精簡結果視窗 (可捲動看完整詞典，不搶面板游標)"),
-            ("dbus_popup", "系統 D-Bus 通知泡泡 (org.freedesktop.Notifications，不洗版)"),
-            ("calc_dbus_dict_window", "混合模式 (計算機用 D-Bus 泡泡秒出，查詞用無焦點視窗)"),
+            ("dbus_popup", "氣泡框彈出模式 (可於「氣泡框設定」自訂位置、底色、字色與透明度)"),
+            ("calc_dbus_dict_window", "混合模式 (計算機用氣泡框秒出，查詞與翻譯用無焦點視窗)"),
         ):
             combo_out.append(o_id, o_lbl)
         combo_out.set_active_id(self.config.get("result_output_mode", "window"))
         out_box.pack_start(combo_out, True, True, 0)
         tab1.pack_start(out_box, False, False, 0)
-
-        dbus_t_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        dbus_t_box.set_margin_start(14)
-        dbus_t_box.pack_start(Gtk.Label(label="D-Bus 泡泡多詞典呈現：", xalign=0.0), False, False, 0)
-        combo_dbus_style = Gtk.ComboBoxText()
-        combo_dbus_style.append("separate", "每本詞典獨立泡泡 (不洗版，最清晰)")
-        combo_dbus_style.append("merged", "單一泡泡以粗體分隔線區隔 (━━━ 📘 字典 ━━━)")
-        combo_dbus_style.set_active_id(self.config.get("dbus_popup_style", "separate"))
-        dbus_t_box.pack_start(combo_dbus_style, True, True, 0)
-        tab1.pack_start(dbus_t_box, False, False, 0)
-
-        dbus_num_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        dbus_num_box.set_margin_start(14)
-        dbus_num_box.pack_start(Gtk.Label(label="最多詞典數：", xalign=0.0), False, False, 0)
-        spin_dbus_max = Gtk.SpinButton(
-            adjustment=Gtk.Adjustment(
-                value=float(self.config.get("dbus_popup_max_dicts", 3)),
-                lower=1.0,
-                upper=5.0,
-                step_increment=1.0,
-                page_increment=1.0,
-                page_size=0.0,
-            ),
-            climb_rate=1.0,
-            digits=0,
-        )
-        dbus_num_box.pack_start(spin_dbus_max, False, False, 0)
-        dbus_num_box.pack_start(Gtk.Label(label="停留秒數：", xalign=0.0), False, False, 0)
-        spin_dbus_sec = Gtk.SpinButton(
-            adjustment=Gtk.Adjustment(
-                value=float(self.config.get("dbus_popup_timeout_sec", 8)),
-                lower=1.0,
-                upper=60.0,
-                step_increment=1.0,
-                page_increment=5.0,
-                page_size=0.0,
-            ),
-            climb_rate=1.0,
-            digits=0,
-        )
-        dbus_num_box.pack_start(spin_dbus_sec, False, False, 0)
-        dbus_num_box.pack_start(Gtk.Label(label="氣泡字型 (pt)：", xalign=0.0), False, False, 0)
-        spin_dbus_fs = Gtk.SpinButton(
-            adjustment=Gtk.Adjustment(
-                value=float(self.config.get("dbus_popup_font_size", 11)),
-                lower=8.0,
-                upper=22.0,
-                step_increment=1.0,
-                page_increment=2.0,
-                page_size=0.0,
-            ),
-            climb_rate=1.0,
-            digits=0,
-        )
-        dbus_num_box.pack_start(spin_dbus_fs, False, False, 0)
-        dbus_num_box.pack_start(Gtk.Label(label="離面板間距(px)：", xalign=0.0), False, False, 0)
-        spin_dbus_yoff = Gtk.SpinButton(
-            adjustment=Gtk.Adjustment(
-                value=float(self.config.get("dbus_popup_y_offset", 24)),
-                lower=0.0,
-                upper=300.0,
-                step_increment=8.0,
-                page_increment=24.0,
-                page_size=0.0,
-            ),
-            climb_rate=1.0,
-            digits=0,
-        )
-        spin_dbus_yoff.set_tooltip_text("D-Bus 氣泡框與 MATE Panel / 輸入框之間的垂直安全距離 (px)")
-        dbus_num_box.pack_start(spin_dbus_yoff, False, False, 0)
-        btn_test_dbus = Gtk.Button(label="🔔 測試")
-        btn_test_dbus.set_tooltip_text("發送測試 D-Bus 氣泡以預覽字型大小與垂直位置")
-        btn_test_dbus.connect(
-            "clicked",
-            lambda *_: self._notify_dbus(
-                f"📘 氣泡預覽 ({self.config.get('dbus_popup_font_size', 11)} pt)",
-                self._wrap_dbus_font(
-                    "<b>━━━ 📘 DrEye4.1 (example) ━━━</b>\n"
-                    "  n. 範例；實例；榜樣\n"
-                    "  已自動避開 MATE Panel 與輸入框位置。"
-                ),
-                icon="accessories-dictionary",
-                timeout_sec=4,
-            ),
-        )
-        dbus_num_box.pack_start(btn_test_dbus, False, False, 0)
-        tab1.pack_start(dbus_num_box, False, False, 0)
 
         tab1.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
@@ -2440,6 +2539,203 @@ class DictCalcWidget(Gtk.EventBox):
         tab1_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         tab1_scroll.add(tab1)
         notebook.append_page(tab1_scroll, Gtk.Label(label="⚙️ 一般、快捷鍵與外觀"))
+
+        # ---------------- Tab 2: Dedicated Bubble Popup Settings Page ----------------
+        tab_bubble = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        tab_bubble.set_margin_top(14)
+        tab_bubble.set_margin_bottom(14)
+        tab_bubble.set_margin_start(16)
+        tab_bubble.set_margin_end(16)
+
+        b_s1 = Gtk.Label(xalign=0.0)
+        b_s1.set_markup(
+            "<b>1. 氣泡框螢幕位置與微調偏移</b> "
+            "<small><span foreground='#94a3b8'>(依實際渲染寬高精準鎖定於目前螢幕內，不跨螢幕溢出)</span></small>"
+        )
+        tab_bubble.pack_start(b_s1, False, False, 0)
+
+        b_pos_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        b_pos_box.set_margin_start(12)
+        b_pos_box.pack_start(Gtk.Label(label="氣泡框彈出位置：", xalign=0.0), False, False, 0)
+        combo_bubble_pos = Gtk.ComboBoxText()
+        for p_id, p_lbl in (
+            ("top_center", "置中上方 (推薦，不擋兩側視窗與面板)"),
+            ("top_left", "左上角"),
+            ("top_right", "右上角"),
+            ("bottom_right", "右下角"),
+            ("bottom_left", "左下角"),
+        ):
+            combo_bubble_pos.append(p_id, p_lbl)
+        combo_bubble_pos.set_active_id(self.config.get("dbus_popup_position", "top_center"))
+        b_pos_box.pack_start(combo_bubble_pos, True, True, 0)
+        tab_bubble.pack_start(b_pos_box, False, False, 0)
+
+        b_off_grid = Gtk.Grid(column_spacing=12, row_spacing=8)
+        b_off_grid.set_margin_start(12)
+        spin_dbus_xoff = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(
+                value=float(self.config.get("dbus_popup_x_offset", 0)),
+                lower=-500.0,
+                upper=500.0,
+                step_increment=10.0,
+                page_increment=50.0,
+                page_size=0.0,
+            ),
+            climb_rate=1.0,
+            digits=0,
+        )
+        spin_dbus_xoff.set_tooltip_text("正值向右偏移，負值向左偏移 (px)")
+        spin_dbus_yoff = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(
+                value=float(self.config.get("dbus_popup_y_offset", 36)),
+                lower=-300.0,
+                upper=500.0,
+                step_increment=8.0,
+                page_increment=24.0,
+                page_size=0.0,
+            ),
+            climb_rate=1.0,
+            digits=0,
+        )
+        spin_dbus_yoff.set_tooltip_text("上方位置時正值向下推移；下方位置時正值向上推移 (px)")
+        b_off_grid.attach(Gtk.Label(label="水平偏移 Offset X (px)：", xalign=0.0), 0, 0, 1, 1)
+        b_off_grid.attach(spin_dbus_xoff, 1, 0, 1, 1)
+        b_off_grid.attach(Gtk.Label(label="垂直偏移 Offset Y (px)：", xalign=0.0), 2, 0, 1, 1)
+        b_off_grid.attach(spin_dbus_yoff, 3, 0, 1, 1)
+        tab_bubble.pack_start(b_off_grid, False, False, 0)
+
+        tab_bubble.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+
+        b_s2 = Gtk.Label(xalign=0.0)
+        b_s2.set_markup("<b>2. 氣泡框背景顏色、字形顏色與背景透明度</b>")
+        tab_bubble.pack_start(b_s2, False, False, 0)
+
+        b_col_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        b_col_box.set_margin_start(12)
+        b_col_box.pack_start(Gtk.Label(label="背景顏色：", xalign=0.0), False, False, 0)
+        bubble_bg_btn = Gtk.ColorButton()
+        b_bg_rgba0 = Gdk.RGBA()
+        if not b_bg_rgba0.parse(self.config.get("dbus_popup_bg_color", "#182234")):
+            b_bg_rgba0.parse("#182234")
+        bubble_bg_btn.set_rgba(b_bg_rgba0)
+        b_col_box.pack_start(bubble_bg_btn, False, False, 0)
+
+        b_col_box.pack_start(Gtk.Label(label="字形顏色：", xalign=0.0), False, False, 0)
+        bubble_fg_btn = Gtk.ColorButton()
+        b_fg_rgba0 = Gdk.RGBA()
+        if not b_fg_rgba0.parse(self.config.get("dbus_popup_fg_color", "#f0f6ff")):
+            b_fg_rgba0.parse("#f0f6ff")
+        bubble_fg_btn.set_rgba(b_fg_rgba0)
+        b_col_box.pack_start(bubble_fg_btn, False, False, 0)
+
+        btn_b_dark = Gtk.Button(label="深色毛玻璃")
+        btn_b_light = Gtk.Button(label="淺色卡片")
+        btn_b_oled = Gtk.Button(label="半透明黑")
+        b_col_box.pack_end(btn_b_oled, False, False, 0)
+        b_col_box.pack_end(btn_b_light, False, False, 0)
+        b_col_box.pack_end(btn_b_dark, False, False, 0)
+        tab_bubble.pack_start(b_col_box, False, False, 0)
+
+        b_op_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        b_op_box.set_margin_start(12)
+        b_op_box.pack_start(Gtk.Label(label="背景不透明度：", xalign=0.0), False, False, 0)
+        scale_bubble_alpha = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 100.0, 2.0)
+        scale_bubble_alpha.set_digits(0)
+        scale_bubble_alpha.set_draw_value(False)
+        init_b_op = max(0, min(100, int(self.config.get("dbus_popup_bg_opacity", 92))))
+        scale_bubble_alpha.set_value(float(init_b_op))
+        lbl_bubble_alpha = Gtk.Label(label=f"{init_b_op}%")
+        lbl_bubble_alpha.set_width_chars(4)
+        b_op_box.pack_start(scale_bubble_alpha, True, True, 0)
+        b_op_box.pack_start(lbl_bubble_alpha, False, False, 0)
+        tab_bubble.pack_start(b_op_box, False, False, 0)
+
+        tab_bubble.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+
+        b_s3 = Gtk.Label(xalign=0.0)
+        b_s3.set_markup("<b>3. 多詞典呈現方式、字型大小與停留時間</b>")
+        tab_bubble.pack_start(b_s3, False, False, 0)
+
+        dbus_t_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        dbus_t_box.set_margin_start(12)
+        dbus_t_box.pack_start(Gtk.Label(label="多詞典呈現：", xalign=0.0), False, False, 0)
+        combo_dbus_style = Gtk.ComboBoxText()
+        combo_dbus_style.append("separate", "每本詞典獨立泡泡 (不洗版，最清晰)")
+        combo_dbus_style.append("merged", "單一泡泡以粗體分隔線區隔 (━━━ 📘 字典 ━━━)")
+        combo_dbus_style.set_active_id(self.config.get("dbus_popup_style", "separate"))
+        dbus_t_box.pack_start(combo_dbus_style, True, True, 0)
+        tab_bubble.pack_start(dbus_t_box, False, False, 0)
+
+        dbus_num_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        dbus_num_box.set_margin_start(12)
+        dbus_num_box.pack_start(Gtk.Label(label="最多詞典數：", xalign=0.0), False, False, 0)
+        spin_dbus_max = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(
+                value=float(self.config.get("dbus_popup_max_dicts", 3)),
+                lower=1.0,
+                upper=5.0,
+                step_increment=1.0,
+                page_increment=1.0,
+                page_size=0.0,
+            ),
+            climb_rate=1.0,
+            digits=0,
+        )
+        dbus_num_box.pack_start(spin_dbus_max, False, False, 0)
+        dbus_num_box.pack_start(Gtk.Label(label="停留秒數：", xalign=0.0), False, False, 0)
+        spin_dbus_sec = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(
+                value=float(self.config.get("dbus_popup_timeout_sec", 8)),
+                lower=1.0,
+                upper=60.0,
+                step_increment=1.0,
+                page_increment=5.0,
+                page_size=0.0,
+            ),
+            climb_rate=1.0,
+            digits=0,
+        )
+        dbus_num_box.pack_start(spin_dbus_sec, False, False, 0)
+        dbus_num_box.pack_start(Gtk.Label(label="氣泡字型 (pt)：", xalign=0.0), False, False, 0)
+        spin_dbus_fs = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(
+                value=float(self.config.get("dbus_popup_font_size", 11)),
+                lower=8.0,
+                upper=22.0,
+                step_increment=1.0,
+                page_increment=2.0,
+                page_size=0.0,
+            ),
+            climb_rate=1.0,
+            digits=0,
+        )
+        dbus_num_box.pack_start(spin_dbus_fs, False, False, 0)
+        tab_bubble.pack_start(dbus_num_box, False, False, 0)
+
+        b_test_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        b_test_box.set_margin_start(12)
+        b_test_box.set_margin_top(6)
+        btn_test_dbus = Gtk.Button(label="🔔 預覽測試氣泡（單擊氣泡可立即關閉）")
+        btn_test_dbus.connect(
+            "clicked",
+            lambda *_: self._notify_dbus(
+                f"📘 氣泡預覽 ({self.config.get('dbus_popup_font_size', 11)} pt)",
+                self._wrap_dbus_font(
+                    "<b>━━━ 📘 DrEye4.1 (example) ━━━</b>\n"
+                    "  n. 範例；實例；榜樣\n"
+                    "  滑鼠移入氣泡會暫停自動消失，點擊可立即關閉。"
+                ),
+                icon="accessories-dictionary",
+                timeout_sec=6,
+            ),
+        )
+        btn_close_bubbles = Gtk.Button(label="✖ 關閉目前氣泡")
+        btn_close_bubbles.connect("clicked", lambda *_: self.bubble_mgr.close_all())
+        b_test_box.pack_start(btn_test_dbus, False, False, 0)
+        b_test_box.pack_start(btn_close_bubbles, False, False, 0)
+        tab_bubble.pack_start(b_test_box, False, False, 0)
+
+        notebook.append_page(tab_bubble, Gtk.Label(label="💬 氣泡框設定"))
 
         # ---------------- Tab 2: StarDict Dictionaries Manager (3 Independent Profiles) ----------------
         tab2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -2674,7 +2970,14 @@ class DictCalcWidget(Gtk.EventBox):
             self.config["dbus_popup_max_dicts"] = int(spin_dbus_max.get_value_as_int())
             self.config["dbus_popup_timeout_sec"] = int(spin_dbus_sec.get_value_as_int())
             self.config["dbus_popup_font_size"] = int(spin_dbus_fs.get_value_as_int())
+            self.config["dbus_popup_position"] = combo_bubble_pos.get_active_id() or "top_center"
+            self.config["dbus_popup_x_offset"] = int(spin_dbus_xoff.get_value_as_int())
             self.config["dbus_popup_y_offset"] = int(spin_dbus_yoff.get_value_as_int())
+            self.config["dbus_popup_bg_color"] = rgba_to_hex(bubble_bg_btn.get_rgba())
+            self.config["dbus_popup_fg_color"] = rgba_to_hex(bubble_fg_btn.get_rgba())
+            b_op = max(0, min(100, int(round(scale_bubble_alpha.get_value()))))
+            self.config["dbus_popup_bg_opacity"] = b_op
+            lbl_bubble_alpha.set_text(f"{b_op}%")
             self.config["display_mode"] = "badge" if rb_badge.get_active() else "panel_entry"
             self.config["panel_entry_width"] = int(spin_entry_w.get_value_as_int())
             self.config["result_font_size"] = int(spin_res_fs.get_value_as_int())
@@ -2699,18 +3002,35 @@ class DictCalcWidget(Gtk.EventBox):
             scale_bg_alpha.set_value(float(opacity_val))
             apply_tab1()
 
+        def apply_bubble_preset(bg_hex, fg_hex, opacity_val):
+            r_bg = Gdk.RGBA()
+            if r_bg.parse(bg_hex):
+                bubble_bg_btn.set_rgba(r_bg)
+            r_fg = Gdk.RGBA()
+            if r_fg.parse(fg_hex):
+                bubble_fg_btn.set_rgba(r_fg)
+            scale_bubble_alpha.set_value(float(opacity_val))
+            apply_tab1()
+
         btn_apply_hk.connect("clicked", apply_tab1)
         combo_mod.connect("changed", apply_tab1)
         combo_gt_tl.connect("changed", apply_tab1)
         combo_gt_rev.connect("changed", apply_tab1)
         combo_out.connect("changed", apply_tab1)
         combo_dbus_style.connect("changed", apply_tab1)
+        combo_bubble_pos.connect("changed", apply_tab1)
         col_btn.connect("color-set", lambda *_: (rb_col_cus.set_active(True), apply_tab1()))
         bg_col_btn.connect("color-set", apply_tab1)
+        bubble_bg_btn.connect("color-set", apply_tab1)
+        bubble_fg_btn.connect("color-set", apply_tab1)
         scale_bg_alpha.connect("value-changed", apply_tab1)
+        scale_bubble_alpha.connect("value-changed", apply_tab1)
         btn_bg_dark.connect("clicked", lambda *_: apply_bg_preset("#182234", 90))
         btn_bg_light.connect("clicked", lambda *_: apply_bg_preset("#f2f5fa", 92))
         btn_bg_trans.connect("clicked", lambda *_: apply_bg_preset("#182234", 0))
+        btn_b_dark.connect("clicked", lambda *_: apply_bubble_preset("#182234", "#f0f6ff", 92))
+        btn_b_light.connect("clicked", lambda *_: apply_bubble_preset("#f8fafc", "#111827", 95))
+        btn_b_oled.connect("clicked", lambda *_: apply_bubble_preset("#0b0f17", "#ffffff", 82))
         for w_c in (
             chk_scan_en,
             chk_auto_copy,
@@ -2723,7 +3043,15 @@ class DictCalcWidget(Gtk.EventBox):
             chk_shadow,
         ):
             w_c.connect("toggled", apply_tab1)
-        for sp_c in (spin_dbus_max, spin_dbus_sec, spin_dbus_fs, spin_dbus_yoff, spin_entry_w, spin_res_fs):
+        for sp_c in (
+            spin_dbus_max,
+            spin_dbus_sec,
+            spin_dbus_fs,
+            spin_dbus_xoff,
+            spin_dbus_yoff,
+            spin_entry_w,
+            spin_res_fs,
+        ):
             sp_c.connect("value-changed", apply_tab1)
 
         # Bottom Close Button
@@ -2761,6 +3089,8 @@ class DictCalcWidget(Gtk.EventBox):
         if self.popup_win is not None:
             self.popup_win.destroy()
             self.popup_win = None
+        if hasattr(self, "bubble_mgr") and self.bubble_mgr is not None:
+            self.bubble_mgr.close_all()
         if self.prefs_win is not None:
             self.prefs_win.destroy()
             self.prefs_win = None
