@@ -1842,6 +1842,8 @@ class ClockWeatherPopupWindow(Gtk.Window):
     def _hide_popup(self):
         if hasattr(self, "sat_view") and self.sat_view is not None:
             self.sat_view.deactivate()
+        if hasattr(self, "tw_pane") and self.tw_pane is not None:
+            self.tw_pane.deactivate()
         self.hide()
 
     def _on_delete_hide(self, *_args):
@@ -1963,8 +1965,11 @@ class ClockWeatherPopupWindow(Gtk.Window):
             self.sat_view.activate()
         else:
             self.sat_view.deactivate()
-        if page_num == 2 and self.tw_pane is not None:
-            self.tw_pane.reload_tasks()
+        if self.tw_pane is not None:
+            if page_num == 2:
+                self.tw_pane.activate()
+            else:
+                self.tw_pane.deactivate()
 
     def show_tab(self, page_index=0):
         self.position_and_show()
@@ -1976,8 +1981,11 @@ class ClockWeatherPopupWindow(Gtk.Window):
             self.sat_view.activate()
         else:
             self.sat_view.deactivate()
-        if idx == 2 and self.tw_pane is not None:
-            self.tw_pane.reload_tasks()
+        if self.tw_pane is not None:
+            if idx == 2:
+                self.tw_pane.activate()
+            else:
+                self.tw_pane.deactivate()
 
     def _open_world_clock_popover(self, btn):
         pop = Gtk.Popover.new(btn)
@@ -2528,6 +2536,11 @@ class ClockWeatherPopupWindow(Gtk.Window):
             self.set_position(Gtk.WindowPosition.CENTER)
         self.show_all()
         self.present()
+        cur_pg = self.main_notebook.get_current_page()
+        if cur_pg == 1 and hasattr(self, "sat_view") and self.sat_view is not None:
+            self.sat_view.activate()
+        elif cur_pg == 2 and hasattr(self, "tw_pane") and self.tw_pane is not None:
+            self.tw_pane.activate()
 
 
 # =============================================================================

@@ -19,7 +19,7 @@ import subprocess
 import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, Gtk
+from gi.repository import Gdk, Gio, GLib, Gtk
 import cairo
 
 
@@ -276,6 +276,9 @@ class TaskwarriorCalendarPane(Gtk.Box):
         self._by_date_pending = {}
         self._by_date_completed = {}
         self._unscheduled = []
+        self._file_monitor = None
+        self._monitor_debounce_id = None
+        self.connect("destroy", lambda *_: self.deactivate())
 
         # Top navigation bar
         nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -387,6 +390,53 @@ class TaskwarriorCalendarPane(Gtk.Box):
         self.view_month = today.month
         self.selected_date = today
         self._refresh_ui()
+
+    def activate(self):
+        """Start on-demand inotify file monitor on ~/.task and refresh tasks immediately."""
+        self._start_monitor()
+        self.reload_tasks()
+
+    def deactivate(self):
+        """Stop file monitor and pending debounce timer when tab is hidden (0% idle CPU)."""
+        if self._monitor_debounce_id is not None:
+            try:
+                GLib.source_remove(self._monitor_debounce_id)
+            except Exception:
+                pass
+            self._monitor_debounce_id = None
+        if self._file_monitor is not None:
+            try:
+                self._file_monitor.cancel()
+            except Exception:
+                pass
+            self._file_monitor = None
+
+    def _start_monitor(self):
+        if self._file_monitor is not None:
+            return
+        task_dir = os.path.expanduser("~/.task")
+        if not os.path.isdir(task_dir):
+            return
+        try:
+            gfile = Gio.File.new_for_path(task_dir)
+            mon = gfile.monitor_directory(Gio.FileMonitorFlags.NONE, None)
+            mon.connect("changed", self._on_task_dir_changed)
+            self._file_monitor = mon
+        except Exception:
+            self._file_monitor = None
+
+    def _on_task_dir_changed(self, _mon, _f, _other, _ev_type):
+        if self._monitor_debounce_id is not None:
+            try:
+                GLib.source_remove(self._monitor_debounce_id)
+            except Exception:
+                pass
+        self._monitor_debounce_id = GLib.timeout_add(250, self._on_debounced_reload)
+
+    def _on_debounced_reload(self):
+        self._monitor_debounce_id = None
+        self.reload_tasks()
+        return False
 
     def reload_tasks(self):
         if not TaskwarriorBackend.is_available():
