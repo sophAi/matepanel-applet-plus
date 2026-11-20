@@ -27,12 +27,14 @@ Features:
 
 import ast
 from collections import OrderedDict
+import datetime
 import glob
 import html
 import json
 import math
 import operator
 import os
+import random
 import re
 import subprocess
 import sys
@@ -40,6 +42,8 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+import zipfile
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -64,6 +68,7 @@ except (ValueError, ImportError):
 
 CONFIG_DIR = os.path.expanduser("~/.config/matepanel-applet-plus")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "dict-calc.json")
+VOCAB_PATH = os.path.join(CONFIG_DIR, "vocab-history.json")
 
 DICT_SEARCH_DIRS = [
     "/usr/share/stardict/dic",
@@ -130,6 +135,10 @@ DEFAULT_CONFIG = {
     "enabled_dicts": list(DEFAULT_PREFERRED_DICTS),           # 無焦點查詢視窗詞典清單 (含順位)
     "enabled_dicts_dbus": list(DEFAULT_PREFERRED_DICTS[:5]),  # D-Bus 氣泡框詞典清單 (含順位)
     "enabled_dicts_scan": list(DEFAULT_PREFERRED_DICTS[:5]),  # Scan Selection 劃詞詞典清單 (含順位)
+    "vocab_record_enabled": True,        # 自動紀錄傳統 StarDict 詞典查詢命中的單字
+    "vocab_card_dicts": ["DrEye4in1詞典", "Collins Cobuild English Dictionary", "英文字根字典"],
+    "vocab_sort_mode": "recent",         # "recent", "freq", "alpha", "random"
+    "vocab_epub_layout": "per_word",     # "per_word" (一字一頁，預設) or "az_chapters" (依字母 A-Z 分章)
     "result_font_size": 11,              # 結果視窗字型大小 (pt)
     "font_color_mode": "dynamic",        # "dynamic" or "custom"
     "custom_font_color": "#ffffff",      # 自訂面板字形顏色
@@ -1364,6 +1373,414 @@ class StarDictManager:
             return []
 
 
+class VocabHistoryManager:
+    """
+    Lightweight vocabulary history store for traditional StarDict dictionary lookups,
+    plus zero-dependency HTML (interactive flashcard) & EPUB 3.0 (e-reader) exporters.
+    """
+
+    def __init__(self, path=VOCAB_PATH):
+        self.path = path
+        self._lock = threading.Lock()
+        self._words = {}  # key (lowercased) -> {'word': str, 'count': int, 'first_seen': str, 'last_seen': str}
+        self.load()
+
+    def load(self):
+        with self._lock:
+            self._words = {}
+            if os.path.exists(self.path):
+                try:
+                    with open(self.path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if isinstance(data, dict) and isinstance(data.get("words"), dict):
+                        self._words = data["words"]
+                except Exception:
+                    self._words = {}
+
+    def _save_unlocked(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump({"words": self._words}, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def record_word(self, word):
+        w = (word or "").strip()
+        if not w or "\n" in w or len(w) > 80:
+            return
+        key = w.lower()
+        now_iso = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            entry = self._words.get(key)
+            if entry is None:
+                self._words[key] = {
+                    "word": w,
+                    "count": 1,
+                    "first_seen": now_iso,
+                    "last_seen": now_iso,
+                }
+            else:
+                entry["count"] = int(entry.get("count", 0)) + 1
+                entry["last_seen"] = now_iso
+            self._save_unlocked()
+
+    def get_entries(self, filter_mode="all", sort_mode="recent"):
+        with self._lock:
+            items = [dict(v) for v in self._words.values()]
+
+        now = datetime.datetime.now()
+        if filter_mode in ("7d", "30d"):
+            days = 7 if filter_mode == "7d" else 30
+            cutoff = now - datetime.timedelta(days=days)
+            filtered = []
+            for it in items:
+                try:
+                    dt = datetime.datetime.strptime(it.get("last_seen", "")[:19], "%Y-%m-%d %H:%M:%S")
+                    if dt >= cutoff:
+                        filtered.append(it)
+                except Exception:
+                    pass
+            items = filtered
+        elif filter_mode == "freq2":
+            items = [it for it in items if int(it.get("count", 1)) >= 2]
+
+        if sort_mode == "freq":
+            items.sort(key=lambda x: (-int(x.get("count", 1)), x.get("last_seen", "")), reverse=False)
+        elif sort_mode == "alpha":
+            items.sort(key=lambda x: x.get("word", "").lower())
+        elif sort_mode == "random":
+            random.shuffle(items)
+        else:  # recent
+            items.sort(key=lambda x: x.get("last_seen", ""), reverse=True)
+        return items
+
+    def delete_words(self, words_list):
+        if not words_list:
+            return
+        keys = {w.strip().lower() for w in words_list if w}
+        with self._lock:
+            for k in keys:
+                self._words.pop(k, None)
+            self._save_unlocked()
+
+    def clear_all(self):
+        with self._lock:
+            self._words = {}
+            self._save_unlocked()
+
+    @staticmethod
+    def export_html(filepath, cards, title="StarDict 單字卡"):
+        """
+        Export cards = [{'word': str, 'count': int, 'last_seen': str, 'entries': [{'dict': str, 'word': str, 'definition': str}]}]
+        into a single self-contained interactive HTML flashcard file (flip mode + list mode + live shuffle + search).
+        """
+        gen_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        card_html_parts = []
+        for idx, c in enumerate(cards, start=1):
+            w_esc = html.escape(c["word"])
+            cnt = int(c.get("count", 1))
+            entries_parts = []
+            for e in c.get("entries", []):
+                d_esc = html.escape(e["dict"])
+                ew_esc = html.escape(e["word"])
+                def_esc = html.escape(e["definition"]).replace("\n", "<br>")
+                entries_parts.append(
+                    f'<div class="dict-block">'
+                    f'<div class="dict-name">📖 {d_esc} <span class="headword">【{ew_esc}】</span></div>'
+                    f'<div class="dict-def">{def_esc}</div>'
+                    f'</div>'
+                )
+            if not entries_parts:
+                entries_parts.append('<div class="dict-empty">（所選詞典無此詞條釋義）</div>')
+            card_html_parts.append(
+                f'<article class="card" data-word="{w_esc.lower()}" onclick="this.classList.toggle(\'revealed\')">'
+                f'<div class="card-head">'
+                f'<span class="idx">#{idx}</span>'
+                f'<span class="word">{w_esc}</span>'
+                f'<span class="badge">查詢 {cnt} 次</span>'
+                f'</div>'
+                f'<div class="card-body">{"".join(entries_parts)}</div>'
+                f'</article>'
+            )
+
+        doc = f"""<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html.escape(title)}</title>
+<style>
+:root {{
+  --bg: #f4f6f9; --card: #ffffff; --text: #111827; --muted: #64748b;
+  --accent: #0284c7; --border: #e2e8f0; --badge-bg: #e0f2fe; --badge-fg: #0369a1;
+}}
+body.dark {{
+  --bg: #0f172a; --card: #1e293b; --text: #f1f5f9; --muted: #94a3b8;
+  --accent: #38bdf8; --border: #334155; --badge-bg: #0c4a6e; --badge-fg: #7dd3fc;
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  margin: 0; padding: 18px; background: var(--bg); color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Noto Sans CJK TC", "PingFang TC", sans-serif;
+  line-height: 1.65;
+}}
+header {{
+  max-width: 860px; margin: 0 auto 18px; padding: 14px 18px;
+  background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+}}
+header h1 {{ margin: 0 0 6px; font-size: 1.3rem; }}
+.meta {{ color: var(--muted); font-size: 0.88rem; margin-bottom: 10px; }}
+.toolbar {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
+.toolbar input {{
+  flex: 1; min-width: 180px; padding: 7px 11px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--bg); color: var(--text);
+}}
+.toolbar button {{
+  padding: 7px 12px; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--bg); color: var(--text); cursor: pointer; font-size: 0.9rem;
+}}
+.toolbar button:hover {{ border-color: var(--accent); color: var(--accent); }}
+main {{ max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }}
+.card {{
+  background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+  padding: 14px 18px; cursor: pointer; transition: border-color 0.15s;
+}}
+.card:hover {{ border-color: var(--accent); }}
+.card-head {{ display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }}
+.idx {{ color: var(--muted); font-size: 0.85rem; }}
+.word {{ font-size: 1.35rem; font-weight: 700; color: var(--accent); }}
+.badge {{
+  margin-left: auto; font-size: 0.78rem; padding: 2px 8px; border-radius: 999px;
+  background: var(--badge-bg); color: var(--badge-fg);
+}}
+.card-body {{ margin-top: 10px; border-top: 1px dashed var(--border); padding-top: 10px; }}
+body.flip-mode .card .card-body {{ display: none; }}
+body.flip-mode .card.revealed .card-body {{ display: block; }}
+body.flip-mode .card:not(.revealed)::after {{
+  content: "（點擊卡片顯示釋義）"; display: block; margin-top: 6px;
+  color: var(--muted); font-size: 0.84rem;
+}}
+.dict-block {{ margin-bottom: 10px; }}
+.dict-block:last-child {{ margin-bottom: 0; }}
+.dict-name {{ font-weight: 700; font-size: 0.92rem; color: var(--accent); margin-bottom: 3px; }}
+.headword {{ color: var(--muted); font-weight: 500; }}
+.dict-def {{ font-size: 0.96rem; white-space: normal; word-break: break-word; }}
+.dict-empty {{ color: var(--muted); font-style: italic; }}
+</style>
+</head>
+<body class="flip-mode">
+<header>
+  <h1>🗂 {html.escape(title)}</h1>
+  <div class="meta">共 {len(cards)} 個單字 · 產生時間：{gen_time}</div>
+  <div class="toolbar">
+    <input id="q" type="search" placeholder="🔎 篩選單字..." oninput="filterCards()">
+    <button onclick="toggleFlip()" id="btnFlip">📖 切換為全部展開</button>
+    <button onclick="shuffleCards()">🎲 隨機洗牌</button>
+    <button onclick="document.body.classList.toggle('dark')">🌙 深色/淺色</button>
+  </div>
+</header>
+<main id="deck">
+{"".join(card_html_parts)}
+</main>
+<script>
+function toggleFlip() {{
+  const isFlip = document.body.classList.toggle('flip-mode');
+  document.getElementById('btnFlip').textContent = isFlip ? '📖 切換為全部展開' : '🃏 切換為翻卡測驗';
+}}
+function filterCards() {{
+  const q = document.getElementById('q').value.trim().toLowerCase();
+  document.querySelectorAll('.card').forEach(el => {{
+    el.style.display = (!q || el.dataset.word.includes(q)) ? '' : 'none';
+  }});
+}}
+function shuffleCards() {{
+  const deck = document.getElementById('deck');
+  const arr = Array.from(deck.children);
+  for (let i = arr.length - 1; i > 0; i--) {{
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }}
+  arr.forEach((el, idx) => {{
+    el.classList.remove('revealed');
+    const idxEl = el.querySelector('.idx');
+    if (idxEl) idxEl.textContent = '#' + (idx + 1);
+    deck.appendChild(el);
+  }});
+}}
+</script>
+</body>
+</html>
+"""
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(doc)
+
+    @staticmethod
+    def export_epub(filepath, cards, layout="per_word", title="StarDict 單字卡"):
+        """
+        Export cards into a standards-compliant EPUB 3.0 ebook using Python stdlib `zipfile`.
+        layout:
+          - 'per_word'    : One word per XHTML page (default, ideal for e-ink flashcard flipping!)
+          - 'az_chapters' : Grouped into A-Z alphabetical chapters
+        """
+        book_uuid = f"urn:uuid:{uuid.uuid4()}"
+        now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        title_esc = html.escape(title)
+
+        style_css = """body {
+  font-family: serif; line-height: 1.65; margin: 1em; color: #111;
+}
+h1.word-title {
+  font-size: 1.6em; margin: 0 0 0.25em 0; border-bottom: 2px solid #222; padding-bottom: 0.2em;
+}
+.meta { font-size: 0.85em; color: #555; margin-bottom: 0.9em; }
+.dict-block { margin-bottom: 1em; }
+.dict-name { font-weight: bold; font-size: 1.02em; margin-bottom: 0.25em; }
+.dict-def { margin: 0; white-space: pre-wrap; }
+.card-sep { border: 0; border-top: 1px dashed #999; margin: 1.2em 0; }
+"""
+
+        def render_card_xhtml_fragment(c):
+            w_esc = html.escape(c["word"])
+            cnt = int(c.get("count", 1))
+            parts = [
+                f'<h1 class="word-title">{w_esc}</h1>',
+                f'<div class="meta">查詢次數：{cnt}</div>',
+            ]
+            entries = c.get("entries", [])
+            if not entries:
+                parts.append('<p class="meta">（所選詞典無此詞條釋義）</p>')
+            else:
+                for e in entries:
+                    d_esc = html.escape(e["dict"])
+                    ew_esc = html.escape(e["word"])
+                    def_esc = html.escape(e["definition"]).replace("\n", "<br/>")
+                    parts.append(
+                        f'<div class="dict-block">'
+                        f'<div class="dict-name">{d_esc}（{ew_esc}）</div>'
+                        f'<p class="dict-def">{def_esc}</p>'
+                        f'</div>'
+                    )
+            return "\n".join(parts)
+
+        pages = []  # list of (filename, nav_label, xhtml_content)
+        if layout == "az_chapters":
+            groups = OrderedDict()
+            for c in cards:
+                ch = c["word"][0].upper() if c["word"] else "#"
+                if not ("A" <= ch <= "Z"):
+                    ch = "#"
+                groups.setdefault(ch, []).append(c)
+            for idx, (ch_lbl, grp_cards) in enumerate(groups.items(), start=1):
+                fname = f"ch_{idx:03d}.xhtml"
+                body_frags = [render_card_xhtml_fragment(c) for c in grp_cards]
+                body_html = '\n<hr class="card-sep"/>\n'.join(body_frags)
+                xhtml = (
+                    '<?xml version="1.0" encoding="utf-8"?>\n'
+                    '<!DOCTYPE html>\n'
+                    '<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="zh-Hant">\n'
+                    f'<head><title>{html.escape(ch_lbl)}</title>'
+                    '<link rel="stylesheet" type="text/css" href="style.css"/></head>\n'
+                    f'<body>\n{body_html}\n</body>\n</html>\n'
+                )
+                pages.append((fname, f"{ch_lbl} ({len(grp_cards)})", xhtml))
+        else:
+            # Default: per_word (one word per page!)
+            for idx, c in enumerate(cards, start=1):
+                fname = f"word_{idx:04d}.xhtml"
+                body_html = render_card_xhtml_fragment(c)
+                xhtml = (
+                    '<?xml version="1.0" encoding="utf-8"?>\n'
+                    '<!DOCTYPE html>\n'
+                    '<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="zh-Hant">\n'
+                    f'<head><title>{html.escape(c["word"])}</title>'
+                    '<link rel="stylesheet" type="text/css" href="style.css"/></head>\n'
+                    f'<body>\n{body_html}\n</body>\n</html>\n'
+                )
+                pages.append((fname, c["word"], xhtml))
+
+        # Navigation XHTML (EPUB 3) & NCX (EPUB 2 compatibility)
+        nav_li = "\n".join(
+            f'      <li><a href="{fname}">{html.escape(lbl)}</a></li>'
+            for fname, lbl, _ in pages
+        )
+        nav_xhtml = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<!DOCTYPE html>\n'
+            '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="zh-Hant">\n'
+            f'<head><title>{title_esc}</title><link rel="stylesheet" type="text/css" href="style.css"/></head>\n'
+            '<body>\n'
+            f'  <nav epub:type="toc" id="toc"><h1>{title_esc}</h1>\n    <ol>\n{nav_li}\n    </ol>\n  </nav>\n'
+            '</body>\n</html>\n'
+        )
+
+        ncx_points = "\n".join(
+            f'    <navPoint id="np-{i}" playOrder="{i}">'
+            f'<navLabel><text>{html.escape(lbl)}</text></navLabel>'
+            f'<content src="{fname}"/></navPoint>'
+            for i, (fname, lbl, _) in enumerate(pages, start=1)
+        )
+        toc_ncx = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">\n'
+            '  <head>\n'
+            f'    <meta name="dtb:uid" content="{book_uuid}"/>\n'
+            '    <meta name="dtb:depth" content="1"/>\n'
+            '    <meta name="dtb:totalPageCount" content="0"/>\n'
+            '    <meta name="dtb:maxPageNumber" content="0"/>\n'
+            '  </head>\n'
+            f'  <docTitle><text>{title_esc}</text></docTitle>\n'
+            f'  <navMap>\n{ncx_points}\n  </navMap>\n'
+            '</ncx>\n'
+        )
+
+        manifest_items = [
+            '    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>',
+            '    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>',
+            '    <item id="css" href="style.css" media-type="text/css"/>',
+        ]
+        spine_items = []
+        for i, (fname, _lbl, _xhtml) in enumerate(pages, start=1):
+            iid = f"p{i:04d}"
+            manifest_items.append(f'    <item id="{iid}" href="{fname}" media-type="application/xhtml+xml"/>')
+            spine_items.append(f'    <itemref idref="{iid}"/>')
+
+        content_opf = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid">\n'
+            '  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">\n'
+            f'    <dc:identifier id="bookid">{book_uuid}</dc:identifier>\n'
+            f'    <dc:title>{title_esc}</dc:title>\n'
+            '    <dc:language>zh-Hant</dc:language>\n'
+            '    <dc:creator>StarDict &amp; Calc Plus</dc:creator>\n'
+            f'    <meta property="dcterms:modified">{now_utc}</meta>\n'
+            '  </metadata>\n'
+            '  <manifest>\n' + "\n".join(manifest_items) + '\n  </manifest>\n'
+            '  <spine toc="ncx">\n' + "\n".join(spine_items) + '\n  </spine>\n'
+            '</package>\n'
+        )
+
+        container_xml = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">\n'
+            '  <rootfiles>\n'
+            '    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>\n'
+            '  </rootfiles>\n'
+            '</container>\n'
+        )
+
+        with zipfile.ZipFile(filepath, "w") as zf:
+            # EPUB spec requires `mimetype` as the first uncompressed entry
+            zf.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
+            zf.writestr("META-INF/container.xml", container_xml, compress_type=zipfile.ZIP_DEFLATED)
+            zf.writestr("OEBPS/style.css", style_css, compress_type=zipfile.ZIP_DEFLATED)
+            zf.writestr("OEBPS/nav.xhtml", nav_xhtml, compress_type=zipfile.ZIP_DEFLATED)
+            zf.writestr("OEBPS/toc.ncx", toc_ncx, compress_type=zipfile.ZIP_DEFLATED)
+            zf.writestr("OEBPS/content.opf", content_opf, compress_type=zipfile.ZIP_DEFLATED)
+            for fname, _lbl, xhtml in pages:
+                zf.writestr(f"OEBPS/{fname}", xhtml, compress_type=zipfile.ZIP_DEFLATED)
+
+
 def hex_to_rgb(hex_str, default=(1.0, 1.0, 1.0)):
     if not hex_str or not isinstance(hex_str, str):
         return default
@@ -1801,6 +2218,7 @@ class DictCalcWidget(Gtk.EventBox):
 
         self.config = self._load_config()
         self.dict_mgr = StarDictManager(root_dir=self.config.get("dict_root_dir", "/usr/share/stardict/dic"))
+        self.vocab_mgr = VocabHistoryManager()
         self.calc = SafeMathCalculator()
         self.dbus_notifier = DBusNotifier()
         self.bubble_mgr = CustomBubbleManager()
@@ -2593,6 +3011,8 @@ class DictCalcWidget(Gtk.EventBox):
         if not is_sentence and StarDictManager.is_single_english_word(q):
             def gated_english_worker():
                 res = self.dict_mgr.query_sync(q, dict_names=sdcv_names) if sdcv_names else []
+                if res and self.config.get("vocab_record_enabled", True):
+                    self.vocab_mgr.record_word(q)
                 sp_info = None
                 if not res:
                     sugs = StarDictManager.suggest_spelling_sync(q, max_suggestions=8)
@@ -2621,6 +3041,8 @@ class DictCalcWidget(Gtk.EventBox):
         if sdcv_names:
             def sdcv_worker():
                 res = self.dict_mgr.query_sync(q, dict_names=sdcv_names)
+                if res and self.config.get("vocab_record_enabled", True):
+                    self.vocab_mgr.record_word(q)
                 GLib.idle_add(merge_and_render, res, None)
 
             threading.Thread(target=sdcv_worker, daemon=True).start()
@@ -3953,6 +4375,294 @@ class DictCalcWidget(Gtk.EventBox):
 
         notebook.append_page(tab2, d_tab_lbl)
 
+        # ---------------- Tab 5: Vocabulary Flashcards (History + Dict Selection + HTML/EPUB Export) ----------------
+        tab_vocab = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        tab_vocab.set_margin_top(10)
+        tab_vocab.set_margin_bottom(10)
+        tab_vocab.set_margin_start(12)
+        tab_vocab.set_margin_end(12)
+
+        v_top_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        chk_vocab_rec = Gtk.CheckButton(label="自動紀錄傳統詞典查詢命中的單字")
+        chk_vocab_rec.set_active(self.config.get("vocab_record_enabled", True))
+        v_top_box.pack_start(chk_vocab_rec, False, False, 0)
+
+        combo_v_filter = Gtk.ComboBoxText()
+        for f_id, f_lbl in (
+            ("all", "全部紀錄"),
+            ("7d", "最近 7 天"),
+            ("30d", "最近 30 天"),
+            ("freq2", "查詢 ≥ 2 次"),
+        ):
+            combo_v_filter.append(f_id, f_lbl)
+        combo_v_filter.set_active_id("all")
+
+        combo_v_sort = Gtk.ComboBoxText()
+        for s_id, s_lbl in (
+            ("recent", "排序：最近查詢"),
+            ("freq", "排序：查詢次數"),
+            ("alpha", "排序：字母 A→Z"),
+            ("random", "🎲 排序：隨機洗牌"),
+        ):
+            combo_v_sort.append(s_id, s_lbl)
+        combo_v_sort.set_active_id(self.config.get("vocab_sort_mode", "recent"))
+
+        btn_v_refresh = Gtk.Button(label="🔄")
+        btn_v_refresh.set_tooltip_text("重新整理單字紀錄（若選擇隨機排序會重新洗牌）")
+        v_top_box.pack_end(btn_v_refresh, False, False, 0)
+        v_top_box.pack_end(combo_v_sort, False, False, 0)
+        v_top_box.pack_end(combo_v_filter, False, False, 0)
+        tab_vocab.pack_start(v_top_box, False, False, 0)
+
+        # Split pane: Left = recorded vocabulary words, Right = traditional StarDict dicts for card generation
+        v_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        v_paned.set_vexpand(True)
+
+        # Left pane: Recorded words TreeView
+        v_left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        lbl_v_words = Gtk.Label(xalign=0.0)
+        v_left.pack_start(lbl_v_words, False, False, 0)
+
+        v_word_store = Gtk.ListStore(bool, str, int, str)
+        v_word_tree = Gtk.TreeView(model=v_word_store)
+        v_rend_chk = Gtk.CellRendererToggle()
+
+        def on_v_word_toggled(_cell, path_str):
+            v_word_store[path_str][0] = not v_word_store[path_str][0]
+            update_vocab_counts()
+
+        v_rend_chk.connect("toggled", on_v_word_toggled)
+        v_word_tree.append_column(Gtk.TreeViewColumn("選", v_rend_chk, active=0))
+        col_vw = Gtk.TreeViewColumn("單字", Gtk.CellRendererText(), text=1)
+        col_vw.set_expand(True)
+        v_word_tree.append_column(col_vw)
+        v_word_tree.append_column(Gtk.TreeViewColumn("次數", Gtk.CellRendererText(), text=2))
+        v_word_tree.append_column(Gtk.TreeViewColumn("最後查詢", Gtk.CellRendererText(), text=3))
+
+        v_w_scroll = Gtk.ScrolledWindow()
+        v_w_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        v_w_scroll.set_vexpand(True)
+        v_w_scroll.add(v_word_tree)
+        v_left.pack_start(v_w_scroll, True, True, 0)
+
+        v_w_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        btn_vw_all = Gtk.Button(label="全選")
+        btn_vw_none = Gtk.Button(label="取消")
+        btn_vw_del = Gtk.Button(label="刪除勾選")
+        btn_vw_clr = Gtk.Button(label="清空全部")
+        for b_vw in (btn_vw_all, btn_vw_none, btn_vw_del, btn_vw_clr):
+            v_w_btns.pack_start(b_vw, False, False, 0)
+        v_left.pack_start(v_w_btns, False, False, 0)
+
+        # Right pane: Traditional StarDict dictionaries selector for flashcards
+        v_right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        v_right.set_margin_start(8)
+        lbl_v_dicts = Gtk.Label(xalign=0.0)
+        v_right.pack_start(lbl_v_dicts, False, False, 0)
+
+        v_dict_store = Gtk.ListStore(bool, str)
+        v_dict_tree = Gtk.TreeView(model=v_dict_store)
+        vd_rend_chk = Gtk.CellRendererToggle()
+
+        def save_vocab_dicts():
+            chosen = [row[1] for row in v_dict_store if row[0]]
+            self.config["vocab_card_dicts"] = chosen
+            self._save_config()
+            lbl_v_dicts.set_markup(f"<b>單字卡來源詞典</b> <small>(已選 {len(chosen)} 套)</small>")
+
+        def on_v_dict_toggled(_cell, path_str):
+            v_dict_store[path_str][0] = not v_dict_store[path_str][0]
+            save_vocab_dicts()
+
+        vd_rend_chk.connect("toggled", on_v_dict_toggled)
+        v_dict_tree.append_column(Gtk.TreeViewColumn("用", vd_rend_chk, active=0))
+        col_vd = Gtk.TreeViewColumn("傳統 Dict 詞典", Gtk.CellRendererText(), text=1)
+        col_vd.set_expand(True)
+        v_dict_tree.append_column(col_vd)
+
+        v_d_scroll = Gtk.ScrolledWindow()
+        v_d_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        v_d_scroll.set_vexpand(True)
+        v_d_scroll.add(v_dict_tree)
+        v_right.pack_start(v_d_scroll, True, True, 0)
+
+        def refresh_vocab_dict_list():
+            v_dict_store.clear()
+            saved_vd = list(self.config.get("vocab_card_dicts", DEFAULT_PREFERRED_DICTS[:3]))
+            saved_set = set(saved_vd)
+            all_names = [d["bookname"] for d in self.dict_mgr.all_dicts]
+            ordered = [n for n in saved_vd if n in all_names] + [n for n in all_names if n not in saved_set]
+            for name in ordered:
+                v_dict_store.append([name in saved_set, name])
+            n_sel = sum(1 for row in v_dict_store if row[0])
+            lbl_v_dicts.set_markup(f"<b>單字卡來源詞典</b> <small>(已選 {n_sel} 套)</small>")
+
+        refresh_vocab_dict_list()
+        profile_refreshers.append(refresh_vocab_dict_list)
+
+        v_paned.pack1(v_left, True, False)
+        v_paned.pack2(v_right, True, False)
+        v_paned.set_position(330)
+        tab_vocab.pack_start(v_paned, True, True, 0)
+
+        # Bottom Export Bar (EPUB layout + HTML / EPUB buttons + Progress)
+        v_exp_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        v_exp_box.pack_start(Gtk.Label(label="EPUB 排版：", xalign=0.0), False, False, 0)
+        combo_epub_layout = Gtk.ComboBoxText()
+        combo_epub_layout.append("per_word", "一字一頁 (預設，適合翻頁背單字)")
+        combo_epub_layout.append("az_chapters", "依字母 A–Z 分章")
+        combo_epub_layout.set_active_id(self.config.get("vocab_epub_layout", "per_word"))
+        v_exp_box.pack_start(combo_epub_layout, True, True, 0)
+
+        btn_exp_html = Gtk.Button(label="📄 匯出 HTML 單字卡")
+        btn_exp_epub = Gtk.Button(label="📚 匯出 EPUB 電子書")
+        v_exp_box.pack_start(btn_exp_html, False, False, 0)
+        v_exp_box.pack_start(btn_exp_epub, False, False, 0)
+        tab_vocab.pack_start(v_exp_box, False, False, 0)
+
+        v_prog_bar = Gtk.ProgressBar()
+        v_prog_bar.set_show_text(True)
+        v_prog_bar.set_text("就緒（勾選單字與詞典後即可匯出）")
+        tab_vocab.pack_start(v_prog_bar, False, False, 0)
+
+        v_tab_lbl = Gtk.Label(label="🗂 單字卡")
+
+        def update_vocab_counts():
+            total = len(v_word_store)
+            sel = sum(1 for row in v_word_store if row[0])
+            lbl_v_words.set_markup(f"<b>已紀錄單字</b> <small>(共 {total} 字，已勾選 {sel} 字)</small>")
+            v_tab_lbl.set_text(f"🗂 單字卡 ({total})")
+
+        def refresh_vocab_words(*_):
+            f_mode = combo_v_filter.get_active_id() or "all"
+            s_mode = combo_v_sort.get_active_id() or "recent"
+            self.config["vocab_sort_mode"] = s_mode
+            self._save_config()
+            entries = self.vocab_mgr.get_entries(filter_mode=f_mode, sort_mode=s_mode)
+            v_word_store.clear()
+            for it in entries:
+                dt_short = str(it.get("last_seen", ""))[:10]
+                v_word_store.append([True, it["word"], int(it.get("count", 1)), dt_short])
+            update_vocab_counts()
+
+        refresh_vocab_words()
+
+        def set_all_v_words(val):
+            for row in v_word_store:
+                row[0] = val
+            update_vocab_counts()
+
+        def delete_selected_v_words(*_):
+            to_del = [row[1] for row in v_word_store if row[0]]
+            if not to_del:
+                return
+            self.vocab_mgr.delete_words(to_del)
+            refresh_vocab_words()
+
+        def clear_all_v_words(*_):
+            self.vocab_mgr.clear_all()
+            refresh_vocab_words()
+
+        def start_vocab_export(fmt):
+            selected_rows = [(row[1], row[2], row[3]) for row in v_word_store if row[0]]
+            if not selected_rows:
+                v_prog_bar.set_text("⚠️ 請先勾選至少一個要匯出的單字")
+                return
+            dict_names = [row[1] for row in v_dict_store if row[0]]
+            if not dict_names:
+                v_prog_bar.set_text("⚠️ 請先在右側勾選至少一套傳統詞典")
+                return
+
+            ext = ".html" if fmt == "html" else ".epub"
+            today_str = datetime.datetime.now().strftime("%Y%m%d")
+            dlg = Gtk.FileChooserDialog(
+                title=f"儲存 {fmt.upper()} 單字卡",
+                parent=win,
+                action=Gtk.FileChooserAction.SAVE,
+            )
+            dlg.set_do_overwrite_confirmation(True)
+            dlg.add_buttons(
+                Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                Gtk.STOCK_SAVE, Gtk.ResponseType.OK,
+            )
+            dlg.set_current_folder(os.path.expanduser("~"))
+            dlg.set_current_name(f"stardict-flashcards-{today_str}{ext}")
+            resp = dlg.run()
+            out_path = dlg.get_filename() if resp == Gtk.ResponseType.OK else None
+            dlg.destroy()
+            if not out_path:
+                return
+            if not out_path.lower().endswith(ext):
+                out_path += ext
+
+            sort_mode = combo_v_sort.get_active_id() or "recent"
+            epub_layout = combo_epub_layout.get_active_id() or "per_word"
+            if sort_mode == "random":
+                random.shuffle(selected_rows)
+
+            btn_exp_html.set_sensitive(False)
+            btn_exp_epub.set_sensitive(False)
+            v_prog_bar.set_fraction(0.0)
+            v_prog_bar.set_text(f"⏳ 正在查詢詞典並製作 {fmt.upper()} ({len(selected_rows)} 字)...")
+
+            def _exp_worker():
+                cards = []
+                total = len(selected_rows)
+                for idx, (w_str, cnt_val, last_s) in enumerate(selected_rows, start=1):
+                    hits = self.dict_mgr.query_sync(w_str, dict_names=dict_names, exact=True)
+                    cards.append(
+                        {
+                            "word": w_str,
+                            "count": cnt_val,
+                            "last_seen": last_s,
+                            "entries": hits,
+                        }
+                    )
+                    frac = idx / float(max(1, total))
+                    GLib.idle_add(
+                        lambda f=frac, i=idx, t=total: (
+                            v_prog_bar.set_fraction(f),
+                            v_prog_bar.set_text(f"⏳ 查詢詞條進度：{i} / {t}"),
+                            False,
+                        )[-1]
+                    )
+                err_msg = None
+                try:
+                    book_title = f"StarDict 單字卡 ({today_str})"
+                    if fmt == "html":
+                        VocabHistoryManager.export_html(out_path, cards, title=book_title)
+                    else:
+                        VocabHistoryManager.export_epub(out_path, cards, layout=epub_layout, title=book_title)
+                except Exception as exc:
+                    err_msg = str(exc)
+
+                def _exp_done():
+                    btn_exp_html.set_sensitive(True)
+                    btn_exp_epub.set_sensitive(True)
+                    if err_msg:
+                        v_prog_bar.set_fraction(0.0)
+                        v_prog_bar.set_text(f"❌ 匯出失敗：{err_msg}")
+                    else:
+                        v_prog_bar.set_fraction(1.0)
+                        v_prog_bar.set_text(f"✅ 已匯出 {len(cards)} 字至：{os.path.basename(out_path)}")
+                    return False
+
+                GLib.idle_add(_exp_done)
+
+            threading.Thread(target=_exp_worker, daemon=True).start()
+
+        btn_v_refresh.connect("clicked", refresh_vocab_words)
+        combo_v_filter.connect("changed", refresh_vocab_words)
+        combo_v_sort.connect("changed", refresh_vocab_words)
+        btn_vw_all.connect("clicked", lambda *_: set_all_v_words(True))
+        btn_vw_none.connect("clicked", lambda *_: set_all_v_words(False))
+        btn_vw_del.connect("clicked", delete_selected_v_words)
+        btn_vw_clr.connect("clicked", clear_all_v_words)
+        btn_exp_html.connect("clicked", lambda *_: start_vocab_export("html"))
+        btn_exp_epub.connect("clicked", lambda *_: start_vocab_export("epub"))
+
+        notebook.append_page(tab_vocab, v_tab_lbl)
+
         outer.pack_start(notebook, True, True, 0)
 
         # Live apply bindings for Tab 1
@@ -4008,6 +4718,8 @@ class DictCalcWidget(Gtk.EventBox):
             self.config["badge_bg_opacity"] = bg_op
             lbl_bg_alpha.set_text(f"{bg_op}%")
             self.config["text_shadow"] = chk_shadow.get_active()
+            self.config["vocab_record_enabled"] = chk_vocab_rec.get_active()
+            self.config["vocab_epub_layout"] = combo_epub_layout.get_active_id() or "per_word"
             self._save_config()
             self._sync_scan_poll_timer()
             self.rebind_global_hotkeys()
@@ -4160,6 +4872,7 @@ class DictCalcWidget(Gtk.EventBox):
         combo_out.connect("changed", apply_tab1)
         combo_dbus_style.connect("changed", apply_tab1)
         combo_bubble_pos.connect("changed", apply_tab1)
+        combo_epub_layout.connect("changed", apply_tab1)
         col_btn.connect("color-set", lambda *_: (rb_col_cus.set_active(True), apply_tab1()))
         bg_col_btn.connect("color-set", apply_tab1)
         bubble_bg_btn.connect("color-set", apply_tab1)
@@ -4192,6 +4905,7 @@ class DictCalcWidget(Gtk.EventBox):
             rb_col_dyn,
             rb_col_cus,
             chk_shadow,
+            chk_vocab_rec,
         ):
             w_c.connect("toggled", apply_tab1)
         # Initialize frame sensitivity to match active engine
