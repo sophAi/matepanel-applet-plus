@@ -1418,9 +1418,15 @@ class DictCalcWidget(Gtk.EventBox):
         self.connect("destroy", self._on_destroy)
 
         # Clipboards: CLIPBOARD (Ctrl+V) and PRIMARY (Mouse Scan Selection)
+        self._scan_poll_id = None
+        self._scan_debounce_id = None
+        self._scan_pending_retries = 0
         self.clipboard_main = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
         self.clipboard_primary = Gtk.Clipboard.get(Gdk.SELECTION_PRIMARY)
         self.clipboard_primary.connect("owner-change", self._on_primary_selection_changed)
+        # Seed _last_scanned_text silently on startup so stale PRIMARY doesn't auto-popup on reload
+        self.clipboard_primary.request_text(self._on_seed_primary_text, None)
+        self._sync_scan_poll_timer()
 
         # Initialize Keybinder global hotkeys
         if HAS_KEYBINDER:
@@ -1512,10 +1518,10 @@ class DictCalcWidget(Gtk.EventBox):
             except Exception:
                 pass
 
-    def _on_hotkey_open_window(self, _keystr):
+    def _on_hotkey_open_window(self, *_args):
         GLib.idle_add(self.focus_panel_search_box)
 
-    def _on_hotkey_scan_selection(self, _keystr):
+    def _on_hotkey_scan_selection(self, *_args):
         GLib.idle_add(self.trigger_scan_selection_now)
 
     def focus_panel_search_box(self, timestamp=None):
@@ -1541,6 +1547,7 @@ class DictCalcWidget(Gtk.EventBox):
     def set_scan_selection_enabled(self, enabled):
         self.config["scan_selection_enabled"] = bool(enabled)
         self._save_config()
+        self._sync_scan_poll_timer()
         self._update_entry_icons()
         self._update_tooltip()
         self.canvas.queue_draw()
@@ -1548,20 +1555,30 @@ class DictCalcWidget(Gtk.EventBox):
     def toggle_scan_selection(self, *_args):
         self.set_scan_selection_enabled(not self.config.get("scan_selection_enabled", False))
 
-    def _is_scan_modifier_pressed(self):
+    def _on_seed_primary_text(self, _clipboard, text, *_args):
+        if text:
+            self._last_scanned_text = text.strip()
+
+    def _get_pointer_modifier_state(self):
+        """Return current Gdk.ModifierType bitmask of pointer/keyboard modifiers."""
+        display = Gdk.Display.get_default()
+        if display is None:
+            return 0
+        seat = display.get_default_seat()
+        if seat is None or seat.get_pointer() is None:
+            return 0
+        root_win = Gdk.get_default_root_window()
+        if root_win is None:
+            return 0
+        _, _, _, state = root_win.get_device_position(seat.get_pointer())
+        return state
+
+    def _is_scan_modifier_pressed(self, state=None):
         req_mod = self.config.get("scan_modifier", "ctrl")
         if req_mod == "none":
             return True
-        display = Gdk.Display.get_default()
-        if display is None:
-            return False
-        seat = display.get_default_seat()
-        if seat is None or seat.get_pointer() is None:
-            return False
-        root_win = Gdk.get_default_root_window()
-        if root_win is None:
-            return False
-        _, _, _, state = root_win.get_device_position(seat.get_pointer())
+        if state is None:
+            state = self._get_pointer_modifier_state()
         if req_mod == "ctrl":
             return bool(state & Gdk.ModifierType.CONTROL_MASK)
         if req_mod == "alt":
@@ -1570,16 +1587,67 @@ class DictCalcWidget(Gtk.EventBox):
             return bool(state & Gdk.ModifierType.SHIFT_MASK)
         return True
 
-    def _on_primary_selection_changed(self, clipboard, _event):
+    def _sync_scan_poll_timer(self):
+        """
+        Run a lightweight 300ms monitor ONLY when Scan Selection is enabled.
+        Fixes the classic X11 PRIMARY bug where Chromium/Firefox/VS Code/Terminal do not
+        re-emit `owner-change` when selecting new text inside the same window, and allows
+        highlighting text first then tapping Ctrl/Alt/Shift after releasing the mouse.
+        """
+        want = bool(self.config.get("scan_selection_enabled", False))
+        if want and self._scan_poll_id is None:
+            self._scan_poll_id = GLib.timeout_add(300, self._on_scan_poll_tick)
+        elif not want and self._scan_poll_id is not None:
+            try:
+                GLib.source_remove(self._scan_poll_id)
+            except Exception:
+                pass
+            self._scan_poll_id = None
+
+    def _on_scan_poll_tick(self):
+        if not self.config.get("scan_selection_enabled", False):
+            self._scan_poll_id = None
+            return False
+        state = self._get_pointer_modifier_state()
+        # Wait until left mouse button is released so we never scan half-dragged text
+        if state & Gdk.ModifierType.BUTTON1_MASK:
+            return True
+        if not self._is_scan_modifier_pressed(state):
+            return True
+        self.clipboard_primary.request_text(self._on_primary_text_received, False)
+        return True
+
+    def _on_primary_selection_changed(self, _clipboard, _event):
         if not self.config.get("scan_selection_enabled", False):
             return
-        if not self._is_scan_modifier_pressed():
-            return
-        clipboard.request_text(self._on_primary_text_received, False)
+        # Debounce owner-change until mouse drag finishes (BUTTON1 released)
+        if self._scan_debounce_id is not None:
+            try:
+                GLib.source_remove(self._scan_debounce_id)
+            except Exception:
+                pass
+        self._scan_pending_retries = 0
+        self._scan_debounce_id = GLib.timeout_add(120, self._on_primary_debounced_check)
+
+    def _on_primary_debounced_check(self):
+        self._scan_debounce_id = None
+        if not self.config.get("scan_selection_enabled", False):
+            return False
+        state = self._get_pointer_modifier_state()
+        if state & Gdk.ModifierType.BUTTON1_MASK:
+            self._scan_pending_retries += 1
+            if self._scan_pending_retries < 25:
+                self._scan_debounce_id = GLib.timeout_add(120, self._on_primary_debounced_check)
+            return False
+        if not self._is_scan_modifier_pressed(state):
+            return False
+        self.clipboard_primary.request_text(self._on_primary_text_received, False)
+        return False
 
     def trigger_scan_selection_now(self, *_args):
         """Triggered via global Scan Selection hotkey (works even if auto-scan is OFF)."""
         self.clipboard_primary.request_text(self._on_primary_text_received, True)
+        return False
 
     def _on_primary_text_received(self, _clipboard, text, force_from_hotkey):
         if not text:
@@ -2981,6 +3049,7 @@ class DictCalcWidget(Gtk.EventBox):
             lbl_bg_alpha.set_text(f"{bg_op}%")
             self.config["text_shadow"] = chk_shadow.get_active()
             self._save_config()
+            self._sync_scan_poll_timer()
             self.rebind_global_hotkeys()
             self._apply_panel_layout()
             self._update_tooltip()
@@ -3072,6 +3141,14 @@ class DictCalcWidget(Gtk.EventBox):
         dlg.destroy()
 
     def _on_destroy(self, *_args):
+        for tid_attr in ("_scan_poll_id", "_scan_debounce_id"):
+            tid = getattr(self, tid_attr, None)
+            if tid is not None:
+                try:
+                    GLib.source_remove(tid)
+                except Exception:
+                    pass
+                setattr(self, tid_attr, None)
         if HAS_KEYBINDER:
             for hk in self._bound_hotkeys:
                 try:
