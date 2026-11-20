@@ -101,7 +101,9 @@ DEFAULT_CONFIG = {
     "result_font_size": 11,              # 結果視窗字型大小 (pt)
     "font_color_mode": "dynamic",        # "dynamic" or "custom"
     "custom_font_color": "#ffffff",      # 自訂面板字形顏色
-    "badge_bg_style": "dark",            # "dark", "light", "transparent"
+    "badge_bg_style": "dark",            # (舊版相容欄位)
+    "badge_bg_color": "#182234",         # 自訂方塊/輸入框背景底色
+    "badge_bg_opacity": 90,              # 背景不透明度 (0=完全透明 ~ 100=完全不透明)
     "text_shadow": False,                # 面板文字描邊陰影
 }
 
@@ -987,6 +989,18 @@ class DictCalcWidget(Gtk.EventBox):
             cfg["enabled_dicts_dbus"] = list(cfg["enabled_dicts"])
         if "enabled_dicts_scan" not in user_cfg and "enabled_dicts" in user_cfg:
             cfg["enabled_dicts_scan"] = list(cfg["enabled_dicts"])
+        # Backward-compatible migration for legacy badge_bg_style -> custom color + opacity
+        if "badge_bg_color" not in user_cfg and "badge_bg_opacity" not in user_cfg and "badge_bg_style" in user_cfg:
+            legacy_bg = user_cfg.get("badge_bg_style", "dark")
+            if legacy_bg == "light":
+                cfg["badge_bg_color"] = "#f2f5fa"
+                cfg["badge_bg_opacity"] = 92
+            elif legacy_bg == "transparent":
+                cfg["badge_bg_color"] = "#182234"
+                cfg["badge_bg_opacity"] = 0
+            else:
+                cfg["badge_bg_color"] = "#182234"
+                cfg["badge_bg_opacity"] = 90
         return cfg
 
     def _save_config(self):
@@ -1157,21 +1171,33 @@ class DictCalcWidget(Gtk.EventBox):
             self.canvas.show()
 
     def _apply_entry_css(self):
-        """Apply badge_bg_style, custom_font_color, and text_shadow directly to the inline Gtk.Entry via GTK3 CSS."""
-        bg_style = self.config.get("badge_bg_style", "dark")
+        """Apply custom badge_bg_color, badge_bg_opacity, custom_font_color, and text_shadow to the inline Gtk.Entry."""
+        bg_hex = self.config.get("badge_bg_color", "#182234")
+        opacity = max(0, min(100, int(self.config.get("badge_bg_opacity", 90))))
+        alpha = opacity / 100.0
+        bg_rgb = hex_to_rgb(bg_hex, default=(0.094, 0.133, 0.204))
+        r255 = int(round(bg_rgb[0] * 255))
+        g255 = int(round(bg_rgb[1] * 255))
+        b255 = int(round(bg_rgb[2] * 255))
+        is_light_bg = opacity >= 30 and rgb_luminance(bg_rgb) > 0.55
+
         font_mode = self.config.get("font_color_mode", "dynamic")
         custom_hex = self.config.get("custom_font_color", "#ffffff")
         shadow_on = bool(self.config.get("text_shadow", False))
 
-        if bg_style == "dark":
-            bg_css = "background-color: rgba(24, 34, 52, 0.90); border: 1px solid rgba(72, 184, 250, 0.78);"
-            default_fg = "#f0f6ff"
-        elif bg_style == "light":
-            bg_css = "background-color: rgba(242, 245, 250, 0.92); border: 1px solid rgba(56, 130, 210, 0.78);"
-            default_fg = "#111827"
-        else:  # transparent
-            bg_css = "background-color: transparent; background-image: none; border: 1px solid rgba(72, 184, 250, 0.75); box-shadow: none;"
+        border_col = "rgba(56, 130, 210, 0.78)" if is_light_bg else "rgba(72, 184, 250, 0.78)"
+        if opacity == 0:
+            bg_css = (
+                f"background-color: transparent; background-image: none; "
+                f"border: 1px solid {border_col}; box-shadow: none;"
+            )
             default_fg = "#ffffff"
+        else:
+            bg_css = (
+                f"background-color: rgba({r255}, {g255}, {b255}, {alpha:.2f}); "
+                f"background-image: none; border: 1px solid {border_col}; box-shadow: none;"
+            )
+            default_fg = "#111827" if is_light_bg else "#f0f6ff"
 
         fg_hex = custom_hex if font_mode == "custom" else default_fg
         fg_rgb = hex_to_rgb(fg_hex, default=(1.0, 1.0, 1.0))
@@ -1486,26 +1512,22 @@ class DictCalcWidget(Gtk.EventBox):
         x, y = 1.0, pad_y
 
         scan_on = self.config.get("scan_selection_enabled", False)
-        bg_style = self.config.get("badge_bg_style", "dark")
+        bg_hex = self.config.get("badge_bg_color", "#182234")
+        opacity = max(0, min(100, int(self.config.get("badge_bg_opacity", 90))))
+        alpha = opacity / 100.0
+        custom_bg_rgb = hex_to_rgb(bg_hex, default=(0.094, 0.133, 0.204))
+        is_light_bg = opacity >= 30 and rgb_luminance(custom_bg_rgb) > 0.55
 
         if scan_on:
-            bg_rgb = (0.10, 0.34, 0.30)
             border_rgb = (0.20, 0.84, 0.62)
             text_rgb = (0.94, 1.00, 0.98)
         else:
-            bg_rgb = (0.14, 0.24, 0.40)
             border_rgb = (0.28, 0.72, 0.98)
             text_rgb = (0.94, 0.98, 1.00)
 
         draw_rounded_rect(ctx, x + 0.5, y + 0.5, bw - 1.0, bh - 1.0, 4.5)
-        if bg_style == "dark":
-            ctx.set_source_rgba(bg_rgb[0], bg_rgb[1], bg_rgb[2], 0.92)
-            ctx.fill_preserve()
-        elif bg_style == "light":
-            l_r = min(1.0, 0.88 + bg_rgb[0] * 0.22)
-            l_g = min(1.0, 0.88 + bg_rgb[1] * 0.22)
-            l_b = min(1.0, 0.88 + bg_rgb[2] * 0.22)
-            ctx.set_source_rgba(l_r, l_g, l_b, 0.92)
+        if alpha > 0.0:
+            ctx.set_source_rgba(custom_bg_rgb[0], custom_bg_rgb[1], custom_bg_rgb[2], alpha)
             ctx.fill_preserve()
 
         ctx.set_source_rgba(border_rgb[0], border_rgb[1], border_rgb[2], 0.95)
@@ -1524,7 +1546,7 @@ class DictCalcWidget(Gtk.EventBox):
             sub_rgb = c_rgb
         else:
             title_rgb = border_rgb
-            sub_rgb = (bg_rgb[0] * 0.85, bg_rgb[1] * 0.85, bg_rgb[2] * 0.85) if bg_style == "light" else text_rgb
+            sub_rgb = (0.07, 0.09, 0.15) if is_light_bg else text_rgb
 
         ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
         t_sz = max(6.5, bh * 0.27)
@@ -1862,21 +1884,35 @@ class DictCalcWidget(Gtk.EventBox):
         col_box.pack_start(col_btn, False, False, 0)
         tab1.pack_start(col_box, False, False, 0)
 
-        bg_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        bg_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         bg_box.pack_start(Gtk.Label(label="方塊背景底色：", xalign=0.0), False, False, 0)
-        rb_bg_dark = Gtk.RadioButton.new_with_label_from_widget(None, "深色底")
-        rb_bg_light = Gtk.RadioButton.new_with_label_from_widget(rb_bg_dark, "淺色底")
-        rb_bg_trans = Gtk.RadioButton.new_with_label_from_widget(rb_bg_dark, "完全透明")
-        cur_bg = self.config.get("badge_bg_style", "dark")
-        if cur_bg == "dark":
-            rb_bg_dark.set_active(True)
-        elif cur_bg == "light":
-            rb_bg_light.set_active(True)
-        else:
-            rb_bg_trans.set_active(True)
-        bg_box.pack_start(rb_bg_dark, False, False, 0)
-        bg_box.pack_start(rb_bg_light, False, False, 0)
-        bg_box.pack_start(rb_bg_trans, False, False, 0)
+        bg_col_btn = Gtk.ColorButton()
+        bg_rgba0 = Gdk.RGBA()
+        if not bg_rgba0.parse(self.config.get("badge_bg_color", "#182234")):
+            bg_rgba0.parse("#182234")
+        bg_col_btn.set_rgba(bg_rgba0)
+        bg_col_btn.set_tooltip_text("點擊自訂方塊 / 輸入框背景底色")
+        bg_box.pack_start(bg_col_btn, False, False, 0)
+
+        bg_box.pack_start(Gtk.Label(label="不透明度：", xalign=0.0), False, False, 0)
+        scale_bg_alpha = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 100.0, 5.0)
+        scale_bg_alpha.set_digits(0)
+        scale_bg_alpha.set_draw_value(False)
+        scale_bg_alpha.set_size_request(115, -1)
+        init_op = max(0, min(100, int(self.config.get("badge_bg_opacity", 90))))
+        scale_bg_alpha.set_value(float(init_op))
+        scale_bg_alpha.set_tooltip_text("0% = 完全透明，100% = 完全不透明")
+        lbl_bg_alpha = Gtk.Label(label=f"{init_op}%")
+        lbl_bg_alpha.set_width_chars(4)
+        bg_box.pack_start(scale_bg_alpha, True, True, 0)
+        bg_box.pack_start(lbl_bg_alpha, False, False, 0)
+
+        btn_bg_dark = Gtk.Button(label="深色")
+        btn_bg_light = Gtk.Button(label="淺色")
+        btn_bg_trans = Gtk.Button(label="透明")
+        bg_box.pack_start(btn_bg_dark, False, False, 0)
+        bg_box.pack_start(btn_bg_light, False, False, 0)
+        bg_box.pack_start(btn_bg_trans, False, False, 0)
         tab1.pack_start(bg_box, False, False, 0)
 
         chk_shadow = Gtk.CheckButton(label="啟用面板文字高對比描邊陰影")
@@ -2118,12 +2154,10 @@ class DictCalcWidget(Gtk.EventBox):
             self.config["result_font_size"] = int(spin_res_fs.get_value_as_int())
             self.config["font_color_mode"] = "dynamic" if rb_col_dyn.get_active() else "custom"
             self.config["custom_font_color"] = rgba_to_hex(col_btn.get_rgba())
-            if rb_bg_dark.get_active():
-                self.config["badge_bg_style"] = "dark"
-            elif rb_bg_light.get_active():
-                self.config["badge_bg_style"] = "light"
-            else:
-                self.config["badge_bg_style"] = "transparent"
+            self.config["badge_bg_color"] = rgba_to_hex(bg_col_btn.get_rgba())
+            bg_op = max(0, min(100, int(round(scale_bg_alpha.get_value()))))
+            self.config["badge_bg_opacity"] = bg_op
+            lbl_bg_alpha.set_text(f"{bg_op}%")
             self.config["text_shadow"] = chk_shadow.get_active()
             self._save_config()
             self.rebind_global_hotkeys()
@@ -2132,11 +2166,23 @@ class DictCalcWidget(Gtk.EventBox):
             if self.popup_win is not None:
                 self.popup_win.sync_controls()
 
+        def apply_bg_preset(hex_col, opacity_val):
+            r_tmp = Gdk.RGBA()
+            if r_tmp.parse(hex_col):
+                bg_col_btn.set_rgba(r_tmp)
+            scale_bg_alpha.set_value(float(opacity_val))
+            apply_tab1()
+
         btn_apply_hk.connect("clicked", apply_tab1)
         combo_mod.connect("changed", apply_tab1)
         combo_out.connect("changed", apply_tab1)
         combo_dbus_style.connect("changed", apply_tab1)
         col_btn.connect("color-set", lambda *_: (rb_col_cus.set_active(True), apply_tab1()))
+        bg_col_btn.connect("color-set", apply_tab1)
+        scale_bg_alpha.connect("value-changed", apply_tab1)
+        btn_bg_dark.connect("clicked", lambda *_: apply_bg_preset("#182234", 90))
+        btn_bg_light.connect("clicked", lambda *_: apply_bg_preset("#f2f5fa", 92))
+        btn_bg_trans.connect("clicked", lambda *_: apply_bg_preset("#182234", 0))
         for w_c in (
             chk_scan_en,
             chk_auto_copy,
@@ -2144,9 +2190,6 @@ class DictCalcWidget(Gtk.EventBox):
             rb_entry,
             rb_col_dyn,
             rb_col_cus,
-            rb_bg_dark,
-            rb_bg_light,
-            rb_bg_trans,
             chk_shadow,
         ):
             w_c.connect("toggled", apply_tab1)
