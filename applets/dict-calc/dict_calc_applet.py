@@ -117,6 +117,7 @@ DEFAULT_CONFIG = {
     "hotkey_scan_selection": "<Ctrl><Alt>s", # 立即查詢目前滑鼠反白文字 (Scan Selection) 的全域快捷鍵
     "calc_auto_copy": True,              # 數學計算模式預設自動將結果存入系統剪貼簿 (可直接 Ctrl+V)
     "active_dict_group": "custom",       # "custom" (已勾選常用), "en_zh", "ja_zh", "sci_en", "all"
+    "dict_root_dir": "/usr/share/stardict/dic",  # StarDict 詞典根目錄路徑 (留空則掃描系統預設路徑)
     "enabled_dicts": list(DEFAULT_PREFERRED_DICTS),           # 無焦點查詢視窗詞典清單 (含順位)
     "enabled_dicts_dbus": list(DEFAULT_PREFERRED_DICTS[:5]),  # D-Bus 氣泡框詞典清單 (含順位)
     "enabled_dicts_scan": list(DEFAULT_PREFERRED_DICTS[:5]),  # Scan Selection 劃詞詞典清單 (含順位)
@@ -1120,8 +1121,14 @@ class StarDictManager:
 
     SDCV_BIN = "/usr/bin/sdcv"
 
-    def __init__(self):
-        self.all_dicts = self.discover_dictionaries()
+    def __init__(self, root_dir=""):
+        self.root_dir = (root_dir or "").strip()
+        self.all_dicts = self.discover_dictionaries(self.root_dir)
+
+    def reload(self, root_dir=""):
+        self.root_dir = (root_dir or "").strip()
+        self.all_dicts = self.discover_dictionaries(self.root_dir)
+        return self.all_dicts
 
     @staticmethod
     def _classify_dict(bookname, dirname):
@@ -1136,17 +1143,30 @@ class StarDictManager:
         return "sci_en"
 
     @classmethod
-    def discover_dictionaries(cls):
+    def discover_dictionaries(cls, root_dir=""):
         """
-        Scan /usr/share/stardict/dic and ~/.stardict/dic for .ifo files.
+        Scan custom `root_dir` (if provided) or default `/usr/share/stardict/dic` and `~/.stardict/dic`
+        for StarDict `.ifo` files (up to 3 levels deep).
         Returns list of dicts: [{'bookname': str, 'wordcount': int, 'group': str, 'path': str}]
         """
         found = []
         seen_names = set()
-        for base_dir in DICT_SEARCH_DIRS:
-            if not os.path.isdir(base_dir):
+        custom = os.path.expanduser((root_dir or "").strip())
+        search_dirs = [custom] if custom else list(DICT_SEARCH_DIRS)
+
+        for base_dir in search_dirs:
+            if not base_dir or not os.path.isdir(base_dir):
                 continue
-            for ifo_path in sorted(glob.glob(os.path.join(base_dir, "*", "*.ifo"))):
+            ifo_paths = []
+            base_depth = base_dir.rstrip(os.sep).count(os.sep)
+            for cur_root, dirnames, filenames in os.walk(base_dir):
+                depth = cur_root.rstrip(os.sep).count(os.sep) - base_depth
+                if depth >= 3:
+                    dirnames[:] = []
+                for fn in sorted(filenames):
+                    if fn.endswith(".ifo"):
+                        ifo_paths.append(os.path.join(cur_root, fn))
+            for ifo_path in sorted(ifo_paths):
                 bookname = None
                 wordcount = 0
                 try:
@@ -1214,6 +1234,9 @@ class StarDictManager:
         if not w:
             return []
         cmd = [self.SDCV_BIN, "-n", "-j"]
+        custom_dir = os.path.expanduser(self.root_dir) if self.root_dir else ""
+        if custom_dir and os.path.isdir(custom_dir):
+            cmd.extend(["-2", custom_dir, "-x"])
         if dict_names:
             for dn in dict_names:
                 cmd.extend(["-u", dn])
@@ -1671,7 +1694,7 @@ class DictCalcWidget(Gtk.EventBox):
         )
 
         self.config = self._load_config()
-        self.dict_mgr = StarDictManager()
+        self.dict_mgr = StarDictManager(root_dir=self.config.get("dict_root_dir", "/usr/share/stardict/dic"))
         self.calc = SafeMathCalculator()
         self.dbus_notifier = DBusNotifier()
         self.bubble_mgr = CustomBubbleManager()
@@ -3284,23 +3307,44 @@ class DictCalcWidget(Gtk.EventBox):
         tab_tr_scroll.add(tab_tr)
         notebook.append_page(tab_tr_scroll, Gtk.Label(label="🌐 翻譯引擎"))
 
-        # ---------------- Tab 2: StarDict Dictionaries Manager (3 Independent Profiles) ----------------
+        # ---------------- Tab 4: StarDict Dictionaries Manager (3 Independent Profiles + Root Dir) ----------------
         tab2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         tab2.set_margin_top(10)
         tab2.set_margin_bottom(10)
         tab2.set_margin_start(12)
         tab2.set_margin_end(12)
 
+        # Dict Root Directory Selector Bar
+        dir_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        dir_box.pack_start(Gtk.Label(label="📁 Dict 根目錄：", xalign=0.0), False, False, 0)
+        entry_dict_dir = Gtk.Entry()
+        entry_dict_dir.set_hexpand(True)
+        entry_dict_dir.set_placeholder_text("/usr/share/stardict/dic（留空則掃描系統預設路徑）")
+        entry_dict_dir.set_text(self.config.get("dict_root_dir", "/usr/share/stardict/dic"))
+        btn_browse_dir = Gtk.Button(label="📂 瀏覽...")
+        btn_rescan_dir = Gtk.Button(label="🔄 重新掃描")
+        dir_box.pack_start(entry_dict_dir, True, True, 0)
+        dir_box.pack_start(btn_browse_dir, False, False, 0)
+        dir_box.pack_start(btn_rescan_dir, False, False, 0)
+        tab2.pack_start(dir_box, False, False, 0)
+
         d_hdr = Gtk.Label(xalign=0.0)
-        d_hdr.set_markup(
-            f"<b>已掃描到 {len(self.dict_mgr.all_dicts)} 套離線 StarDict 詞典（三種查詢情境獨立管理）</b>\n"
-            f"<small>可分別為「無焦點查詢視窗」、「D-Bus 氣泡框」與「Scan Selection 劃詞」設定不同詞典與顯示順位（支援右側按鈕與滑鼠拖曳）</small>"
-        )
+        d_tab_lbl = Gtk.Label(label=f"📚 詞典管理 ({len(self.dict_mgr.all_dicts)} 套)")
+
+        def update_dict_hdr():
+            n_all = len(self.dict_mgr.all_dicts)
+            d_hdr.set_markup(
+                f"<b>已掃描到 {n_all} 套離線 StarDict 詞典（三種查詢情境獨立管理）</b>\n"
+                f"<small>可分別為「無焦點查詢視窗」、「氣泡框」與「Scan Selection 劃詞」設定不同詞典與顯示順位（支援右側按鈕與滑鼠拖曳）</small>"
+            )
+            d_tab_lbl.set_text(f"📚 詞典管理 ({n_all} 套)")
+
+        update_dict_hdr()
         tab2.pack_start(d_hdr, False, False, 0)
 
-        dict_by_name = {d["bookname"]: d for d in self.dict_mgr.all_dicts}
         grp_labels = {"en_zh": "英漢/漢英", "ja_zh": "日漢/漢日", "sci_en": "科技/英英"}
         dict_notebook = Gtk.Notebook()
+        profile_refreshers = []
 
         def build_dict_profile_page(config_key, profile_desc, default_preset, allow_copy_win=False):
             page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -3313,8 +3357,10 @@ class DictCalcWidget(Gtk.EventBox):
             page.pack_start(info_lbl, False, False, 0)
 
             store = Gtk.ListStore(bool, str, str, int)
+            rebuilding = [False]
 
             def populate_store_from_list(enabled_list):
+                dict_by_name = {d["bookname"]: d for d in self.dict_mgr.all_dicts}
                 store.clear()
                 added = set()
                 for name in enabled_list:
@@ -3333,11 +3379,16 @@ class DictCalcWidget(Gtk.EventBox):
                     f"<small>{html.escape(profile_desc)} — 目前已啟用 <b>{n_en}</b> 套詞典</small>"
                 )
 
-            saved_enabled = list(self.config.get(config_key, default_preset))
-            populate_store_from_list(saved_enabled)
-            update_count_label()
+            def refresh_from_mgr():
+                rebuilding[0] = True
+                try:
+                    populate_store_from_list(list(self.config.get(config_key, default_preset)))
+                    update_count_label()
+                finally:
+                    rebuilding[0] = False
 
-            rebuilding = [False]
+            profile_refreshers.append(refresh_from_mgr)
+            refresh_from_mgr()
 
             def save_order(*_):
                 if rebuilding[0]:
@@ -3490,7 +3541,43 @@ class DictCalcWidget(Gtk.EventBox):
         )
         tab2.pack_start(dict_notebook, True, True, 0)
 
-        notebook.append_page(tab2, Gtk.Label(label=f"📚 詞典管理 ({len(self.dict_mgr.all_dicts)} 套)"))
+        def on_rescan_dict_dir(*_):
+            new_dir = entry_dict_dir.get_text().strip()
+            self.config["dict_root_dir"] = new_dir
+            self._save_config()
+            self.dict_mgr.reload(new_dir)
+            update_dict_hdr()
+            for fn_ref in profile_refreshers:
+                fn_ref()
+            self._update_tooltip()
+            if self.popup_win is not None:
+                self.popup_win.sync_controls()
+
+        def on_browse_dict_dir(*_):
+            dlg = Gtk.FileChooserDialog(
+                title="選擇 StarDict 詞典根目錄",
+                parent=win,
+                action=Gtk.FileChooserAction.SELECT_FOLDER,
+            )
+            dlg.add_buttons(
+                Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                Gtk.STOCK_OPEN, Gtk.ResponseType.OK,
+            )
+            cur_d = os.path.expanduser(entry_dict_dir.get_text().strip() or "/usr/share/stardict/dic")
+            if os.path.isdir(cur_d):
+                dlg.set_current_folder(cur_d)
+            if dlg.run() == Gtk.ResponseType.OK:
+                chosen = dlg.get_filename()
+                if chosen:
+                    entry_dict_dir.set_text(chosen)
+                    on_rescan_dict_dir()
+            dlg.destroy()
+
+        btn_browse_dir.connect("clicked", on_browse_dict_dir)
+        btn_rescan_dir.connect("clicked", on_rescan_dict_dir)
+        entry_dict_dir.connect("activate", on_rescan_dict_dir)
+
+        notebook.append_page(tab2, d_tab_lbl)
 
         outer.pack_start(notebook, True, True, 0)
 
