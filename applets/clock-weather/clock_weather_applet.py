@@ -75,6 +75,7 @@ DEFAULT_CONFIG = {
     "font_opacity": 100,                 # 面板文字不透明度 (10..100%)
     "text_shadow": False,                # 面板文字高對比描邊陰影
     "show_hover_tooltip": True,          # 滑鼠懸停圖示時顯示詳細資訊 (Tooltip)
+    "notify_weather_change": True,       # 天氣圖案改變時自動彈出氣泡框提醒
     "detail_display_mode": "embedded",   # "embedded" (完整視窗) | "custom_bubble" (精簡月曆 RGBA 氣泡框)
     "bubble_position": "top_right",      # top_left / top_center / top_right / center / bottom_left / bottom_right
     "bubble_offset_x": 0,                # 氣泡水平偏移 (px)
@@ -180,6 +181,24 @@ def wmo_to_info(code, is_day=True):
     if c in (95, 96, 99):
         return ("雷雨" if c == 95 else "強雷陣雨", "weather-storm")
     return ("多雲", "weather-few-clouds" if is_day else "weather-few-clouds-night")
+
+
+def weather_change_remark(icon_name, desc=""):
+    """Return a friendly Chinese remark corresponding to the new desktop weather icon."""
+    base = (icon_name or "").replace("-night", "")
+    mapping = {
+        "weather-clear": "☀️ 放晴了喔！",
+        "weather-few-clouds": "⛅ 轉為多雲了喔！",
+        "weather-overcast": "☁️ 陰天了喔！",
+        "weather-fog": "🌫️ 起霧了喔！外出請注意視線！",
+        "weather-showers-scattered": "🌦️ 開始下小雨了喔！記得帶傘！",
+        "weather-showers": "🌧️ 下雨了喔！出門別忘記帶傘！",
+        "weather-storm": "⛈️ 打雷下雨了喔！請注意安全！",
+        "weather-snow": "❄️ 下雪了喔！注意保暖！",
+    }
+    if base in mapping:
+        return mapping[base]
+    return f"🌤️ 天氣變為「{desc or '新狀態'}」了喔！"
 
 
 def draw_raindrop(ctx, cx, cy, size):
@@ -749,17 +768,28 @@ class CustomCalendarBubbleWindow(Gtk.Window):
                 if show_prob:
                     p_str = f"{int(round(pprob))}%"
                     p_fs = max(7.0, min(base_fs - 2.0, cw * 0.16))
-                    ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+                    ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
                     ctx.set_font_size(p_fs)
-                    ctx.set_source_rgba(0.45, 0.82, 1.00, 0.95)
                     p_ext = ctx.text_extents(p_str)
                     drop_sz = max(5.5, p_fs * 0.85)
                     drop_gap = 2.0
                     total_pw = drop_sz * 0.72 + drop_gap + p_ext.width
                     start_px = cx + (cw - total_pw) / 2.0
                     base_py = cy + ch - 2.5
-                    draw_raindrop(ctx, start_px + drop_sz * 0.36, base_py - p_ext.height * 0.48, drop_sz)
-                    ctx.move_to(start_px + drop_sz * 0.72 + drop_gap - p_ext.x_bearing, base_py)
+                    drop_cx = start_px + drop_sz * 0.36
+                    drop_cy = base_py - p_ext.height * 0.48
+                    txt_x = start_px + drop_sz * 0.72 + drop_gap - p_ext.x_bearing
+
+                    # Dark outline shadow so raindrop + % stays crisp even on white/light backgrounds
+                    ctx.set_source_rgba(0.0, 0.0, 0.0, 0.78)
+                    for dx, dy in ((-0.8, 0.0), (0.8, 0.0), (0.0, -0.8), (0.0, 0.8)):
+                        draw_raindrop(ctx, drop_cx + dx, drop_cy + dy, drop_sz)
+                        ctx.move_to(txt_x + dx, base_py + dy)
+                        ctx.show_text(p_str)
+
+                    ctx.set_source_rgba(0.45, 0.82, 1.00, 0.98)
+                    draw_raindrop(ctx, drop_cx, drop_cy, drop_sz)
+                    ctx.move_to(txt_x, base_py)
                     ctx.show_text(p_str)
         return False
 
@@ -816,6 +846,248 @@ class CustomBubbleManager:
         _, nat = win.get_preferred_size()
         bw = max(460, min(nat.width, mon_w - pad * 2))
         bh = max(360, min(nat.height, mon_h - pad * 2))
+        win.resize(bw, bh)
+
+        if position == "top_left":
+            px = mon_l + pad + offset_x
+            py = mon_t + offset_y
+        elif position == "top_center":
+            px = mon_l + (mon_w - bw) // 2 + offset_x
+            py = mon_t + offset_y
+        elif position == "center":
+            px = mon_l + (mon_w - bw) // 2 + offset_x
+            py = mon_t + (mon_h - bh) // 2 + offset_y
+        elif position == "bottom_left":
+            px = mon_l + pad + offset_x
+            py = mon_b - bh - offset_y
+        elif position == "bottom_right":
+            px = mon_r - bw - pad + offset_x
+            py = mon_b - bh - offset_y
+        else:  # top_right
+            px = mon_r - bw - pad + offset_x
+            py = mon_t + offset_y
+
+        px = max(mon_l + pad, min(px, mon_r - bw - pad))
+        py = max(mon_t + pad, min(py, mon_b - bh - pad))
+        win.move(int(px), int(py))
+        win.show_all()
+        win.start_timer(timeout_sec)
+        self._win = win
+        return True
+
+
+class WeatherChangeBubbleWindow(Gtk.Window):
+    """
+    Borderless, focus-free RGBA notification bubble shown automatically when the weather icon changes:
+      "天氣從 [原天氣圖示] 變成 [當前天氣圖示]" + friendly remark (e.g. 下雨了喔！ / 放晴了喔！ / 陰天了喔！).
+    """
+
+    def __init__(
+        self,
+        city_name,
+        old_pixbuf,
+        new_pixbuf,
+        remark_text,
+        temp_c,
+        bg_hex,
+        fg_hex,
+        bg_opacity,
+        font_size,
+        on_close_cb=None,
+    ):
+        super().__init__(type=Gtk.WindowType.POPUP)
+        self.set_decorated(False)
+        self.set_accept_focus(False)
+        self.set_focus_on_map(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_type_hint(Gdk.WindowTypeHint.NOTIFICATION)
+        self.set_resizable(False)
+
+        self._on_close_cb = on_close_cb
+        self._bg_rgb = hex_to_rgb(bg_hex, default=(0.094, 0.133, 0.204))
+        self._bg_alpha = max(0.0, min(1.0, float(bg_opacity) / 100.0))
+        self._fg_hex = fg_hex or "#f0f6ff"
+        self._timeout_id = None
+        self._timeout_sec = 10
+        self._hovered = False
+
+        screen = self.get_screen()
+        if screen is not None:
+            visual = screen.get_rgba_visual()
+            if visual is not None and screen.is_composited():
+                self.set_visual(visual)
+        self.set_app_paintable(True)
+        self.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.ENTER_NOTIFY_MASK
+            | Gdk.EventMask.LEAVE_NOTIFY_MASK
+        )
+        self.connect("draw", self._on_draw_bg)
+        self.connect("button-press-event", self._on_click)
+        self.connect("enter-notify-event", self._on_enter)
+        self.connect("leave-notify-event", self._on_leave)
+
+        fs = max(9, min(18, int(font_size)))
+        pt_title = int((fs + 0.5) * 1024)
+        pt_body = int((fs + 1.0) * 1024)
+        pt_remark = int((fs + 1.5) * 1024)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_top(10)
+        box.set_margin_bottom(10)
+        box.set_margin_start(14)
+        box.set_margin_end(14)
+
+        temp_s = f" · {temp_c:.1f}°C" if temp_c is not None else ""
+        lbl_hdr = Gtk.Label(xalign=0.0)
+        lbl_hdr.set_markup(
+            f"<span foreground='{html.escape(self._fg_hex)}' alpha='80%' size='{pt_title}'><b>天氣變化提醒 · {html.escape(city_name)}{html.escape(temp_s)}</b></span>"
+        )
+        box.pack_start(lbl_hdr, False, False, 0)
+
+        trans_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        lbl_from = Gtk.Label(xalign=0.0)
+        lbl_from.set_markup(f"<span foreground='{html.escape(self._fg_hex)}' size='{pt_body}'><b>天氣從</b></span>")
+        trans_row.pack_start(lbl_from, False, False, 0)
+        if old_pixbuf is not None:
+            trans_row.pack_start(Gtk.Image.new_from_pixbuf(old_pixbuf), False, False, 0)
+        lbl_to = Gtk.Label(xalign=0.0)
+        lbl_to.set_markup(f"<span foreground='{html.escape(self._fg_hex)}' size='{pt_body}'><b>變成</b></span>")
+        trans_row.pack_start(lbl_to, False, False, 0)
+        if new_pixbuf is not None:
+            trans_row.pack_start(Gtk.Image.new_from_pixbuf(new_pixbuf), False, False, 0)
+        box.pack_start(trans_row, False, False, 0)
+
+        lbl_remark = Gtk.Label(xalign=0.0)
+        lbl_remark.set_markup(
+            f"<span foreground='{html.escape(self._fg_hex)}' size='{pt_remark}'><b>{html.escape(remark_text)}</b></span>"
+        )
+        box.pack_start(lbl_remark, False, False, 0)
+
+        self.add(box)
+        self.show_all()
+
+    def start_timer(self, timeout_sec):
+        self._cancel_timer()
+        if timeout_sec is None or int(timeout_sec) <= 0:
+            self._timeout_sec = 0
+            return
+        self._timeout_sec = max(3, int(timeout_sec))
+        self._timeout_id = GLib.timeout_add(self._timeout_sec * 1000, self._on_timeout)
+
+    def _cancel_timer(self):
+        if self._timeout_id is not None:
+            try:
+                GLib.source_remove(self._timeout_id)
+            except Exception:
+                pass
+            self._timeout_id = None
+
+    def _on_timeout(self):
+        self._timeout_id = None
+        if not self._hovered and self._timeout_sec > 0:
+            self.dismiss()
+        return False
+
+    def _on_enter(self, *_args):
+        self._hovered = True
+        self._cancel_timer()
+        return False
+
+    def _on_leave(self, *_args):
+        self._hovered = False
+        if self._timeout_sec > 0:
+            self.start_timer(max(2, min(self._timeout_sec, 4)))
+        return False
+
+    def _on_click(self, *_args):
+        self.dismiss()
+        return True
+
+    def dismiss(self):
+        self._cancel_timer()
+        if self._on_close_cb is not None:
+            cb = self._on_close_cb
+            self._on_close_cb = None
+            cb(self)
+        self.destroy()
+
+    def _on_draw_bg(self, widget, ctx):
+        alloc = widget.get_allocation()
+        w, h = float(alloc.width), float(alloc.height)
+        ctx.save()
+        ctx.set_operator(cairo.OPERATOR_SOURCE)
+        ctx.set_source_rgba(0.0, 0.0, 0.0, 0.0)
+        ctx.paint()
+        ctx.set_operator(cairo.OPERATOR_OVER)
+        r, g, b = self._bg_rgb
+        if self._bg_alpha > 0.0:
+            draw_rounded_rect(ctx, 0.0, 0.0, max(2.0, w), max(2.0, h), 10.0)
+            ctx.set_source_rgba(r, g, b, self._bg_alpha)
+            ctx.fill()
+        ctx.restore()
+        return False
+
+
+class WeatherAlertBubbleManager:
+    """Manages the weather-change alert RGBA bubble with strict multi-monitor clamping."""
+
+    def __init__(self):
+        self._win = None
+
+    def close_all(self):
+        if self._win is not None:
+            w = self._win
+            self._win = None
+            try:
+                w.dismiss()
+            except Exception:
+                pass
+
+    def _on_closed(self, win):
+        if self._win is win:
+            self._win = None
+
+    def show(
+        self,
+        city_name,
+        old_pixbuf,
+        new_pixbuf,
+        remark_text,
+        temp_c,
+        mon_bounds,
+        position="top_right",
+        offset_x=0,
+        offset_y=36,
+        bg_color="#182234",
+        fg_color="#f0f6ff",
+        bg_opacity=92,
+        font_size=11,
+        timeout_sec=10,
+    ):
+        self.close_all()
+        mon_l, mon_t, mon_r, mon_b = mon_bounds
+        mon_w = max(240, mon_r - mon_l)
+        mon_h = max(200, mon_b - mon_t)
+        pad = 12
+
+        win = WeatherChangeBubbleWindow(
+            city_name=city_name,
+            old_pixbuf=old_pixbuf,
+            new_pixbuf=new_pixbuf,
+            remark_text=remark_text,
+            temp_c=temp_c,
+            bg_hex=bg_color,
+            fg_hex=fg_color,
+            bg_opacity=bg_opacity,
+            font_size=font_size,
+            on_close_cb=self._on_closed,
+        )
+        _, nat = win.get_preferred_size()
+        bw = max(220, min(nat.width, mon_w - pad * 2))
+        bh = max(72, min(nat.height, mon_h - pad * 2))
         win.resize(bw, bh)
 
         if position == "top_left":
@@ -1552,12 +1824,19 @@ class ClockWeatherWidget(Gtk.EventBox):
         self.popup_win = None
         self.prefs_win = None
         self.bubble_mgr = CustomBubbleManager()
+        self.alert_bubble_mgr = WeatherAlertBubbleManager()
         self._bubble_toggle_action = None
+        self._weather_alert_toggle_action = None
         self._syncing_menu_toggle = False
         self._minute_timer_id = None
         self._weather_timer_id = None
         self._icon_cache = {}
         self._fetching_weather = False
+        self._last_weather_icon = None
+        if isinstance(self.weather_data, dict):
+            _cur0 = self.weather_data.get("current") or {}
+            if _cur0.get("code") is not None:
+                _, self._last_weather_icon = wmo_to_info(_cur0.get("code", 0), is_day=_cur0.get("is_day", True))
 
         self.icon_theme = Gtk.IconTheme.get_default()
         if self.icon_theme is not None:
@@ -1710,12 +1989,26 @@ class ClockWeatherWidget(Gtk.EventBox):
             def _apply():
                 self._fetching_weather = False
                 if data is not None and err is None:
+                    cur_new = data.get("current") or {}
+                    new_desc, new_icon = wmo_to_info(
+                        cur_new.get("code", 0), is_day=cur_new.get("is_day", True)
+                    )
+                    old_icon = self._last_weather_icon
+                    self._last_weather_icon = new_icon
+
                     self.weather_data = data
                     self._save_weather_cache(data)
                     self._update_canvas_size()
                     self._update_tooltip()
                     if self.popup_win is not None and self.popup_win.is_visible():
                         self.popup_win.refresh_view()
+
+                    if (
+                        self.config.get("notify_weather_change", True)
+                        and old_icon is not None
+                        and old_icon.replace("-night", "") != new_icon.replace("-night", "")
+                    ):
+                        self.show_weather_change_bubble(old_icon, new_icon, new_desc, cur_new.get("temp"))
                 if on_done_cb:
                     on_done_cb(err)
                 return False
@@ -1983,6 +2276,42 @@ class ClockWeatherWidget(Gtk.EventBox):
 
     def close_detail_bubbles(self):
         self.bubble_mgr.close_all()
+        self.alert_bubble_mgr.close_all()
+
+    def set_weather_change_notify(self, enabled):
+        val = bool(enabled)
+        self.config["notify_weather_change"] = val
+        self._save_config()
+        if self._weather_alert_toggle_action is not None and not self._syncing_menu_toggle:
+            self._syncing_menu_toggle = True
+            try:
+                self._weather_alert_toggle_action.set_active(val)
+            finally:
+                self._syncing_menu_toggle = False
+
+    def show_weather_change_bubble(self, old_icon, new_icon, new_desc="", temp_c=None):
+        old_pb = self.get_weather_pixbuf(old_icon, 28)
+        new_pb = self.get_weather_pixbuf(new_icon, 28)
+        remark = weather_change_remark(new_icon, new_desc)
+        city = self.config.get("city_name", "台北")
+        mon_bounds = self.get_active_monitor_bounds()
+        t_sec = int(self.config.get("bubble_timeout_sec", 12))
+        self.alert_bubble_mgr.show(
+            city_name=city,
+            old_pixbuf=old_pb,
+            new_pixbuf=new_pb,
+            remark_text=remark,
+            temp_c=temp_c,
+            mon_bounds=mon_bounds,
+            position=self.config.get("bubble_position", "top_right"),
+            offset_x=int(self.config.get("bubble_offset_x", 0)),
+            offset_y=int(self.config.get("bubble_offset_y", 36)),
+            bg_color=self.config.get("bubble_bg_color", "#182234"),
+            fg_color=self.config.get("bubble_fg_color", "#f0f6ff"),
+            bg_opacity=int(self.config.get("bubble_bg_opacity", 92)),
+            font_size=int(self.config.get("calendar_font_size", 11)),
+            timeout_sec=t_sec if t_sec > 0 else 10,
+        )
 
     def set_display_mode(self, mode):
         new_mode = "custom_bubble" if mode == "custom_bubble" else "embedded"
@@ -2345,6 +2674,11 @@ class ClockWeatherWidget(Gtk.EventBox):
         b_time_row.pack_start(spin_b_timeout, False, False, 0)
         tab_bubble.pack_start(b_time_row, False, False, 0)
 
+        chk_notify_change = Gtk.CheckButton(label="自動提醒天氣變化（天氣圖案產生改變時彈出氣泡提醒）")
+        chk_notify_change.set_margin_start(10)
+        chk_notify_change.set_active(self.config.get("notify_weather_change", True))
+        tab_bubble.pack_start(chk_notify_change, False, False, 0)
+
         tab_bubble.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
         bs2 = Gtk.Label(xalign=0.0)
@@ -2405,8 +2739,10 @@ class ClockWeatherWidget(Gtk.EventBox):
 
         b_test_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         b_test_row.set_margin_start(10)
-        btn_test_bubble = Gtk.Button(label="🧪 測試目前氣泡預覽")
+        btn_test_bubble = Gtk.Button(label="🧪 測試精簡月曆氣泡")
+        btn_test_alert = Gtk.Button(label="🌦️ 測試天氣變化提醒氣泡")
         b_test_row.pack_start(btn_test_bubble, False, False, 0)
+        b_test_row.pack_start(btn_test_alert, False, False, 0)
         tab_bubble.pack_start(b_test_row, False, False, 0)
 
         lbl_status = Gtk.Label(xalign=0.0)
@@ -2457,6 +2793,7 @@ class ClockWeatherWidget(Gtk.EventBox):
             self.config["bubble_bg_opacity"] = bop_v
             lbl_b_op.set_text(f"{bop_v}%")
             self.set_display_mode(combo_detail_mode.get_active_id() or "embedded")
+            self.set_weather_change_notify(chk_notify_change.get_active())
             self._sync_weather_timer()
             self._update_canvas_size()
             self._update_tooltip()
@@ -2469,6 +2806,7 @@ class ClockWeatherWidget(Gtk.EventBox):
             self.config["city_name"] = name
             self.config["latitude"] = float(lat)
             self.config["longitude"] = float(lon)
+            self._last_weather_icon = None
             self._save_config()
             combo_city_res.remove_all()
             found_cities.clear()
@@ -2561,7 +2899,14 @@ class ClockWeatherWidget(Gtk.EventBox):
             self.show_compact_calendar_bubble()
             lbl_status.set_markup("<small><span foreground='#34d399'>✔ 已彈出精簡月曆 RGBA 氣泡框預覽</span></small>")
 
+        def _on_test_alert(*_):
+            apply_all()
+            cur = (self.weather_data or {}).get("current") or {}
+            self.show_weather_change_bubble("weather-overcast", "weather-showers", "陣雨", cur.get("temp"))
+            lbl_status.set_markup("<small><span foreground='#34d399'>✔ 已彈出天氣變化提醒氣泡預覽</span></small>")
+
         btn_test_bubble.connect("clicked", _on_test_bubble)
+        btn_test_alert.connect("clicked", _on_test_alert)
         b_bg_btn.connect("color-set", apply_all)
         b_fg_btn.connect("color-set", apply_all)
         scale_b_op.connect("value-changed", apply_all)
@@ -2572,6 +2917,7 @@ class ClockWeatherWidget(Gtk.EventBox):
         for w in (
             chk_w_icon, chk_w_temp, chk_aqi, chk_date, chk_wd, chk_24h,
             chk_panel_fs_auto, chk_world, rb_fc_dyn, rb_fc_cus, chk_shadow, chk_hover_tip,
+            chk_notify_change,
         ):
             w.connect("toggled", apply_all)
 
@@ -2674,9 +3020,27 @@ def setup_applet_context_menu(applet, widget):
     action_group.add_action(toggle_act)
     widget._bubble_toggle_action = toggle_act
 
+    alert_act = Gtk.ToggleAction(
+        name="ToggleWeatherAlertAction",
+        label="自動提醒天氣變化 (_Weather Change Alert)",
+        tooltip="天氣圖案改變時自動彈出氣泡框提醒",
+        stock_id=None,
+    )
+    alert_act.set_active(widget.config.get("notify_weather_change", True))
+
+    def _on_toggle_alert(action):
+        if widget._syncing_menu_toggle:
+            return
+        widget.set_weather_change_notify(action.get_active())
+
+    alert_act.connect("toggled", _on_toggle_alert)
+    action_group.add_action(alert_act)
+    widget._weather_alert_toggle_action = alert_act
+
     menu_xml = (
         '<menuitem name="OpenCalendar" action="OpenCalendarAction"/>'
         '<menuitem name="ToggleBubbleMode" action="ToggleBubbleModeAction"/>'
+        '<menuitem name="ToggleWeatherAlert" action="ToggleWeatherAlertAction"/>'
         '<menuitem name="RefreshWeather" action="RefreshWeatherAction"/>'
         "<separator/>"
         '<menuitem name="Preferences" action="PreferencesAction"/>'
