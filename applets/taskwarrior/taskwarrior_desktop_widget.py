@@ -40,6 +40,50 @@ CONFIG_DIR = os.path.expanduser("~/.config/matepanel-applet-plus")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "taskwarrior-desktop.json")
 TASK_COLORS_PATH = os.path.join(CONFIG_DIR, "task-colors.json")
 WEATHER_CACHE_PATH = os.path.join(CONFIG_DIR, "weather-cache.json")
+AUTOSTART_PATH = os.path.expanduser("~/.config/autostart/taskwarrior-desktop-calendar.desktop")
+
+
+def is_autostart_enabled():
+    """Return True if the XDG/MATE autostart desktop entry exists and is enabled."""
+    if not os.path.isfile(AUTOSTART_PATH):
+        return False
+    try:
+        with open(AUTOSTART_PATH, "r", encoding="utf-8") as f:
+            txt = f.read()
+        for line in txt.splitlines():
+            s = line.strip()
+            if s.startswith("X-MATE-Autostart-enabled=") and s.split("=", 1)[1].strip().lower() == "false":
+                return False
+            if s.startswith("Hidden=") and s.split("=", 1)[1].strip().lower() == "true":
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def set_autostart_enabled(enabled):
+    """Create or remove the XDG/MATE autostart entry for this desktop widget."""
+    try:
+        if enabled:
+            os.makedirs(os.path.dirname(AUTOSTART_PATH), exist_ok=True)
+            script_path = os.path.abspath(__file__)
+            entry = (
+                "[Desktop Entry]\n"
+                "Type=Application\n"
+                "Name=Taskwarrior Desktop Calendar\n"
+                "Comment=Interactive Taskwarrior monthly calendar embedded on MATE desktop\n"
+                f"Exec=/usr/bin/python3 {script_path}\n"
+                "Terminal=false\n"
+                "X-MATE-Autostart-enabled=true\n"
+                "X-MATE-Autostart-Delay=2\n"
+            )
+            with open(AUTOSTART_PATH, "w", encoding="utf-8") as f:
+                f.write(entry)
+        else:
+            if os.path.exists(AUTOSTART_PATH):
+                os.remove(AUTOSTART_PATH)
+    except Exception:
+        pass
 
 TASK_COLOR_PRESETS = [
     ("#dc2626", "紅"),
@@ -184,6 +228,7 @@ class MiniDesktopIconWindow(Gtk.Window):
         self.parent_cal = parent_cal
         self.set_title("Taskwarrior Desktop Icon")
         self.set_decorated(False)
+        self.set_type_hint(Gdk.WindowTypeHint.DESKTOP)
         self.set_keep_below(True)
         self.set_skip_taskbar_hint(True)
         self.set_skip_pager_hint(True)
@@ -369,6 +414,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self.set_title("Taskwarrior Desktop Calendar")
         self.set_decorated(False)
+        self.set_type_hint(Gdk.WindowTypeHint.DESKTOP)
         self.set_keep_below(True)
         self.set_skip_taskbar_hint(True)
         self.set_skip_pager_hint(True)
@@ -401,7 +447,14 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         self._config_debounce_id = None
         self._geom_save_id = None
         self._is_minimized = False
+        self._is_maximized = False
+        self._pre_max_geom = None
         self.mini_win = None
+        self._drag_mode = None      # None, "move", "se", "e", "s"
+        self._drag_start_root = None
+        self._drag_orig_pos = None
+        self._drag_orig_size = None
+        self._last_cursor_name = None
 
         # Enable RGBA transparency
         screen = self.get_screen()
@@ -411,8 +464,18 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
                 self.set_visual(visual)
         self.set_app_paintable(True)
 
+        self.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+            | Gdk.EventMask.LEAVE_NOTIFY_MASK
+        )
         self.connect("draw", self._on_draw_bg)
         self.connect("configure-event", self._on_configure)
+        self.connect("button-press-event", self._on_win_button_press)
+        self.connect("motion-notify-event", self._on_win_motion)
+        self.connect("button-release-event", self._on_win_button_release)
+        self.connect("leave-notify-event", self._on_win_leave)
         self.connect("destroy", self._on_destroy)
 
         self._build_ui()
@@ -504,7 +567,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         return pb
 
     def _on_configure(self, _w, event):
-        if self._is_minimized or not self.get_visible():
+        if self._is_minimized or self._is_maximized or not self.get_visible():
             return False
         if self._geom_save_id is not None:
             try:
@@ -514,7 +577,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
 
         def _commit():
             self._geom_save_id = None
-            if self._is_minimized or not self.get_visible():
+            if self._is_minimized or self._is_maximized or not self.get_visible():
                 return False
             px, py = self.get_position()
             pw, ph = self.get_size()
@@ -538,8 +601,14 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         # Top header bar (draggable when unlocked)
         self.hdr_ev = Gtk.EventBox()
         self.hdr_ev.set_visible_window(False)
-        self.hdr_ev.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.hdr_ev.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+        )
         self.hdr_ev.connect("button-press-event", self._on_header_button_press)
+        self.hdr_ev.connect("motion-notify-event", self._on_win_motion)
+        self.hdr_ev.connect("button-release-event", self._on_win_button_release)
 
         nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
 
@@ -578,12 +647,15 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         self.btn_prefs = _make_btn("⚙", "外觀與位置設定")
         self.btn_prefs.connect("clicked", self.show_preferences_dialog)
 
+        self.btn_max = _make_btn("□", "放大至工作區全螢幕（不與 MATE Panel 重疊）")
+        self.btn_max.connect("clicked", self.toggle_maximize_workarea)
+
         self.btn_mini = _make_btn("—", "縮小為桌面小圖示（方便操作桌面檔案）")
         self.btn_mini.connect("clicked", self.minimize_to_icon)
 
         self._nav_buttons = [
             self.btn_prev, self.btn_today, self.btn_next,
-            self.btn_unsched, self.btn_add, self.btn_undo, self.btn_lock, self.btn_prefs, self.btn_mini,
+            self.btn_unsched, self.btn_add, self.btn_undo, self.btn_lock, self.btn_prefs, self.btn_max, self.btn_mini,
         ]
 
         nav.pack_start(self.btn_prev, False, False, 0)
@@ -591,6 +663,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         nav.pack_start(self.btn_next, False, False, 0)
         nav.pack_start(self.month_lbl, True, True, 0)
         nav.pack_end(self.btn_mini, False, False, 0)
+        nav.pack_end(self.btn_max, False, False, 0)
         nav.pack_end(self.btn_prefs, False, False, 0)
         nav.pack_end(self.btn_lock, False, False, 0)
         nav.pack_end(self.btn_undo, False, False, 0)
@@ -604,9 +677,15 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         self.cal_canvas = Gtk.DrawingArea()
         self.cal_canvas.set_hexpand(True)
         self.cal_canvas.set_vexpand(True)
-        self.cal_canvas.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.cal_canvas.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+        )
         self.cal_canvas.connect("draw", self._on_draw_calendar)
         self.cal_canvas.connect("button-press-event", self._on_canvas_click)
+        self.cal_canvas.connect("motion-notify-event", self._on_win_motion)
+        self.cal_canvas.connect("button-release-event", self._on_win_button_release)
         root.pack_start(self.cal_canvas, True, True, 0)
 
         self.add(root)
@@ -616,14 +695,122 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         fg = html.escape(self.config.get("fg_color", "#f1f5f9"))
         locked = bool(self.config.get("locked", False))
         self.btn_lock._raw_txt = "🔒" if locked else "🔓"
+        self.btn_max._raw_txt = "❐" if self._is_maximized else "□"
+        self.btn_max.set_tooltip_text(
+            "還原視窗大小" if self._is_maximized else "放大至工作區全螢幕（不與 MATE Panel 重疊）"
+        )
         self.btn_unsched._raw_txt = f"📌 未排期 ({len(self._unscheduled)})"
         for b in self._nav_buttons:
             b._inner_lbl.set_markup(f"<span foreground='{fg}'><b>{html.escape(b._raw_txt)}</b></span>")
         self.btn_unsched.set_visible(len(self._unscheduled) > 0)
 
+    def _set_cursor_name(self, name):
+        if name == self._last_cursor_name:
+            return
+        self._last_cursor_name = name
+        gdk_win = self.get_window()
+        if gdk_win is None:
+            return
+        try:
+            if name:
+                cur = Gdk.Cursor.new_from_name(gdk_win.get_display(), name)
+                gdk_win.set_cursor(cur)
+            else:
+                gdk_win.set_cursor(None)
+        except Exception:
+            pass
+
+    def _detect_resize_edge(self, x_root, y_root):
+        """Return 'se', 'e', 's', or None based on pointer position relative to window."""
+        if self.config.get("locked", False):
+            return None
+        wx, wy = self.get_position()
+        ww, wh = self.get_size()
+        lx = float(x_root) - float(wx)
+        ly = float(y_root) - float(wy)
+        on_right = lx >= (ww - 12.0) and lx <= (ww + 4.0)
+        on_bottom = ly >= (wh - 12.0) and ly <= (wh + 4.0)
+        in_se = lx >= (ww - 24.0) and ly >= (wh - 24.0)
+        if in_se or (on_right and on_bottom):
+            return "se"
+        if on_right:
+            return "e"
+        if on_bottom:
+            return "s"
+        return None
+
+    def _start_manual_drag(self, mode, x_root, y_root):
+        if self._is_maximized:
+            self._is_maximized = False
+            self._style_nav_labels()
+        self._drag_mode = mode
+        self._drag_start_root = (float(x_root), float(y_root))
+        self._drag_orig_pos = self.get_position()
+        self._drag_orig_size = self.get_size()
+
+    def _on_win_button_press(self, _w, event):
+        if event.button == 1 and not self.config.get("locked", False):
+            edge = self._detect_resize_edge(event.x_root, event.y_root)
+            if edge:
+                self._start_manual_drag(edge, event.x_root, event.y_root)
+                return True
+        if event.button == 3:
+            self._show_context_menu(event)
+            return True
+        return False
+
+    def _on_win_motion(self, _w, event):
+        if self._drag_mode is not None and self._drag_start_root is not None:
+            if not (event.state & Gdk.ModifierType.BUTTON1_MASK):
+                self._finish_manual_drag()
+                return False
+            dx = float(event.x_root) - self._drag_start_root[0]
+            dy = float(event.y_root) - self._drag_start_root[1]
+            if self._drag_mode == "move":
+                nx = int(round(self._drag_orig_pos[0] + dx))
+                ny = int(round(self._drag_orig_pos[1] + dy))
+                self.move(nx, ny)
+            else:
+                ow, oh = self._drag_orig_size
+                nw = max(520, int(round(ow + dx))) if self._drag_mode in ("se", "e") else ow
+                nh = max(380, int(round(oh + dy))) if self._drag_mode in ("se", "s") else oh
+                self.resize(nw, nh)
+            return True
+
+        edge = self._detect_resize_edge(event.x_root, event.y_root)
+        cursor_map = {"se": "nwse-resize", "e": "ew-resize", "s": "ns-resize"}
+        self._set_cursor_name(cursor_map.get(edge))
+        return False
+
+    def _finish_manual_drag(self):
+        if self._drag_mode is None:
+            return
+        self._drag_mode = None
+        self._drag_start_root = None
+        self._drag_orig_pos = None
+        self._drag_orig_size = None
+        px, py = self.get_position()
+        pw, ph = self.get_size()
+        self.config["x"] = int(px)
+        self.config["y"] = int(py)
+        self.config["width"] = int(pw)
+        self.config["height"] = int(ph)
+        self._save_config()
+
+    def _on_win_button_release(self, _w, event):
+        if event.button == 1 and self._drag_mode is not None:
+            self._finish_manual_drag()
+            return True
+        return False
+
+    def _on_win_leave(self, _w, _event):
+        if self._drag_mode is None:
+            self._set_cursor_name(None)
+        return False
+
     def _on_header_button_press(self, _w, event):
         if event.button == 1 and not self.config.get("locked", False):
-            self.begin_move_drag(event.button, int(event.x_root), int(event.y_root), event.time)
+            self._start_manual_drag("move", event.x_root, event.y_root)
             return True
         if event.button == 3:
             self._show_context_menu(event)
@@ -770,16 +957,60 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         if self.mini_win is not None and self.mini_win.get_visible():
             self.mini_win.canvas.queue_draw()
 
-    def minimize_to_icon(self, *_args):
-        if self._is_minimized:
+    def toggle_maximize_workarea(self, *_args):
+        """Toggle maximizing the widget to the monitor's usable workarea (never overlapping MATE Panel)."""
+        if self._is_maximized:
+            self._is_maximized = False
+            if self._pre_max_geom:
+                x, y, w, h = self._pre_max_geom
+            else:
+                x = int(self.config.get("x", 80))
+                y = int(self.config.get("y", 60))
+                w = max(520, int(self.config.get("width", 940)))
+                h = max(380, int(self.config.get("height", 620)))
+            self.resize(w, h)
+            self.move(x, y)
+            self._style_nav_labels()
+            self.cal_canvas.queue_draw()
             return
+
         px, py = self.get_position()
         pw, ph = self.get_size()
+        self._pre_max_geom = (int(px), int(py), int(pw), int(ph))
         self.config["x"] = int(px)
         self.config["y"] = int(py)
         self.config["width"] = int(pw)
         self.config["height"] = int(ph)
         self._save_config()
+
+        wa = None
+        display = Gdk.Display.get_default()
+        if display is not None:
+            gdk_win = self.get_window()
+            mon = display.get_monitor_at_window(gdk_win) if gdk_win is not None else display.get_primary_monitor()
+            if mon is None and display.get_n_monitors() > 0:
+                mon = display.get_monitor(0)
+            if mon is not None:
+                wa = mon.get_workarea()
+
+        if wa is not None and wa.width > 0 and wa.height > 0:
+            self._is_maximized = True
+            self.move(int(wa.x), int(wa.y))
+            self.resize(int(wa.width), int(wa.height))
+            self._style_nav_labels()
+            self.cal_canvas.queue_draw()
+
+    def minimize_to_icon(self, *_args):
+        if self._is_minimized:
+            return
+        px, py = self.get_position()
+        pw, ph = self.get_size()
+        if not self._is_maximized:
+            self.config["x"] = int(px)
+            self.config["y"] = int(py)
+            self.config["width"] = int(pw)
+            self.config["height"] = int(ph)
+            self._save_config()
 
         self._is_minimized = True
         if self.mini_win is None:
@@ -802,11 +1033,18 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
             return
         if self.mini_win is not None:
             self.mini_win.hide()
+        self._is_minimized = False
+        if self._is_maximized:
+            self._is_maximized = False
+            self.show_all()
+            self.toggle_maximize_workarea()
+            self._refresh_view()
+            GLib.idle_add(self._assert_desktop_layer)
+            return
         w = max(520, int(self.config.get("width", 940)))
         h = max(380, int(self.config.get("height", 620)))
         x = int(self.config.get("x", 80))
         y = int(self.config.get("y", 60))
-        self._is_minimized = False
         self.resize(w, h)
         self.move(x, y)
         self.show_all()
@@ -1165,16 +1403,12 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
     # =========================================================================
 
     def _on_canvas_click(self, widget, event):
-        alloc = widget.get_allocation()
-        # Bottom-right resize grip when unlocked
-        if (
-            event.button == 1
-            and not self.config.get("locked", False)
-            and event.x >= alloc.width - 18
-            and event.y >= alloc.height - 18
-        ):
-            self.begin_resize_drag(Gdk.WindowEdge.SOUTH_EAST, event.button, int(event.x_root), int(event.y_root), event.time)
-            return True
+        # Bottom-right / edge resize grip when unlocked (WM-independent, works on Marco & Compiz)
+        if event.button == 1 and not self.config.get("locked", False):
+            edge = self._detect_resize_edge(event.x_root, event.y_root)
+            if edge:
+                self._start_manual_drag(edge, event.x_root, event.y_root)
+                return True
 
         if event.button == 3:
             self._show_context_menu(event)
@@ -1560,6 +1794,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
             ("↩ 復原上一步 (Undo)", self._on_undo),
             (None, None),
             ("🔓 解鎖拖曳與縮放" if self.config.get("locked") else "🔒 鎖定桌面位置", self._on_toggle_lock),
+            ("❐ 還原視窗大小" if self._is_maximized else "□ 放大至工作區全螢幕", self.toggle_maximize_workarea),
             ("— 縮小為桌面小圖示", self.minimize_to_icon),
             ("⚙ 外觀與位置設定...", self.show_preferences_dialog),
             (None, None),
@@ -1682,6 +1917,11 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         chk_lock = Gtk.CheckButton(label="🔒 鎖定桌面位置與大小（取消勾選即可拖曳頂部移動、右下角縮放）")
         chk_lock.set_active(self.config.get("locked", False))
         box.pack_start(chk_lock, False, False, 0)
+
+        chk_autostart = Gtk.CheckButton(label="🚀 開機進入桌面時自動啟動桌面月曆")
+        chk_autostart.set_active(is_autostart_enabled())
+        chk_autostart.connect("toggled", lambda c: set_autostart_enabled(c.get_active()))
+        box.pack_start(chk_autostart, False, False, 0)
 
         def apply_all(*_):
             self.config["bg_color"] = rgba_to_hex(bg_btn.get_rgba())

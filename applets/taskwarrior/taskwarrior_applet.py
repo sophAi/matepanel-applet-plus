@@ -3157,15 +3157,49 @@ class TaskwarriorWidget(Gtk.EventBox):
         btn_cal.connect("clicked", lambda *_: self.show_calendar_window())
         btn_pomo = Gtk.Button(label="🍅 啟動/暫停番茄鐘")
         btn_pomo.connect("clicked", lambda *_: self.pomo_toggle_pause_resume())
+        btn_desktop = Gtk.Button(label="🖥️ 啟動桌面月曆")
+        btn_desktop.set_tooltip_text("啟動 Taskwarrior 桌面嵌入式月曆（若已在執行中則略過）")
+        btn_desktop.connect("clicked", lambda *_: self.launch_desktop_widget())
         btn_close = Gtk.Button(label="關閉")
         btn_close.connect("clicked", lambda *_: win.destroy())
         btn_box.pack_start(btn_cal, False, False, 0)
         btn_box.pack_start(btn_pomo, False, False, 0)
+        btn_box.pack_start(btn_desktop, False, False, 0)
         btn_box.pack_end(btn_close, False, False, 0)
         outer.pack_end(btn_box, False, False, 0)
 
         win.add(outer)
         win.show_all()
+
+    def launch_desktop_widget(self, *_args):
+        """Launch taskwarrior_desktop_widget.py if not already running; ignore if already active."""
+        try:
+            res = subprocess.run(
+                ["pgrep", "-f", "taskwarrior_desktop_widget.py"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if res.returncode == 0:
+                return False
+        except Exception:
+            pass
+
+        script_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "taskwarrior_desktop_widget.py"
+        )
+        if not os.path.isfile(script_path):
+            return False
+        try:
+            subprocess.Popen(
+                ["/usr/bin/python3", script_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return True
+        except Exception:
+            return False
 
     def show_about_dialog(self, *_args):
         dlg = Gtk.AboutDialog()
