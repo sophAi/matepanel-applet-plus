@@ -1156,8 +1156,8 @@ class HimawariSatelliteView(Gtk.Box):
     IMG_H = 256 * 2          # 512
 
     BANDS = [
-        ("B13/TBB", "紅外線雲圖 (日夜通用)"),
         ("SND/ETC", "雲頂高度強化 (彩色對流)"),
+        ("B13/TBB", "紅外線雲圖 (日夜通用)"),
         ("B08/TBB", "水氣頻道 (大氣水氣)"),
         ("REP/ETC", "真實色雲圖 (白天推薦)"),
     ]
@@ -1176,7 +1176,7 @@ class HimawariSatelliteView(Gtk.Box):
         self.set_margin_start(6)
         self.set_margin_end(6)
 
-        self._band = "B13/TBB"
+        self._band = "SND/ETC"
         self._frames = []            # list of {"label": str, "surface": cairo.ImageSurface}
         self._base_tiles = {}        # (x, y) -> GdkPixbuf (GSI pale)
         self._label_tiles = {}       # (x, y) -> GdkPixbuf
