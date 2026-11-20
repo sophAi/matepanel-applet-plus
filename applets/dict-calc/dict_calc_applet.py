@@ -26,6 +26,7 @@ Features:
 """
 
 import ast
+from collections import OrderedDict
 import glob
 import html
 import json
@@ -36,6 +37,9 @@ import re
 import subprocess
 import sys
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -92,6 +96,10 @@ DEFAULT_CONFIG = {
     "panel_entry_width": 170,            # 面板內嵌查詢框寬度 (px)
     "scan_selection_enabled": False,     # 是否啟用滑鼠反白自動劃詞查詢 (Selection Primary)
     "scan_modifier": "ctrl",             # 劃詞觸發修飾鍵: "none", "ctrl", "alt", "shift"
+    "google_translate_enabled": True,    # 句子/段落自動改用 Google 翻譯 (雙向翻譯)
+    "google_translate_fallback": True,   # 離線詞典查無短片語時自動 Fallback 至 Google 翻譯
+    "google_translate_target": "zh-TW",  # 外文翻譯目標語言 ("zh-TW", "zh-CN", "ja", "en")
+    "google_translate_reverse": "en",    # 中文反向翻譯目標語言 ("en", "ja")
     "hotkey_open_window": "<Ctrl><Alt>d",# 聚焦面板輸入框 / 呼叫查詢的全域快捷鍵
     "hotkey_scan_selection": "<Ctrl><Alt>s", # 立即查詢目前滑鼠反白文字 (Scan Selection) 的全域快捷鍵
     "calc_auto_copy": True,              # 數學計算模式預設自動將結果存入系統剪貼簿 (可直接 Ctrl+V)
@@ -199,6 +207,156 @@ class DBusNotifier:
     def show(self, summary, body, icon="accessories-dictionary", timeout_sec=8, position=None):
         positions = [position] if position is not None else None
         return self.show_batch([(summary, body, icon)], timeout_sec=timeout_sec, positions=positions)
+
+
+class GoogleTranslator:
+    """
+    Zero-dependency, zero-subprocess Google Translate GTX client using Python stdlib `urllib.request`.
+    Features:
+      - Smart sentence/paragraph detection vs single word/short phrase
+      - Bidirectional language routing (non-Chinese -> primary_tl; Chinese -> reverse_tl)
+      - POST form submission supporting multi-line paragraphs up to 2,000 chars
+      - Thread-safe 20-entry LRU memory cache
+    """
+
+    PRIMARY_ENDPOINT = "https://clients5.google.com/translate_a/t"
+    FALLBACK_ENDPOINT = "https://translate.googleapis.com/translate_a/single"
+    SENTENCE_PUNCT_RE = re.compile(r"[。，！？；：,.!?;:]")
+    LANG_LABELS = {
+        "zh": "中文",
+        "zh-TW": "繁體中文",
+        "zh-CN": "簡體中文",
+        "en": "英文",
+        "ja": "日文",
+        "ko": "韓文",
+        "fr": "法文",
+        "de": "德文",
+        "es": "西班牙文",
+        "auto": "自動偵測",
+    }
+
+    def __init__(self, cache_size=20):
+        self._cache = OrderedDict()
+        self._cache_size = cache_size
+        self._lock = threading.Lock()
+
+    @classmethod
+    def is_sentence_or_paragraph(cls, text):
+        """Return True if text looks like a sentence or paragraph rather than a single word/short phrase."""
+        if not text:
+            return False
+        if "\n" in text:
+            return True
+        if len(text) >= 40:
+            return True
+        # Count CJK (Chinese/Japanese/Korean) characters
+        cjk_count = sum(
+            1
+            for ch in text
+            if ("\u4e00" <= ch <= "\u9fff")
+            or ("\u3040" <= ch <= "\u30ff")
+            or ("\uac00" <= ch <= "\ud7af")
+        )
+        if cjk_count >= 8:
+            return True
+        # Sentence punctuation with meaningful length
+        if len(text) >= 6 and cls.SENTENCE_PUNCT_RE.search(text):
+            return True
+        # English / whitespace-delimited words >= 3
+        words = [w for w in text.split() if w]
+        if len(words) >= 3:
+            return True
+        return False
+
+    @classmethod
+    def detect_target_lang(cls, text, primary_tl="zh-TW", reverse_tl="en"):
+        """Bidirectional target language selection: Chinese -> reverse_tl, others -> primary_tl."""
+        has_kana = any("\u3040" <= ch <= "\u30ff" for ch in text)
+        if has_kana:
+            return primary_tl
+        non_ws = [ch for ch in text if not ch.isspace()]
+        if not non_ws:
+            return primary_tl
+        han_count = sum(1 for ch in non_ws if "\u4e00" <= ch <= "\u9fff")
+        ascii_alpha = sum(1 for ch in non_ws if ("a" <= ch.lower() <= "z"))
+        is_chinese = (han_count / float(len(non_ws)) >= 0.40) or (han_count >= 2 and ascii_alpha <= 2)
+        if is_chinese and primary_tl.startswith("zh"):
+            return reverse_tl
+        return primary_tl
+
+    @classmethod
+    def lang_label(cls, code):
+        return cls.LANG_LABELS.get(code, code)
+
+    def translate_sync(self, text, primary_tl="zh-TW", reverse_tl="en", timeout=6.0):
+        """
+        Translate `text` synchronously. Intended to be called from a background thread.
+        Returns: (translated_text, detected_src_lang, target_lang, error_msg)
+        """
+        tl = self.detect_target_lang(text, primary_tl=primary_tl, reverse_tl=reverse_tl)
+        cache_key = (text, tl)
+        with self._lock:
+            if cache_key in self._cache:
+                self._cache.move_to_end(cache_key)
+                tr_text, src_lang = self._cache[cache_key]
+                return tr_text, src_lang, tl, None
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+        }
+        payload = urllib.parse.urlencode({"q": text}).encode("utf-8")
+        last_err = None
+
+        # Try primary endpoint (clients5 dict-chrome-ex) first, then fallback to gtx
+        endpoints = [
+            ("chrome_ex", f"{self.PRIMARY_ENDPOINT}?client=dict-chrome-ex&sl=auto&tl={urllib.parse.quote(tl)}"),
+            ("gtx", f"{self.FALLBACK_ENDPOINT}?client=gtx&sl=auto&tl={urllib.parse.quote(tl)}&dt=t"),
+        ]
+        for ep_kind, url in endpoints:
+            req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
+                data = json.loads(raw)
+                translated = ""
+                src_lang = "auto"
+                if ep_kind == "chrome_ex":
+                    # Response format: [["translated text", "src_lang"]] or ["translated text"]
+                    if isinstance(data, list) and data:
+                        first = data[0]
+                        if isinstance(first, list) and first:
+                            translated = str(first[0] or "")
+                            if len(first) > 1 and first[1]:
+                                src_lang = str(first[1])
+                        elif isinstance(first, str):
+                            translated = first
+                else:
+                    segments = data[0] if isinstance(data, list) and len(data) > 0 and isinstance(data[0], list) else []
+                    translated = "".join(
+                        str(seg[0]) for seg in segments if isinstance(seg, list) and seg and seg[0]
+                    )
+                    if isinstance(data, list) and len(data) > 2 and data[2]:
+                        src_lang = str(data[2])
+
+                if translated.strip():
+                    if src_lang == tl and any("\u4e00" <= ch <= "\u9fff" for ch in text):
+                        src_lang = "zh"
+                    with self._lock:
+                        self._cache[cache_key] = (translated, src_lang)
+                        self._cache.move_to_end(cache_key)
+                        while len(self._cache) > self._cache_size:
+                            self._cache.popitem(last=False)
+                    return translated, src_lang, tl, None
+                last_err = "Google 翻譯未回傳譯文"
+            except urllib.error.HTTPError as exc:
+                last_err = f"HTTP 錯誤 ({exc.code})，請稍後再試"
+            except urllib.error.URLError as exc:
+                last_err = f"網路連線失敗：{exc.reason}"
+            except Exception as exc:
+                last_err = f"翻譯失敗：{exc}"
+
+        return None, "auto", tl, last_err or "翻譯失敗"
 
 
 # =============================================================================
@@ -787,13 +945,21 @@ class DictCalcPopupWindow(Gtk.Window):
         if not self._last_calc_result:
             self.calc_frame.hide()
 
-    def show_loading(self, q, near_pointer=False):
-        self.query_title_lbl.set_markup(f"<b>📖 查詢：{html.escape(q)}</b>")
+    def show_loading(self, q, near_pointer=False, is_translate=False):
+        short_q = q.replace("\n", " ")
+        if len(short_q) > 28:
+            short_q = short_q[:26] + "…"
+        if is_translate:
+            self.query_title_lbl.set_markup(f"<b>🌐 Google 翻譯：{html.escape(short_q)}</b>")
+            loading_msg = "🌐 正在使用 Google 翻譯中..."
+        else:
+            self.query_title_lbl.set_markup(f"<b>📖 查詢：{html.escape(short_q)}</b>")
+            loading_msg = f"🔎 正在查詢「{short_q}」..."
         self.calc_frame.hide()
         self._last_calc_result = None
         self.result_buf.set_text("")
         self.result_buf.insert_with_tags(
-            self.result_buf.get_end_iter(), f"🔎 正在查詢「{q}」...", self.tag_muted
+            self.result_buf.get_end_iter(), loading_msg, self.tag_muted
         )
         self.position_and_show(near_pointer=near_pointer)
 
@@ -879,6 +1045,60 @@ class DictCalcPopupWindow(Gtk.Window):
         self._update_status_footer(f"查詢「{query_word}」：共找到 {len(results)} 筆詞典釋義")
         self.position_and_show(near_pointer=near_pointer)
 
+    def show_translate_result(
+        self,
+        original_text,
+        translated_text,
+        src_lang,
+        target_lang,
+        err=None,
+        is_fallback=False,
+        near_pointer=False,
+    ):
+        short_q = original_text.replace("\n", " ")
+        if len(short_q) > 26:
+            short_q = short_q[:24] + "…"
+        self.query_title_lbl.set_markup(f"<b>🌐 Google 翻譯：{html.escape(short_q)}</b>")
+
+        buf = self.result_buf
+        buf.set_text("")
+
+        if err is not None or not translated_text:
+            self._last_calc_result = None
+            self.calc_frame.hide()
+            buf.insert_with_tags(
+                buf.get_end_iter(),
+                f"⚠️ Google 翻譯失敗：{err or '無回傳內容'}\n\n",
+                self.tag_word,
+            )
+            buf.insert_with_tags(buf.get_end_iter(), f"原文：\n{original_text}\n", self.tag_muted)
+            self._update_status_footer("🌐 Google 翻譯失敗")
+            self.position_and_show(near_pointer=near_pointer)
+            return
+
+        src_lbl = GoogleTranslator.lang_label(src_lang)
+        tgt_lbl = GoogleTranslator.lang_label(target_lang)
+        fb_note = " (離線無結果自動切換)" if is_fallback else ""
+
+        self._last_calc_result = translated_text
+        self.calc_result_lbl.set_markup(
+            f"🌐 <b>Google 翻譯</b>  <span foreground='#38bdf8'>{html.escape(src_lbl)} → {html.escape(tgt_lbl)}</span>"
+            f"<small><span foreground='#94a3b8'>{html.escape(fb_note)}</span></small>"
+        )
+        self.calc_frame.show_all()
+
+        buf.insert_with_tags(buf.get_end_iter(), f"🌐 譯文 ({tgt_lbl})\n", self.tag_dict_hdr)
+        buf.insert_with_tags(buf.get_end_iter(), f"{translated_text}\n", self.tag_body)
+        buf.insert_with_tags(buf.get_end_iter(), "\n" + ("─" * 38) + "\n", self.tag_muted)
+        buf.insert_with_tags(buf.get_end_iter(), f"📝 原文 ({src_lbl})\n", self.tag_word)
+        buf.insert_with_tags(buf.get_end_iter(), f"{original_text}\n", self.tag_muted)
+
+        self.result_view.scroll_to_iter(buf.get_start_iter(), 0.0, False, 0.0, 0.0)
+        self._update_status_footer(
+            f"🌐 Google 翻譯 ({src_lbl} → {tgt_lbl}) | 共 {len(original_text)} 字 | 點右上 📋 複製譯文"
+        )
+        self.position_and_show(near_pointer=near_pointer)
+
 
 # =============================================================================
 # 4. Main MATE Panel Applet Widget (Badge / Inline Panel Entry + Hotkeys + Scan)
@@ -914,6 +1134,7 @@ class DictCalcWidget(Gtk.EventBox):
         self.dict_mgr = StarDictManager()
         self.calc = SafeMathCalculator()
         self.dbus_notifier = DBusNotifier()
+        self.translator = GoogleTranslator()
 
         self.panel_size = 28
         self.popup_win = None
@@ -1133,10 +1354,21 @@ class DictCalcWidget(Gtk.EventBox):
                 txt2 = self.clipboard_main.wait_for_text() or ""
                 text = txt2
         cleaned = (text or "").strip()
-        if not cleaned or len(cleaned) > 160 or "\n" in cleaned:
+        if not cleaned:
             if force_from_hotkey:
                 self.open_popup_window("")
             return
+        # Allow multi-line sentences & paragraphs up to 2,000 chars for Google Translate;
+        # if Google Translate is disabled, keep strict single-line word limit (160 chars).
+        gt_enabled = bool(self.config.get("google_translate_enabled", True))
+        if not gt_enabled:
+            if len(cleaned) > 160 or "\n" in cleaned:
+                if force_from_hotkey:
+                    self.open_popup_window("")
+                return
+        else:
+            if len(cleaned) > 2000:
+                cleaned = cleaned[:2000].rstrip()
         if not force_from_hotkey and cleaned == self._last_scanned_text:
             return
         self._last_scanned_text = cleaned
@@ -1441,14 +1673,27 @@ class DictCalcWidget(Gtk.EventBox):
                 GLib.idle_add(self._refocus_panel_entry)
             return
 
-        # 2. StarDict Asynchronous Lookup
+        # 2. Smart Routing: Sentence / Paragraph -> Google Translate (Scheme A)
         use_dbus_dict = out_mode == "dbus_popup"
+        gt_enabled = bool(self.config.get("google_translate_enabled", True))
         self._query_seq += 1
         seq = self._query_seq
 
+        if gt_enabled and GoogleTranslator.is_sentence_or_paragraph(q):
+            self._start_google_translate(
+                seq,
+                q,
+                near_pointer=near_pointer,
+                use_dbus_dict=use_dbus_dict,
+                keep_panel_focus=keep_panel_focus,
+                is_fallback=False,
+            )
+            return
+
+        # 3. Offline StarDict Asynchronous Lookup (Single word / short phrase)
         if not use_dbus_dict:
             win = self._ensure_popup_window()
-            win.show_loading(q, near_pointer=near_pointer)
+            win.show_loading(q, near_pointer=near_pointer, is_translate=False)
             if keep_panel_focus:
                 GLib.idle_add(self._refocus_panel_entry)
 
@@ -1480,6 +1725,100 @@ class DictCalcWidget(Gtk.EventBox):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _start_google_translate(self, seq, text, near_pointer, use_dbus_dict, keep_panel_focus, is_fallback=False):
+        """Run Google Translate GTX asynchronously; auto-switch long/multi-line paragraphs to focus-free window."""
+        force_window = ("\n" in text) or (len(text) >= 180)
+        use_dbus_tr = use_dbus_dict and (not force_window)
+
+        if not use_dbus_tr:
+            win = self._ensure_popup_window()
+            win.show_loading(text, near_pointer=near_pointer, is_translate=True)
+            if keep_panel_focus:
+                GLib.idle_add(self._refocus_panel_entry)
+
+        primary_tl = self.config.get("google_translate_target", "zh-TW")
+        reverse_tl = self.config.get("google_translate_reverse", "en")
+
+        def tr_worker():
+            translated, src_lang, tgt_lang, err = self.translator.translate_sync(
+                text, primary_tl=primary_tl, reverse_tl=reverse_tl
+            )
+            GLib.idle_add(
+                self._on_translate_done,
+                seq,
+                text,
+                translated,
+                src_lang,
+                tgt_lang,
+                err,
+                near_pointer,
+                use_dbus_tr,
+                keep_panel_focus,
+                is_fallback,
+            )
+
+        threading.Thread(target=tr_worker, daemon=True).start()
+
+    def _on_translate_done(
+        self,
+        seq,
+        original_text,
+        translated_text,
+        src_lang,
+        target_lang,
+        err,
+        near_pointer,
+        use_dbus_tr,
+        keep_panel_focus,
+        is_fallback,
+    ):
+        if seq != self._query_seq:
+            return False
+
+        if use_dbus_tr:
+            timeout_sec = int(self.config.get("dbus_popup_timeout_sec", 8))
+            if err is not None or not translated_text:
+                self._notify_dbus(
+                    "🌐 Google 翻譯失敗",
+                    self._wrap_dbus_font(html.escape(str(err or "無回傳內容"))),
+                    icon="dialog-error",
+                    timeout_sec=timeout_sec,
+                )
+            else:
+                src_lbl = GoogleTranslator.lang_label(src_lang)
+                tgt_lbl = GoogleTranslator.lang_label(target_lang)
+                fb_tag = " · 自動切換" if is_fallback else ""
+                short_orig = original_text.replace("\n", " ")
+                if len(short_orig) > 65:
+                    short_orig = short_orig[:63] + "…"
+                tr_disp = translated_text.strip()
+                if len(tr_disp) > 420:
+                    tr_disp = tr_disp[:417] + "…"
+                body = self._wrap_dbus_font(
+                    f"<b>{html.escape(tr_disp)}</b>\n<i>{html.escape(short_orig)}</i>"
+                )
+                self._notify_dbus(
+                    f"🌐 Google 翻譯 ({src_lbl} → {tgt_lbl}{fb_tag})",
+                    body,
+                    icon="accessories-dictionary",
+                    timeout_sec=timeout_sec,
+                )
+        else:
+            win = self._ensure_popup_window()
+            win.show_translate_result(
+                original_text,
+                translated_text,
+                src_lang,
+                target_lang,
+                err=err,
+                is_fallback=is_fallback,
+                near_pointer=near_pointer,
+            )
+
+        if keep_panel_focus:
+            GLib.idle_add(self._refocus_panel_entry)
+        return False
+
     def _refocus_panel_entry(self):
         if self.config.get("display_mode", "panel_entry") == "panel_entry":
             self.panel_entry.grab_focus()
@@ -1487,6 +1826,22 @@ class DictCalcWidget(Gtk.EventBox):
 
     def _on_query_dict_done(self, seq, query_word, results, near_pointer, use_dbus_dict, keep_panel_focus):
         if seq != self._query_seq:
+            return False
+
+        # Auto-fallback to Google Translate when offline StarDict returns 0 hits
+        if (
+            not results
+            and self.config.get("google_translate_enabled", True)
+            and self.config.get("google_translate_fallback", True)
+        ):
+            self._start_google_translate(
+                seq,
+                query_word,
+                near_pointer=near_pointer,
+                use_dbus_dict=use_dbus_dict,
+                keep_panel_focus=keep_panel_focus,
+                is_fallback=True,
+            )
             return False
 
         if use_dbus_dict:
@@ -1714,7 +2069,9 @@ class DictCalcWidget(Gtk.EventBox):
 
     def open_popup_window(self, text="", near_pointer=False, source="panel"):
         if text:
-            self.panel_entry.set_text(text)
+            # Keep the compact panel entry clean when scanning multi-line paragraphs
+            if "\n" not in text and len(text) <= 80:
+                self.panel_entry.set_text(text)
             self.execute_query(text, near_pointer=near_pointer, keep_panel_focus=False, source=source)
         else:
             self.focus_panel_search_box()
@@ -1729,7 +2086,7 @@ class DictCalcWidget(Gtk.EventBox):
             return
 
         win = Gtk.Window(title="StarDict 離線詞典 & 計算機 Plus — 偏好設定")
-        win.set_default_size(560, 660)
+        win.set_default_size(600, 720)
         win.set_position(Gtk.WindowPosition.CENTER)
         self.prefs_win = win
         win.connect("destroy", lambda *_: setattr(self, "prefs_win", None))
@@ -1812,6 +2169,44 @@ class DictCalcWidget(Gtk.EventBox):
         )
         chk_auto_copy.set_active(self.config.get("calc_auto_copy", True))
         tab1.pack_start(chk_auto_copy, False, False, 0)
+
+        chk_gt_en = Gtk.CheckButton(
+            label="🌐 句子 / 段落自動使用 Google 翻譯 (雙向翻譯，長段落自動以無焦點視窗顯示)"
+        )
+        chk_gt_en.set_active(self.config.get("google_translate_enabled", True))
+        tab1.pack_start(chk_gt_en, False, False, 0)
+
+        chk_gt_fb = Gtk.CheckButton(
+            label="離線詞典查無單字 / 短片語時，自動 Fallback 至 Google 翻譯"
+        )
+        chk_gt_fb.set_margin_start(14)
+        chk_gt_fb.set_active(self.config.get("google_translate_fallback", True))
+        tab1.pack_start(chk_gt_fb, False, False, 0)
+
+        gt_lang_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        gt_lang_box.set_margin_start(14)
+        gt_lang_box.pack_start(Gtk.Label(label="外文翻譯目標：", xalign=0.0), False, False, 0)
+        combo_gt_tl = Gtk.ComboBoxText()
+        for l_id, l_lbl in (
+            ("zh-TW", "繁體中文 (zh-TW)"),
+            ("zh-CN", "簡體中文 (zh-CN)"),
+            ("ja", "日文 (ja)"),
+            ("en", "英文 (en)"),
+        ):
+            combo_gt_tl.append(l_id, l_lbl)
+        combo_gt_tl.set_active_id(self.config.get("google_translate_target", "zh-TW"))
+        gt_lang_box.pack_start(combo_gt_tl, True, True, 0)
+
+        gt_lang_box.pack_start(Gtk.Label(label="中文反向翻譯：", xalign=0.0), False, False, 0)
+        combo_gt_rev = Gtk.ComboBoxText()
+        for l_id, l_lbl in (
+            ("en", "英文 (en)"),
+            ("ja", "日文 (ja)"),
+        ):
+            combo_gt_rev.append(l_id, l_lbl)
+        combo_gt_rev.set_active_id(self.config.get("google_translate_reverse", "en"))
+        gt_lang_box.pack_start(combo_gt_rev, False, False, 0)
+        tab1.pack_start(gt_lang_box, False, False, 0)
 
         out_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         out_box.set_margin_start(14)
@@ -2019,7 +2414,10 @@ class DictCalcWidget(Gtk.EventBox):
         chk_shadow.set_active(self.config.get("text_shadow", False))
         tab1.pack_start(chk_shadow, False, False, 0)
 
-        notebook.append_page(tab1, Gtk.Label(label="⚙️ 一般、快捷鍵與外觀"))
+        tab1_scroll = Gtk.ScrolledWindow()
+        tab1_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        tab1_scroll.add(tab1)
+        notebook.append_page(tab1_scroll, Gtk.Label(label="⚙️ 一般、快捷鍵與外觀"))
 
         # ---------------- Tab 2: StarDict Dictionaries Manager (3 Independent Profiles) ----------------
         tab2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -2244,6 +2642,11 @@ class DictCalcWidget(Gtk.EventBox):
             self.config["scan_selection_enabled"] = chk_scan_en.get_active()
             self.config["scan_modifier"] = combo_mod.get_active_id() or "ctrl"
             self.config["calc_auto_copy"] = chk_auto_copy.get_active()
+            self.config["google_translate_enabled"] = chk_gt_en.get_active()
+            self.config["google_translate_fallback"] = chk_gt_fb.get_active()
+            self.config["google_translate_target"] = combo_gt_tl.get_active_id() or "zh-TW"
+            self.config["google_translate_reverse"] = combo_gt_rev.get_active_id() or "en"
+            chk_gt_fb.set_sensitive(chk_gt_en.get_active())
             self.config["result_output_mode"] = combo_out.get_active_id() or "window"
             self.config["dbus_popup_style"] = combo_dbus_style.get_active_id() or "separate"
             self.config["dbus_popup_max_dicts"] = int(spin_dbus_max.get_value_as_int())
@@ -2276,6 +2679,8 @@ class DictCalcWidget(Gtk.EventBox):
 
         btn_apply_hk.connect("clicked", apply_tab1)
         combo_mod.connect("changed", apply_tab1)
+        combo_gt_tl.connect("changed", apply_tab1)
+        combo_gt_rev.connect("changed", apply_tab1)
         combo_out.connect("changed", apply_tab1)
         combo_dbus_style.connect("changed", apply_tab1)
         col_btn.connect("color-set", lambda *_: (rb_col_cus.set_active(True), apply_tab1()))
@@ -2287,6 +2692,8 @@ class DictCalcWidget(Gtk.EventBox):
         for w_c in (
             chk_scan_en,
             chk_auto_copy,
+            chk_gt_en,
+            chk_gt_fb,
             rb_badge,
             rb_entry,
             rb_col_dyn,
