@@ -1546,7 +1546,8 @@ class DictCalcWidget(Gtk.EventBox):
     def _compute_dbus_positions(self, items):
         """
         Compute safe (x, y) coordinates for D-Bus notification bubbles so they NEVER overlap
-        mate-panel or the inline search box, stacking cleanly away from the panel edge.
+        mate-panel or the inline search box, and NEVER spill across monitor boundaries in
+        multi-monitor setups.
         """
         display = Gdk.Display.get_default()
         if display is None:
@@ -1555,7 +1556,9 @@ class DictCalcWidget(Gtk.EventBox):
         if gdk_win is not None:
             _, ox, oy = gdk_win.get_origin()
             alloc = self.get_allocation()
-            monitor = display.get_monitor_at_window(gdk_win)
+            cx = int(ox + max(1, alloc.width) / 2)
+            cy = int(oy + max(1, alloc.height) / 2)
+            monitor = display.get_monitor_at_point(cx, cy) or display.get_monitor_at_window(gdk_win)
         else:
             ox, oy = 0, 0
             alloc = None
@@ -1565,47 +1568,67 @@ class DictCalcWidget(Gtk.EventBox):
 
         geo = monitor.get_geometry()
         wa = monitor.get_workarea()
+        # Intersect workarea with the exact monitor geometry so multi-monitor bounds are strict
+        mon_left = max(geo.x, wa.x)
+        mon_right = min(geo.x + geo.width, wa.x + wa.width)
+        mon_top = max(geo.y, wa.y)
+        mon_bottom = min(geo.y + geo.height, wa.y + wa.height)
+        mon_w = max(300, mon_right - mon_left)
+        mon_h = max(300, mon_bottom - mon_top)
+
         fs = max(8, min(22, int(self.config.get("dbus_popup_font_size", 11))))
         gap = max(0, min(300, int(self.config.get("dbus_popup_y_offset", 24))))
 
-        est_w = 360
+        # Estimate realistic max bubble width (coco/standard themes grow with font size & text width)
+        max_line_eff = 28
+        for summary, body, _icon in items:
+            s_eff = sum(2 if ord(ch) > 127 else 1 for ch in str(summary))
+            if s_eff > max_line_eff:
+                max_line_eff = s_eff
+            plain = html.unescape(re.sub(r"<[^>]+>", "", str(body)))
+            for ln in plain.splitlines():
+                l_eff = sum(2 if ord(ch) > 127 else 1 for ch in ln)
+                if l_eff > max_line_eff:
+                    max_line_eff = l_eff
+        est_w = max(460, min(640, int(130 + min(max_line_eff, 58) * (fs * 0.85))))
+        est_w = min(est_w, max(260, mon_w - 28))
+
         if gdk_win is not None:
-            px = max(wa.x + 12, min(ox, wa.x + wa.width - est_w - 12))
+            px = max(mon_left + 12, min(ox, mon_right - est_w - 20))
             panel_at_top = (oy + (alloc.height / 2.0)) < (geo.y + geo.height / 2.0)
         else:
-            px = wa.x + wa.width - est_w - 16
-            panel_at_top = (wa.y - geo.y) >= ((geo.y + geo.height) - (wa.y + wa.height))
+            px = max(mon_left + 12, mon_right - est_w - 20)
+            panel_at_top = (mon_top - geo.y) >= ((geo.y + geo.height) - mon_bottom)
 
         # Estimate each bubble height based on visible wrapped lines + font size
         heights = []
-        chars_per_line = max(14, int(280.0 / max(8.0, fs * 0.85)))
+        chars_per_line = max(16, int((est_w - 90) / max(8.0, fs * 0.82)))
         line_h = fs * 1.65 + 2.5
         for _summary, body, _icon in items:
             plain = html.unescape(re.sub(r"<[^>]+>", "", str(body)))
             vis_lines = 0
             for ln in plain.splitlines():
-                # CJK characters are roughly double width
                 eff_len = sum(2 if ord(ch) > 127 else 1 for ch in ln)
                 vis_lines += max(1, (eff_len + chars_per_line - 1) // chars_per_line)
             est_h = int(72 + max(1, vis_lines) * line_h)
-            est_h = max(96, min(est_h, max(120, wa.height - 60)))
+            est_h = max(96, min(est_h, max(120, mon_h - 60)))
             heights.append(est_h)
 
         positions = []
         if panel_at_top:
-            safe_top = (max(wa.y, oy + alloc.height) if gdk_win is not None else wa.y) + gap
+            safe_top = (max(mon_top, oy + alloc.height) if gdk_win is not None else mon_top) + gap
             cur_y = safe_top
             for est_h in heights:
-                py = min(cur_y, wa.y + wa.height - est_h - 8)
+                py = min(cur_y, mon_bottom - est_h - 8)
                 py = max(safe_top, py)
                 positions.append((int(px), int(py)))
                 cur_y += est_h + 12
         else:
-            safe_bottom = (min(wa.y + wa.height, oy) if gdk_win is not None else (wa.y + wa.height)) - gap
+            safe_bottom = (min(mon_bottom, oy) if gdk_win is not None else mon_bottom) - gap
             cur_bottom = safe_bottom
             for est_h in heights:
                 py = cur_bottom - est_h
-                py = max(wa.y + 10, py)
+                py = max(mon_top + 10, py)
                 positions.append((int(px), int(py)))
                 cur_bottom = py - 12
 
@@ -1726,9 +1749,8 @@ class DictCalcWidget(Gtk.EventBox):
         threading.Thread(target=worker, daemon=True).start()
 
     def _start_google_translate(self, seq, text, near_pointer, use_dbus_dict, keep_panel_focus, is_fallback=False):
-        """Run Google Translate GTX asynchronously; auto-switch long/multi-line paragraphs to focus-free window."""
-        force_window = ("\n" in text) or (len(text) >= 180)
-        use_dbus_tr = use_dbus_dict and (not force_window)
+        """Run Google Translate asynchronously; follows user's result_output_mode (focus-free window or D-Bus bubble)."""
+        use_dbus_tr = use_dbus_dict
 
         if not use_dbus_tr:
             win = self._ensure_popup_window()
@@ -1792,8 +1814,8 @@ class DictCalcWidget(Gtk.EventBox):
                 if len(short_orig) > 65:
                     short_orig = short_orig[:63] + "…"
                 tr_disp = translated_text.strip()
-                if len(tr_disp) > 420:
-                    tr_disp = tr_disp[:417] + "…"
+                if len(tr_disp) > 900:
+                    tr_disp = tr_disp[:897] + "…"
                 body = self._wrap_dbus_font(
                     f"<b>{html.escape(tr_disp)}</b>\n<i>{html.escape(short_orig)}</i>"
                 )
@@ -2171,7 +2193,7 @@ class DictCalcWidget(Gtk.EventBox):
         tab1.pack_start(chk_auto_copy, False, False, 0)
 
         chk_gt_en = Gtk.CheckButton(
-            label="🌐 句子 / 段落自動使用 Google 翻譯 (雙向翻譯，長段落自動以無焦點視窗顯示)"
+            label="🌐 句子 / 段落自動使用 Google 翻譯 (雙向翻譯，依上方顯示方式呈現)"
         )
         chk_gt_en.set_active(self.config.get("google_translate_enabled", True))
         tab1.pack_start(chk_gt_en, False, False, 0)
