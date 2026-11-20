@@ -67,6 +67,7 @@ DEFAULT_CONFIG = {
     "gpu_bg_opacity": 92,               # GPU 方塊底色不透明度 (0..100%)
     "text_shadow": False,               # 為面板字形加上對比描邊陰影
     "show_hover_tooltip": True,         # 滑鼠懸停圖示時顯示詳細資訊 (Tooltip)
+    "hide_panel_border": False,         # 取消 MATE Panel 圖示框線
     "show_other_sensors": True,         # 在選單中顯示 NVMe / 主機板 / 風扇等其他感測器
     "cpu_avg_cores_only": True,         # True: 僅平均實體核心 Core 0..N; False: 包含 Package id
     "warn_temp_c": 55.0,                # 中度負載溫度閾值 (°C)
@@ -913,9 +914,12 @@ class TempMonitorWidget(Gtk.EventBox):
         else:
             eff_bg_alpha = 0.0
 
-        ctx.set_source_rgba(eff_border_rgb[0], eff_border_rgb[1], eff_border_rgb[2], 0.95)
-        ctx.set_line_width(1.25)
-        ctx.stroke()
+        if not self.config.get("hide_panel_border", False):
+            ctx.set_source_rgba(eff_border_rgb[0], eff_border_rgb[1], eff_border_rgb[2], 0.95)
+            ctx.set_line_width(1.25)
+            ctx.stroke()
+        else:
+            ctx.new_path()
 
         # Draw vertical side progress bars inside left and right edges (bottom-up fill)
         has_left = bool(side_bars and side_bars.get("left") is not None)
@@ -1806,6 +1810,10 @@ class TempMonitorWidget(Gtk.EventBox):
         chk_hover_tip.set_active(self.config.get("show_hover_tooltip", True))
         outer.pack_start(chk_hover_tip, False, False, 0)
 
+        chk_no_border = Gtk.CheckButton(label="取消 MATE Panel 圖示框線")
+        chk_no_border.set_active(self.config.get("hide_panel_border", False))
+        outer.pack_start(chk_no_border, False, False, 0)
+
         outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
         # Section 5: Calculation & Thresholds
@@ -1915,6 +1923,7 @@ class TempMonitorWidget(Gtk.EventBox):
                 self.config["badge_bg_style"] = "transparent"
             self.config["text_shadow"] = chk_shadow.get_active()
             self.config["show_hover_tooltip"] = chk_hover_tip.get_active()
+            self.config["hide_panel_border"] = chk_no_border.get_active()
             self.config["cpu_avg_cores_only"] = chk_cores_only.get_active()
             self.config["show_other_sensors"] = chk_other.get_active()
             self.config["warn_temp_c"] = float(spin_warn.get_value())
@@ -1973,6 +1982,7 @@ class TempMonitorWidget(Gtk.EventBox):
             rb_bg_trans,
             chk_shadow,
             chk_hover_tip,
+            chk_no_border,
             chk_cores_only,
             chk_other,
         ):

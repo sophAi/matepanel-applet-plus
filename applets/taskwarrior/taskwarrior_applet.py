@@ -80,6 +80,7 @@ DEFAULT_CONFIG = {
     "pomo_bg_opacity": 92,               # 番茄鐘方塊底色不透明度 (0..100%)
     "text_shadow": False,                # 文字高對比描邊陰影
     "show_hover_tooltip": True,          # 滑鼠懸停圖示時顯示詳細資訊 (Tooltip)
+    "hide_panel_border": False,          # 取消 MATE Panel 圖示框線
     "completed_limit": 20,               # 下拉選單最近已完成任務顯示筆數
 }
 
@@ -1701,9 +1702,12 @@ class TaskwarriorWidget(Gtk.EventBox):
         else:
             eff_bg_alpha = 0.0
 
-        ctx.set_source_rgba(eff_border_rgb[0], eff_border_rgb[1], eff_border_rgb[2], 0.95)
-        ctx.set_line_width(1.25)
-        ctx.stroke()
+        if not self.config.get("hide_panel_border", False):
+            ctx.set_source_rgba(eff_border_rgb[0], eff_border_rgb[1], eff_border_rgb[2], 0.95)
+            ctx.set_line_width(1.25)
+            ctx.stroke()
+        else:
+            ctx.new_path()
 
         if self.has_active_task:
             ctx.arc(x + bw - 4.5, y + 4.5, 2.3, 0, 2 * math.pi)
@@ -1777,9 +1781,12 @@ class TaskwarriorWidget(Gtk.EventBox):
         else:
             eff_bg_alpha = 0.0
 
-        ctx.set_source_rgba(eff_border_rgb[0], eff_border_rgb[1], eff_border_rgb[2], 0.95)
-        ctx.set_line_width(1.3)
-        ctx.stroke()
+        if not self.config.get("hide_panel_border", False):
+            ctx.set_source_rgba(eff_border_rgb[0], eff_border_rgb[1], eff_border_rgb[2], 0.95)
+            ctx.set_line_width(1.3)
+            ctx.stroke()
+        else:
+            ctx.new_path()
 
         # Bottom mini progress bar showing countdown progress
         has_bar = self.pomo_phase != "idle" and self.pomo_total_sec > 0
@@ -3003,6 +3010,10 @@ class TaskwarriorWidget(Gtk.EventBox):
         chk_hover_tip.set_active(self.config.get("show_hover_tooltip", True))
         outer.pack_start(chk_hover_tip, False, False, 0)
 
+        chk_no_border = Gtk.CheckButton(label="取消 MATE Panel 圖示框線")
+        chk_no_border.set_active(self.config.get("hide_panel_border", False))
+        outer.pack_start(chk_no_border, False, False, 0)
+
         def rgba_to_hex(rgba):
             r = max(0, min(255, int(round(rgba.red * 255))))
             g = max(0, min(255, int(round(rgba.green * 255))))
@@ -3046,6 +3057,7 @@ class TaskwarriorWidget(Gtk.EventBox):
                 self.config["badge_bg_style"] = "transparent"
             self.config["text_shadow"] = chk_shadow.get_active()
             self.config["show_hover_tooltip"] = chk_hover_tip.get_active()
+            self.config["hide_panel_border"] = chk_no_border.get_active()
             if self.pomo_phase == "idle":
                 self.pomo_total_sec = self.config["pomo_work_min"] * 60
                 self.pomo_remaining_sec = self.pomo_total_sec
@@ -3095,6 +3107,7 @@ class TaskwarriorWidget(Gtk.EventBox):
             rb_bg_trans,
             chk_shadow,
             chk_hover_tip,
+            chk_no_border,
         ):
             w_ctrl.connect("toggled", apply_changes)
         for sp_ctrl in (

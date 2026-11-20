@@ -145,6 +145,7 @@ DEFAULT_CONFIG = {
     "badge_bg_style": "dark",            # (舊版相容欄位)
     "badge_bg_color": "#182234",         # 自訂方塊/輸入框背景底色
     "badge_border_color": "#48b8fa",     # 自訂方塊/輸入框外框顏色
+    "hide_panel_border": False,          # 取消 MATE Panel 圖示與輸入框外框
     "badge_bg_opacity": 90,              # 背景不透明度 (0=完全透明 ~ 100=完全不透明)
     "text_shadow": False,                # 面板文字描邊陰影
     "show_hover_tooltip": True,          # 滑鼠懸停圖示時顯示詳細資訊 (Tooltip)
@@ -2261,7 +2262,7 @@ class DictCalcWidget(Gtk.EventBox):
         self.panel_entry.get_style_context().add_provider(
             self.entry_css_provider, Gtk.STYLE_PROVIDER_PRIORITY_USER
         )
-        self.panel_entry.set_placeholder_text("查詞 / 算式...")
+        self.panel_entry.set_placeholder_text("查詢/算式")
         self.panel_entry.connect("activate", self._on_panel_entry_activate)
         self.panel_entry.connect("button-press-event", self._on_panel_entry_button_press)
         self.panel_entry.connect("populate-popup", self._on_panel_entry_populate_popup)
@@ -2558,7 +2559,7 @@ class DictCalcWidget(Gtk.EventBox):
         # Keep the inline panel entry completely clean (no inner toggle icons; toggle Scan Selection via right-click menu)
         self.panel_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.PRIMARY, None)
         self.panel_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, None)
-        self.panel_entry.set_placeholder_text("查詞 / 算式...")
+        self.panel_entry.set_placeholder_text("查詢/算式")
 
     def _sync_entry_visibility(self):
         if self.config.get("display_mode", "badge") == "panel_entry":
@@ -2585,22 +2586,23 @@ class DictCalcWidget(Gtk.EventBox):
         custom_hex = self.config.get("custom_font_color", "#ffffff")
         shadow_on = bool(self.config.get("text_shadow", False))
 
+        hide_border = bool(self.config.get("hide_panel_border", False))
         bd_hex = self.config.get("badge_border_color", "#48b8fa")
         bd_rgb = hex_to_rgb(bd_hex, default=(0.282, 0.722, 0.980))
         br255 = int(round(bd_rgb[0] * 255))
         bg255 = int(round(bd_rgb[1] * 255))
         bb255 = int(round(bd_rgb[2] * 255))
-        border_col = f"rgba({br255}, {bg255}, {bb255}, 0.85)"
+        border_css = "border: none;" if hide_border else f"border: 1px solid rgba({br255}, {bg255}, {bb255}, 0.85);"
         if opacity == 0:
             bg_css = (
                 f"background-color: transparent; background-image: none; "
-                f"border: 1px solid {border_col}; box-shadow: none;"
+                f"{border_css} box-shadow: none;"
             )
             default_fg = "#ffffff"
         else:
             bg_css = (
                 f"background-color: rgba({r255}, {g255}, {b255}, {alpha:.2f}); "
-                f"background-image: none; border: 1px solid {border_col}; box-shadow: none;"
+                f"background-image: none; {border_css} box-shadow: none;"
             )
             default_fg = "#111827" if is_light_bg else "#f0f6ff"
 
@@ -3397,9 +3399,12 @@ class DictCalcWidget(Gtk.EventBox):
             ctx.set_source_rgba(custom_bg_rgb[0], custom_bg_rgb[1], custom_bg_rgb[2], alpha)
             ctx.fill_preserve()
 
-        ctx.set_source_rgba(border_rgb[0], border_rgb[1], border_rgb[2], 0.95)
-        ctx.set_line_width(1.2)
-        ctx.stroke()
+        if not self.config.get("hide_panel_border", False):
+            ctx.set_source_rgba(border_rgb[0], border_rgb[1], border_rgb[2], 0.95)
+            ctx.set_line_width(1.2)
+            ctx.stroke()
+        else:
+            ctx.new_path()
 
         # Scan Selection active green indicator dot in top-right corner
         if scan_on:
@@ -3727,6 +3732,10 @@ class DictCalcWidget(Gtk.EventBox):
         chk_hover_tip = Gtk.CheckButton(label="滑鼠懸停面板圖示時顯示詳細資訊 (Tooltip)")
         chk_hover_tip.set_active(self.config.get("show_hover_tooltip", True))
         tab1.pack_start(chk_hover_tip, False, False, 0)
+
+        chk_no_border = Gtk.CheckButton(label="取消 MATE Panel 圖示框線")
+        chk_no_border.set_active(self.config.get("hide_panel_border", False))
+        tab1.pack_start(chk_no_border, False, False, 0)
 
         tab1_scroll = Gtk.ScrolledWindow()
         tab1_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -4761,6 +4770,7 @@ class DictCalcWidget(Gtk.EventBox):
             lbl_bg_alpha.set_text(f"{bg_op}%")
             self.config["text_shadow"] = chk_shadow.get_active()
             self.config["show_hover_tooltip"] = chk_hover_tip.get_active()
+            self.config["hide_panel_border"] = chk_no_border.get_active()
             self.config["vocab_record_enabled"] = chk_vocab_rec.get_active()
             self.config["vocab_epub_layout"] = combo_epub_layout.get_active_id() or "per_word"
             self._save_config()
@@ -4968,6 +4978,7 @@ class DictCalcWidget(Gtk.EventBox):
             rb_col_cus,
             chk_shadow,
             chk_hover_tip,
+            chk_no_border,
             chk_vocab_rec,
         ):
             w_c.connect("toggled", apply_tab1)
