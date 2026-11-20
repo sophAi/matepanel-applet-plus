@@ -77,8 +77,11 @@ Custom MATE Panel Applets collection and development repository for Linux deskto
 ./install.sh install task   # 僅安裝「Taskwarrior 任務管理 Plus」
 ./install.sh install temp   # 僅安裝「CPU/GPU 溫度監控 Plus」
 
-# 3. 更新程式碼後重新載入 Applet（MATE Panel 會自動重啟該 Applet）
-pkill -f dict_calc_applet.py
+# 3. 更新程式碼後重新載入 Applet（免 sudo，MATE Panel 會自動重啟）
+./install.sh reload         # 重載全部三款 Applets
+./install.sh reload dict    # 僅重載「StarDict 離線詞典與計算機 Plus」
+./install.sh reload temp    # 僅重載「CPU/GPU 溫度監控 Plus」
+./install.sh reload task    # 僅重載「Taskwarrior 任務管理 Plus」
 
 # 4. 從系統 MATE Panel 移除註冊
 ./install.sh uninstall
