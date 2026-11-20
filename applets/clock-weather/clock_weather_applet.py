@@ -690,7 +690,16 @@ class CustomCalendarBubbleWindow(Gtk.Window):
             ctx.show_text(wd)
 
         today = date.today()
-        daily_map = (self.parent_widget.weather_data or {}).get("daily_by_date") or {}
+        wdata = self.parent_widget.weather_data or {}
+        daily_map = wdata.get("daily_by_date") or {}
+        cur = wdata.get("current") or {}
+        if cur.get("us_aqi") is not None:
+            _, today_aqi_hex = aqi_to_label_color(cur.get("us_aqi"))
+        elif cur.get("pm2_5") is not None:
+            today_aqi_hex = pm25_to_color(cur.get("pm2_5"))
+        else:
+            today_aqi_hex = "#34d399"
+        aqi_r, aqi_g, aqi_b = hex_to_rgb(today_aqi_hex, default=(0.20, 0.83, 0.60))
         icon_sz = max(14, min(22, int(min(col_w * 0.36, row_h * 0.44))))
 
         for idx, d_obj in enumerate(self.cell_dates):
@@ -708,7 +717,7 @@ class CustomCalendarBubbleWindow(Gtk.Window):
 
             draw_rounded_rect(ctx, cx, cy, cw, ch, 5.0)
             if is_today:
-                ctx.set_source_rgba(0.14, 0.50, 0.40, 0.52)
+                ctx.set_source_rgba(aqi_r, aqi_g, aqi_b, 0.32)
             elif day_fc is not None:
                 ctx.set_source_rgba(0.20, 0.34, 0.50, 0.28)
             elif in_month:
@@ -719,8 +728,8 @@ class CustomCalendarBubbleWindow(Gtk.Window):
 
             if is_today:
                 draw_rounded_rect(ctx, cx + 0.5, cy + 0.5, cw - 1.0, ch - 1.0, 5.0)
-                ctx.set_source_rgba(0.25, 0.85, 0.65, 0.90)
-                ctx.set_line_width(1.3)
+                ctx.set_source_rgba(aqi_r, aqi_g, aqi_b, 0.96)
+                ctx.set_line_width(1.6)
                 ctx.stroke()
 
             # Day number (top-left)
@@ -733,7 +742,7 @@ class CustomCalendarBubbleWindow(Gtk.Window):
             if not in_month:
                 ctx.set_source_rgba(fg_r, fg_g, fg_b, 0.32)
             elif is_today:
-                ctx.set_source_rgba(0.55, 1.00, 0.85, 1.00)
+                ctx.set_source_rgba(fg_r, fg_g, fg_b, 1.00)
             elif c_idx >= 5:
                 ctx.set_source_rgba(0.98, 0.62, 0.55, 0.96)
             else:
@@ -1436,7 +1445,16 @@ class ClockWeatherPopupWindow(Gtk.Window):
             ctx.show_text(wd)
 
         today = date.today()
-        daily_map = (self.parent_widget.weather_data or {}).get("daily_by_date") or {}
+        wdata = self.parent_widget.weather_data or {}
+        daily_map = wdata.get("daily_by_date") or {}
+        cur = wdata.get("current") or {}
+        if cur.get("us_aqi") is not None:
+            _, today_aqi_hex = aqi_to_label_color(cur.get("us_aqi"))
+        elif cur.get("pm2_5") is not None:
+            today_aqi_hex = pm25_to_color(cur.get("pm2_5"))
+        else:
+            today_aqi_hex = "#34d399"
+        aqi_r, aqi_g, aqi_b = hex_to_rgb(today_aqi_hex, default=(0.20, 0.83, 0.60))
         icon_sz = max(14, min(22, int(min(col_w * 0.34, row_h * 0.36))))
 
         if not self.cell_dates:
@@ -1457,10 +1475,11 @@ class ClockWeatherPopupWindow(Gtk.Window):
             day_fc = daily_map.get(d_str)
 
             draw_rounded_rect(ctx, cx, cy, cw, ch, 5.0)
-            if is_sel:
+            if is_today:
+                scale = 0.44 if is_sel else 0.30
+                ctx.set_source_rgba(aqi_r * scale, aqi_g * scale, aqi_b * scale, 0.95)
+            elif is_sel:
                 ctx.set_source_rgba(0.16, 0.34, 0.54, 0.96)
-            elif is_today:
-                ctx.set_source_rgba(0.12, 0.28, 0.26, 0.95)
             elif day_fc is not None:
                 ctx.set_source_rgba(0.16, 0.20, 0.27, 0.95)
             elif is_cur_m:
@@ -1469,12 +1488,12 @@ class ClockWeatherPopupWindow(Gtk.Window):
                 ctx.set_source_rgba(0.09, 0.11, 0.14, 0.55)
             ctx.fill_preserve()
 
-            if is_sel:
+            if is_today:
+                ctx.set_source_rgba(aqi_r, aqi_g, aqi_b, 1.0)
+                ctx.set_line_width(2.0 if is_sel else 1.6)
+            elif is_sel:
                 ctx.set_source_rgba(0.32, 0.76, 1.00, 1.0)
                 ctx.set_line_width(1.8)
-            elif is_today:
-                ctx.set_source_rgba(0.20, 0.85, 0.62, 0.95)
-                ctx.set_line_width(1.5)
             elif day_fc is not None:
                 ctx.set_source_rgba(0.30, 0.45, 0.62, 0.70)
                 ctx.set_line_width(1.0)
@@ -1487,7 +1506,7 @@ class ClockWeatherPopupWindow(Gtk.Window):
             ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
             ctx.set_font_size(base_fs)
             if is_today:
-                ctx.set_source_rgba(0.25, 0.95, 0.65, 1.0)
+                ctx.set_source_rgba(aqi_r, aqi_g, aqi_b, 1.0)
             elif not is_cur_m:
                 ctx.set_source_rgba(0.45, 0.50, 0.58, 0.70)
             elif c_idx >= 5:
