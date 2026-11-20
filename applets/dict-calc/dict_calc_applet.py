@@ -1469,11 +1469,6 @@ class DictCalcPopupWindow(Gtk.Window):
         self.calc_frame.add(calc_hbox)
         root.pack_start(self.calc_frame, False, False, 0)
 
-        # Spelling Suggestion Bar (shown only when a misspelled single English word is detected)
-        self.suggest_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
-        self.suggest_box.set_no_show_all(True)
-        root.pack_start(self.suggest_box, False, False, 0)
-
         # Scrollable Dictionary Results TextView
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
@@ -1502,36 +1497,6 @@ class DictCalcPopupWindow(Gtk.Window):
         self.add(root)
         self.show_all()
         self.calc_frame.hide()
-        self.suggest_box.hide()
-
-    def set_spelling_suggestions(self, original_word, suggestions, auto_word=None):
-        for child in list(self.suggest_box.get_children()):
-            self.suggest_box.remove(child)
-        if not suggestions:
-            self.suggest_box.hide()
-            return
-        lbl = Gtk.Label()
-        lbl.set_markup(
-            f"<small><span foreground='#fbbf24'>💡 您是不是要找：</span></small>"
-        )
-        self.suggest_box.pack_start(lbl, False, False, 0)
-        for cand in suggestions[:5]:
-            btn = Gtk.Button(label=cand)
-            btn.set_can_focus(False)
-            btn.set_relief(Gtk.ReliefStyle.NONE)
-            if auto_word and cand == auto_word:
-                btn.set_tooltip_text(f"已自動顯示「{cand}」釋義")
-            else:
-                btn.set_tooltip_text(f"點擊查詢「{cand}」")
-            btn.connect(
-                "clicked",
-                lambda _b, w=cand: (
-                    self.parent_widget.panel_entry.set_text(w),
-                    self.parent_widget.execute_query(w, near_pointer=False, keep_panel_focus=True),
-                ),
-            )
-            self.suggest_box.pack_start(btn, False, False, 0)
-        self.suggest_box.show_all()
 
     def _init_text_tags(self):
         buf = self.result_buf
@@ -1628,7 +1593,6 @@ class DictCalcPopupWindow(Gtk.Window):
             self.query_title_lbl.set_markup(f"<b>📖 查詢：{html.escape(short_q)}</b>")
             loading_msg = f"🔎 正在查詢「{short_q}」..."
         self.calc_frame.hide()
-        self.suggest_box.hide()
         self._last_calc_result = None
         self.result_buf.set_text("")
         self.result_buf.insert_with_tags(
@@ -1691,10 +1655,8 @@ class DictCalcPopupWindow(Gtk.Window):
                 self.query_title_lbl.set_markup(
                     f"<b>❓ 查無「{html.escape(orig_w)}」— 拼字建議</b>"
                 )
-            self.set_spelling_suggestions(orig_w, sugs, auto_word=auto_w)
         else:
             self.query_title_lbl.set_markup(f"<b>📖 查詢：{html.escape(query_word)}</b>")
-            self.suggest_box.hide()
         self.calc_frame.hide()
         self._last_calc_result = None
 
@@ -1704,6 +1666,7 @@ class DictCalcPopupWindow(Gtk.Window):
         if not results:
             if spelling_info:
                 orig_w, sugs, _aw = spelling_info
+                top_sug = sugs[0] if sugs else ""
                 buf.insert_with_tags(
                     buf.get_end_iter(),
                     f"查無單字「{orig_w}」。\n\n",
@@ -1711,7 +1674,7 @@ class DictCalcPopupWindow(Gtk.Window):
                 )
                 buf.insert_with_tags(
                     buf.get_end_iter(),
-                    "💡 您是不是要找以下拼法？（可直接點上方按鈕查詢）\n",
+                    f"💡 您是不是要找以下拼法？（輸入框已自動填入「{top_sug}」，按 Enter 即可查詢）\n",
                     self.tag_word,
                 )
                 buf.insert_with_tags(
@@ -1719,7 +1682,7 @@ class DictCalcPopupWindow(Gtk.Window):
                     "  • " + "\n  • ".join(sugs) + "\n",
                     self.tag_body,
                 )
-                self._update_status_footer(f"查無「{orig_w}」：提供 {len(sugs)} 個可能拼法")
+                self._update_status_footer(f"查無「{orig_w}」：輸入框已填入「{top_sug}」，按 Enter 查詢")
             else:
                 buf.insert_with_tags(
                     buf.get_end_iter(),
@@ -1870,6 +1833,9 @@ class DictCalcWidget(Gtk.EventBox):
         # 2. Clean Inline Panel Search/Calc Entry (click-to-type with request_focus + right-click menu)
         self.panel_entry = Gtk.Entry()
         self.panel_entry.set_no_show_all(True)
+        # Override GTK3 default 20-char (~170px) minimum width so panel_entry_width shrinks/grows accurately!
+        self.panel_entry.set_width_chars(1)
+        self.panel_entry.set_max_width_chars(1)
         self.panel_entry.set_name("dict-calc-panel-entry")
         self.entry_css_provider = Gtk.CssProvider()
         self.panel_entry.get_style_context().add_provider(
@@ -2220,6 +2186,7 @@ class DictCalcWidget(Gtk.EventBox):
         else:
             shadow_css = "text-shadow: none;"
 
+        entry_w = max(60, min(320, int(self.config.get("panel_entry_width", 170))))
         css_str = (
             f"#dict-calc-panel-entry {{\n"
             f"  {bg_css}\n"
@@ -2228,7 +2195,10 @@ class DictCalcWidget(Gtk.EventBox):
             f"  border-radius: 4px;\n"
             f"  padding-top: 1px;\n"
             f"  padding-bottom: 1px;\n"
+            f"  padding-left: 5px;\n"
+            f"  padding-right: 5px;\n"
             f"  min-height: 0px;\n"
+            f"  min-width: {entry_w}px;\n"
             f"  {shadow_css}\n"
             f"}}\n"
             f"#dict-calc-panel-entry image {{\n"
@@ -2244,10 +2214,14 @@ class DictCalcWidget(Gtk.EventBox):
         h = max(24, self.panel_size)
         bw = max(34, int(h * 1.25))
         self.canvas.set_size_request(bw, h)
-        entry_w = max(90, min(320, int(self.config.get("panel_entry_width", 170))))
+        entry_w = max(60, min(320, int(self.config.get("panel_entry_width", 170))))
+        self.panel_entry.set_width_chars(1)
+        self.panel_entry.set_max_width_chars(1)
         self.panel_entry.set_size_request(entry_w, max(20, h - 4))
         self._apply_entry_css()
         self._sync_entry_visibility()
+        self.panel_entry.queue_resize()
+        self.queue_resize()
         self.canvas.queue_draw()
 
     def _on_panel_entry_button_press(self, entry, event):
@@ -2793,6 +2767,14 @@ class DictCalcWidget(Gtk.EventBox):
         if seq != self._query_seq:
             return False
 
+        # When aspell returns spelling suggestions, auto-fill the #1 suggestion into the panel entry
+        # and select it so pressing Enter queries it immediately (or typing replaces it).
+        if spelling_info:
+            _orig_w, _sugs, _auto_w = spelling_info
+            if _sugs:
+                self.panel_entry.set_text(_sugs[0])
+                self.panel_entry.select_region(0, -1)
+
         # Auto-fallback to Google Translate when offline StarDict returns 0 hits
         if (
             allow_fallback
@@ -2830,10 +2812,13 @@ class DictCalcWidget(Gtk.EventBox):
             if not results:
                 if spelling_info:
                     orig_w, sugs, _aw = spelling_info
+                    top_sug = sugs[0] if sugs else ""
                     self._notify_dbus(
                         f"❓ 查無「{orig_w}」— 可能拼法",
                         self._wrap_dbus_font(
-                            f"您是不是要找：\n{html.escape('  ·  '.join(sugs))}"
+                            f"您是不是要找：\n{html.escape('  ·  '.join(sugs))}\n"
+                            f"<span alpha='45%'>────────────────────</span>\n"
+                            f"<small><span alpha='75%'>輸入框已自動填入「{html.escape(top_sug)}」，按 Enter 即可查詢</span></small>"
                         ),
                         icon="accessories-dictionary",
                         timeout_sec=timeout_sec,
@@ -3202,7 +3187,7 @@ class DictCalcWidget(Gtk.EventBox):
         spin_entry_w = Gtk.SpinButton(
             adjustment=Gtk.Adjustment(
                 value=float(self.config.get("panel_entry_width", 170)),
-                lower=90.0,
+                lower=60.0,
                 upper=320.0,
                 step_increment=10.0,
                 page_increment=20.0,
