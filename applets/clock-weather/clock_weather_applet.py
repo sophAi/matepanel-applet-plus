@@ -460,6 +460,20 @@ class ClockWeatherPopupWindow(Gtk.Window):
         self.cell_dates = []
         self._cal_grid_rect = (0, 0, 1, 1)
 
+        css_prov = Gtk.CssProvider()
+        css_prov.load_from_data(
+            b".aqi-val-outline { "
+            b"text-shadow: 0 0 2px rgba(0, 0, 0, 0.90), "
+            b"1px 0 0 rgba(0, 0, 0, 0.85), -1px 0 0 rgba(0, 0, 0, 0.85), "
+            b"0 1px 0 rgba(0, 0, 0, 0.85), 0 -1px 0 rgba(0, 0, 0, 0.85); "
+            b"}"
+        )
+        screen = Gdk.Screen.get_default()
+        if screen is not None:
+            Gtk.StyleContext.add_provider_for_screen(
+                screen, css_prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
+
         self._build_ui()
 
     def _on_delete_hide(self, *_args):
@@ -925,47 +939,94 @@ class ClockWeatherPopupWindow(Gtk.Window):
         )
         metric_lines.append(f"🌅 日出 <b>{sr}</b>   ·   🌇 日落 <b>{ss}</b>")
 
+        m_lbl = Gtk.Label(xalign=0.0)
+        m_lbl.set_line_wrap(True)
+        m_lbl.set_markup(f"<span size='{p_sm}'>" + "\n".join(metric_lines) + "</span>")
+        self.detail_box.pack_start(m_lbl, False, False, 0)
+
+        def _make_inline_lbl(markup_str, outlined=False):
+            lb = Gtk.Label(xalign=0.0)
+            lb.set_markup(f"<span size='{p_sm}'>{markup_str}</span>")
+            if outlined:
+                lb.get_style_context().add_class("aqi-val-outline")
+            return lb
+
         if is_today and (cur.get("us_aqi") is not None or cur.get("pm2_5") is not None or cur.get("pm10") is not None):
             aqi_lbl, aqi_col = aqi_to_label_color(cur.get("us_aqi"))
             pm25 = cur.get("pm2_5")
             pm10 = cur.get("pm10")
-            metric_lines.append(
-                f"🍃 空氣品質：<span background='#1e293b' foreground='{aqi_col}'> <b>{html.escape(aqi_lbl)}</b> </span>"
+            aqi_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+            aqi_row.pack_start(_make_inline_lbl("🍃 空氣品質："), False, False, 0)
+            aqi_row.pack_start(
+                _make_inline_lbl(f"<span foreground='{aqi_col}'><b>{html.escape(aqi_lbl)}</b></span>", outlined=True),
+                False,
+                False,
+                0,
             )
-            pm_parts = []
-            if pm25 is not None:
-                pm_parts.append(
-                    f"PM2.5 <span background='#1e293b' foreground='{pm25_to_color(pm25)}'> <b>{pm25:.1f}</b> </span>"
-                )
-            if pm10 is not None:
-                pm_parts.append(
-                    f"PM10 <span background='#1e293b' foreground='{pm10_to_color(pm10)}'> <b>{pm10:.1f}</b> </span>"
-                )
-            if pm_parts:
-                metric_lines.append(f"   {' · '.join(pm_parts)} μg/m³")
+            self.detail_box.pack_start(aqi_row, False, False, 0)
+
+            if pm25 is not None or pm10 is not None:
+                pm_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+                pm_row.pack_start(_make_inline_lbl("   "), False, False, 0)
+                if pm25 is not None:
+                    pm_row.pack_start(_make_inline_lbl("PM2.5 "), False, False, 0)
+                    pm_row.pack_start(
+                        _make_inline_lbl(
+                            f"<span foreground='{pm25_to_color(pm25)}'><b>{pm25:.1f}</b></span>", outlined=True
+                        ),
+                        False,
+                        False,
+                        0,
+                    )
+                if pm25 is not None and pm10 is not None:
+                    pm_row.pack_start(_make_inline_lbl(" · "), False, False, 0)
+                if pm10 is not None:
+                    pm_row.pack_start(_make_inline_lbl("PM10 "), False, False, 0)
+                    pm_row.pack_start(
+                        _make_inline_lbl(
+                            f"<span foreground='{pm10_to_color(pm10)}'><b>{pm10:.1f}</b></span>", outlined=True
+                        ),
+                        False,
+                        False,
+                        0,
+                    )
+                pm_row.pack_start(_make_inline_lbl(" μg/m³"), False, False, 0)
+                self.detail_box.pack_start(pm_row, False, False, 0)
         elif day_fc.get("pm2_5_avg") is not None or day_fc.get("pm10_avg") is not None:
             p25_a = day_fc.get("pm2_5_avg")
             p25_m = day_fc.get("pm2_5_max")
             p10_a = day_fc.get("pm10_avg")
             p10_m = day_fc.get("pm10_max")
-            fc_parts = []
+            fc_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+            fc_row.pack_start(_make_inline_lbl("🍃 預估空品："), False, False, 0)
             if p25_a is not None:
-                fc_parts.append(
-                    f"PM2.5 <span background='#1e293b' foreground='{pm25_to_color(p25_a)}'> <b>{p25_a:.0f}</b> </span>"
-                    + (f" (高{p25_m:.0f})" if p25_m is not None else "")
+                fc_row.pack_start(_make_inline_lbl("PM2.5 "), False, False, 0)
+                fc_row.pack_start(
+                    _make_inline_lbl(
+                        f"<span foreground='{pm25_to_color(p25_a)}'><b>{p25_a:.0f}</b></span>", outlined=True
+                    ),
+                    False,
+                    False,
+                    0,
                 )
+                if p25_m is not None:
+                    fc_row.pack_start(_make_inline_lbl(f" (高{p25_m:.0f})"), False, False, 0)
+            if p25_a is not None and p10_a is not None:
+                fc_row.pack_start(_make_inline_lbl(" · "), False, False, 0)
             if p10_a is not None:
-                fc_parts.append(
-                    f"PM10 <span background='#1e293b' foreground='{pm10_to_color(p10_a)}'> <b>{p10_a:.0f}</b> </span>"
-                    + (f" (高{p10_m:.0f})" if p10_m is not None else "")
+                fc_row.pack_start(_make_inline_lbl("PM10 "), False, False, 0)
+                fc_row.pack_start(
+                    _make_inline_lbl(
+                        f"<span foreground='{pm10_to_color(p10_a)}'><b>{p10_a:.0f}</b></span>", outlined=True
+                    ),
+                    False,
+                    False,
+                    0,
                 )
-            if fc_parts:
-                metric_lines.append(f"🍃 預估空品：{' · '.join(fc_parts)} μg/m³")
-
-        m_lbl = Gtk.Label(xalign=0.0)
-        m_lbl.set_line_wrap(True)
-        m_lbl.set_markup(f"<span size='{p_sm}'>" + "\n".join(metric_lines) + "</span>")
-        self.detail_box.pack_start(m_lbl, False, False, 0)
+                if p10_m is not None:
+                    fc_row.pack_start(_make_inline_lbl(f" (高{p10_m:.0f})"), False, False, 0)
+            fc_row.pack_start(_make_inline_lbl(" μg/m³"), False, False, 0)
+            self.detail_box.pack_start(fc_row, False, False, 0)
 
         self.detail_box.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
@@ -1458,11 +1519,7 @@ class ClockWeatherWidget(Gtk.EventBox):
             ctx.new_sub_path()
             ctx.arc(cx_dot, cy_dot, dot_r, 0, 2 * math.pi)
             ctx.set_source_rgba(dot_rgb[0], dot_rgb[1], dot_rgb[2], font_alpha)
-            ctx.fill_preserve()
-            # High-contrast dark outline so yellow/green dots stand out clearly on gray/light panels
-            ctx.set_source_rgba(0.06, 0.08, 0.12, 0.92 * font_alpha)
-            ctx.set_line_width(1.5)
-            ctx.stroke()
+            ctx.fill()
         return False
 
     def handle_applet_button_press(self, widget, event):
