@@ -63,26 +63,26 @@ DEFAULT_CONFIG = {
     "show_date": True,                   # 面板顯示日期 (MM/DD)
     "show_weekday": True,                # 面板顯示星期
     "use_24h": True,                     # 24小時制 (True) 或 12小時制 (False)
-    "panel_font_auto": True,             # 面板字體大小自動最大化
-    "panel_font_size": 17,               # 面板自訂字體大小 (px, 8..36)
-    "calendar_font_size": 11,            # 彈窗月曆與預報字型大小 (pt)
+    "panel_font_auto": False,            # 面板字體大小自動最大化
+    "panel_font_size": 20,               # 面板自訂字體大小 (px, 8..36)
+    "calendar_font_size": 16,            # 彈窗月曆與預報字型大小 (pt)
     "show_world_clock": True,            # 彈窗底部顯示多時區世界時鐘
-    "world_clocks": "Asia/Tokyo, Europe/London, America/New_York",
-    "badge_bg_color": "#182234",         # 面板背景顏色
-    "badge_bg_opacity": 90,              # 面板背景不透明度 (0..100%)
+    "world_clocks": "Australia/Sydney, America/Los_Angeles",
+    "badge_bg_color": "#ffffff",         # 面板背景顏色
+    "badge_bg_opacity": 0,               # 面板背景不透明度 (0..100%)
     "font_color_mode": "dynamic",        # "dynamic" or "custom"
     "custom_font_color": "#ffffff",      # 自訂面板字形顏色
-    "font_opacity": 100,                 # 面板文字不透明度 (10..100%)
+    "font_opacity": 80,                  # 面板文字不透明度 (10..100%)
     "text_shadow": False,                # 面板文字高對比描邊陰影
-    "show_hover_tooltip": True,          # 滑鼠懸停圖示時顯示詳細資訊 (Tooltip)
+    "show_hover_tooltip": False,         # 滑鼠懸停圖示時顯示詳細資訊 (Tooltip)
     "notify_weather_change": True,       # 天氣圖案改變時自動彈出氣泡框提醒
-    "detail_display_mode": "embedded",   # "embedded" (完整視窗) | "custom_bubble" (精簡月曆 RGBA 氣泡框)
-    "bubble_position": "top_right",      # top_left / top_center / top_right / center / bottom_left / bottom_right
+    "detail_display_mode": "custom_bubble",  # "embedded" (完整視窗) | "custom_bubble" (精簡月曆 RGBA 氣泡框)
+    "bubble_position": "top_left",       # top_left / top_center / top_right / center / bottom_left / bottom_right
     "bubble_offset_x": 0,                # 氣泡水平偏移 (px)
-    "bubble_offset_y": 36,               # 氣泡垂直偏移 (px)
-    "bubble_bg_color": "#182234",        # 自訂氣泡背景顏色
-    "bubble_fg_color": "#f0f6ff",        # 自訂氣泡文字顏色
-    "bubble_bg_opacity": 92,             # 自訂氣泡背景不透明度 (0..100%)
+    "bubble_offset_y": 0,                # 氣泡垂直偏移 (px)
+    "bubble_bg_color": "#5e5c64",        # 自訂氣泡背景顏色
+    "bubble_fg_color": "#deddda",        # 自訂氣泡文字顏色
+    "bubble_bg_opacity": 98,             # 自訂氣泡背景不透明度 (0..100%)
     "bubble_timeout_sec": 12,            # 氣泡自動關閉秒數 (0 = 常駐直到點擊關閉)
 }
 

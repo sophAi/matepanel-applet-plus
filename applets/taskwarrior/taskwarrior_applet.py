@@ -60,7 +60,7 @@ DEFAULT_CONFIG = {
     "pomo_sync_task_start": True,        # 綁定任務啟動番茄鐘時同步執行 task start / stop
     "left_click_action": "calendar",     # "calendar" (開啟雙欄月曆任務看板) or "menu" (開啟傳統下拉快速選單)
     "calendar_show_completed": True,     # 在月曆格子與右側清單中顯示歷史已完成任務 (依 end 完成日期對應)
-    "calendar_font_size": 11,            # 月曆看板基準字型大小 (pt/px, 範圍 8..22)
+    "calendar_font_size": 16,            # 月曆看板基準字型大小 (pt/px, 範圍 8..22)
     "max_title_chars": 22,               # badge_text 模式下顯示的最大字元數
     "show_due_in_panel": True,           # badge_text 模式下是否在標題後附加上到期倒數
     "filter_project": "",                # 空字串代表顯示全部專案
@@ -76,15 +76,15 @@ DEFAULT_CONFIG = {
     "task_header_bg_color": "#dc2626",   # TASK 方塊界線以上底色 (預設月曆紅)
     "task_header_fg_color": "#ffffff",   # TASK 方塊上方文字顏色
     "task_header_bg_opacity": 96,        # TASK 方塊界線以上透明度 (0..100%)
-    "task_bg_color": "#e5e7eb",          # TASK 方塊界線以下底色 (預設月曆灰白)
-    "task_border_color": "#9ca3af",      # TASK 方塊框線顏色
-    "task_bg_opacity": 96,               # TASK 方塊界線以下透明度 (0..100%)
+    "task_bg_color": "#f6f5f4",          # TASK 方塊界線以下底色 (預設月曆灰白)
+    "task_border_color": "#38bdf8",      # TASK 方塊框線顏色
+    "task_bg_opacity": 92,               # TASK 方塊界線以下透明度 (0..100%)
     "pomo_bg_color": "#3f1d28",          # 番茄鐘方塊底色
     "pomo_border_color": "#f43f5e",      # 番茄鐘方塊框線顏色
     "pomo_bg_opacity": 92,               # 番茄鐘方塊底色不透明度 (0..100%)
     "text_shadow": False,                # 文字高對比描邊陰影
-    "show_hover_tooltip": True,          # 滑鼠懸停圖示時顯示詳細資訊 (Tooltip)
-    "hide_panel_border": False,          # 取消 MATE Panel 圖示框線
+    "show_hover_tooltip": False,         # 滑鼠懸停圖示時顯示詳細資訊 (Tooltip)
+    "hide_panel_border": True,           # 取消 MATE Panel 圖示框線
     "completed_limit": 20,               # 下拉選單最近已完成任務顯示筆數
 }
 

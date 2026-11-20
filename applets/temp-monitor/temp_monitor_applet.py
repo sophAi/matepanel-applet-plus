@@ -47,27 +47,27 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "temp-monitor.json")
 
 DEFAULT_CONFIG = {
     "enabled": True,
-    "interval_sec": 2,
+    "interval_sec": 5,
     "display_mode": "badge",            # "badge" (方塊圖示) or "icon_text" (晶片圖示+文字)
-    "gpu_badge_layout": "separate",     # "separate" (獨立方塊 [CPU][GPU][UTL][MEM]) or "compact" (GPU方塊內嵌雙進度條)
+    "gpu_badge_layout": "compact",      # "separate" (獨立方塊 [CPU][GPU][UTL][MEM]) or "compact" (GPU方塊內嵌雙進度條)
     "show_panel_gpu_util": True,        # 在面板顯示 Volatile GPU-Util
-    "show_panel_gpu_mem": True,         # 在面板顯示 GPU Memory-Usage
+    "show_panel_gpu_mem": False,        # 在面板顯示 GPU Memory-Usage
     "gpu_mem_panel_unit": "percent",    # "percent" (26%) or "gib" (1.1G)
-    "font_color_mode": "dynamic",       # "dynamic" (預設內建色階) or "custom" (自訂三段式字形顏色)
+    "font_color_mode": "custom",        # "dynamic" (預設內建色階) or "custom" (自訂三段式字形顏色)
     "custom_font_color": "#ffffff",     # 自訂「正常狀態」字形顏色
     "custom_warn_font_color": "#fbbf24",# 自訂「中度負載」字形顏色
     "custom_crit_font_color": "#f87171",# 自訂「高溫/高負載警戒」字形顏色
-    "badge_bg_style": "dark",           # "dark" (深色半透明底), "light" (淺色半透明底), "transparent" (透明無底色)
+    "badge_bg_style": "transparent",    # "dark" (深色半透明底), "light" (淺色半透明底), "transparent" (透明無底色)
     "custom_badge_style": True,         # 分別自訂 CPU / GPU 方塊底色、框線色與底色透明度
-    "cpu_bg_color": "#113a2b",          # CPU 方塊底色
-    "cpu_border_color": "#34d399",      # CPU 方塊框線顏色
-    "cpu_bg_opacity": 92,               # CPU 方塊底色不透明度 (0..100%)
-    "gpu_bg_color": "#162944",          # GPU 方塊底色
-    "gpu_border_color": "#38bdf8",      # GPU 方塊框線顏色
-    "gpu_bg_opacity": 92,               # GPU 方塊底色不透明度 (0..100%)
-    "text_shadow": False,               # 為面板字形加上對比描邊陰影
-    "show_hover_tooltip": True,         # 滑鼠懸停圖示時顯示詳細資訊 (Tooltip)
-    "hide_panel_border": False,         # 取消 MATE Panel 圖示框線
+    "cpu_bg_color": "#ffffff",          # CPU 方塊底色
+    "cpu_border_color": "#ffffff",      # CPU 方塊框線顏色
+    "cpu_bg_opacity": 44,               # CPU 方塊底色不透明度 (0..100%)
+    "gpu_bg_color": "#26a269",          # GPU 方塊底色
+    "gpu_border_color": "#113a2b",      # GPU 方塊框線顏色
+    "gpu_bg_opacity": 56,               # GPU 方塊底色不透明度 (0..100%)
+    "text_shadow": True,                # 為面板字形加上對比描邊陰影
+    "show_hover_tooltip": False,        # 滑鼠懸停圖示時顯示詳細資訊 (Tooltip)
+    "hide_panel_border": True,          # 取消 MATE Panel 圖示框線
     "show_other_sensors": True,         # 在選單中顯示 NVMe / 主機板 / 風扇等其他感測器
     "cpu_avg_cores_only": True,         # True: 僅平均實體核心 Core 0..N; False: 包含 Package id
     "warn_temp_c": 55.0,                # 中度負載溫度閾值 (°C)

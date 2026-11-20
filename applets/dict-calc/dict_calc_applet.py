@@ -101,54 +101,69 @@ VIRTUAL_DICT_ENGINE_MAP = {d["bookname"]: d["engine"] for d in VIRTUAL_TRANSLATE
 
 DEFAULT_CONFIG = {
     "display_mode": "panel_entry",       # "panel_entry" (純面板查詢輸入框，預設) or "badge" (精簡方塊圖示)
-    "result_output_mode": "window",      # "window" (無焦點精簡結果視窗) or "dbus_popup" (氣泡框彈出模式)
-    "dbus_popup_style": "separate",      # "separate" (每本詞典獨立泡泡，最多 N 個) or "merged" (單一泡泡以粗體分隔線區隔)
+    "result_output_mode": "dbus_popup",  # "window" (無焦點精簡結果視窗) or "dbus_popup" (氣泡框彈出模式)
+    "dbus_popup_style": "merged",        # "separate" (每本詞典獨立泡泡，最多 N 個) or "merged" (單一泡泡以粗體分隔線區隔)
     "dbus_popup_max_dicts": 3,           # 氣泡框最多顯示幾本命中的詞典 (1..5)
-    "dbus_popup_timeout_sec": 8,         # 氣泡框停留秒數 (1..60)
-    "dbus_popup_font_size": 11,          # 氣泡框字型大小 (pt)
-    "dbus_popup_position": "top_center", # "top_center"(置中上方), "top_left"(左上角), "top_right"(右上角), "bottom_right"(右下角), "bottom_left"(左下角)
+    "dbus_popup_timeout_sec": 15,        # 氣泡框停留秒數 (1..60)
+    "dbus_popup_font_size": 16,          # 氣泡框字型大小 (pt)
+    "dbus_popup_position": "top_right",  # "top_center"(置中上方), "top_left"(左上角), "top_right"(右上角), "bottom_right"(右下角), "bottom_left"(左下角)
     "dbus_popup_x_offset": 0,            # 氣泡框水平偏移 (-500..+500 px)
-    "dbus_popup_y_offset": 36,           # 氣泡框垂直偏移 (-300..+500 px)
-    "dbus_popup_bg_color": "#182234",    # 氣泡框背景顏色
-    "dbus_popup_fg_color": "#f0f6ff",    # 氣泡框字形顏色
-    "dbus_popup_bg_opacity": 92,         # 氣泡框背景不透明度 (0..100%)
-    "panel_entry_width": 170,            # 面板內嵌查詢框寬度 (px)
+    "dbus_popup_y_offset": 4,            # 氣泡框垂直偏移 (-300..+500 px)
+    "dbus_popup_bg_color": "#fffbe6",    # 氣泡框背景顏色
+    "dbus_popup_fg_color": "#111827",    # 氣泡框字形顏色
+    "dbus_popup_bg_opacity": 76,         # 氣泡框背景不透明度 (0..100%)
+    "panel_entry_width": 100,            # 面板內嵌查詢框寬度 (px)
     "scan_selection_enabled": False,     # 是否啟用滑鼠反白自動劃詞查詢 (Selection Primary)
-    "scan_modifier": "ctrl",             # 劃詞觸發修飾鍵: "none", "ctrl", "alt", "shift"
+    "scan_modifier": "none",             # 劃詞觸發修飾鍵: "none", "ctrl", "alt", "shift"
     "google_translate_enabled": True,    # 句子/段落自動使用線上/本機翻譯 (雙向翻譯)
     "google_translate_fallback": True,   # 離線詞典查無短片語時自動 Fallback 至翻譯引擎
     "google_translate_target": "zh-TW",  # 外文翻譯目標語言 ("zh-TW", "zh-CN", "ja", "en")
     "google_translate_reverse": "en",    # 中文反向翻譯目標語言 ("en", "ja")
-    "translate_engine": "google",        # "google", "gemini", "openai_compat", "deepl"
+    "translate_engine": "gemini",        # "google", "gemini", "openai_compat", "deepl"
     "translate_fallback_google": True,   # 所選引擎超額或連線失敗時自動降級回 Google 翻譯
-    "gemini_api_key": "",                # Gemini API Free Tier Key (Google AI Studio)
-    "gemini_model": "gemini-3.1-flash-lite",
+    "gemini_api_key": "",                # Gemini API Free Tier Key (Google AI Studio，請於偏好設定自行填入)
+    "gemini_model": "gemini-3-flash-preview",
     "openai_base_url": "https://api.groq.com/openai/v1",  # 支援 Groq / OpenRouter / 本機 Ollama
     "openai_api_key": "",
     "openai_model": "llama-3.3-70b-versatile",
     "deepl_api_key": "",                 # DeepL API Free (:fx) 或 Pro Key
-    "hotkey_open_window": "<Ctrl><Alt>d",# 聚焦面板輸入框 / 呼叫查詢的全域快捷鍵
-    "hotkey_scan_selection": "<Ctrl><Alt>s", # 立即查詢目前滑鼠反白文字 (Scan Selection) 的全域快捷鍵
+    "hotkey_open_window": "<Super>o",    # 聚焦面板輸入框 / 呼叫查詢的全域快捷鍵
+    "hotkey_scan_selection": "<Super>d", # 立即查詢目前滑鼠反白文字 (Scan Selection) 的全域快捷鍵
     "calc_auto_copy": True,              # 數學計算模式預設自動將結果存入系統剪貼簿 (可直接 Ctrl+V)
     "active_dict_group": "custom",       # "custom" (已勾選常用), "en_zh", "ja_zh", "sci_en", "all"
     "dict_root_dir": "/usr/share/stardict/dic",  # StarDict 詞典根目錄路徑 (留空則掃描系統預設路徑)
-    "enabled_dicts": list(DEFAULT_PREFERRED_DICTS),           # 無焦點查詢視窗詞典清單 (含順位)
-    "enabled_dicts_dbus": list(DEFAULT_PREFERRED_DICTS[:5]),  # D-Bus 氣泡框詞典清單 (含順位)
-    "enabled_dicts_scan": list(DEFAULT_PREFERRED_DICTS[:5]),  # Scan Selection 劃詞詞典清單 (含順位)
+    "enabled_dicts": [
+        "DrEye4in1詞典",
+        "English Thesaurus",
+        "Collins Cobuild English Dictionary",
+        "Oxford English Collocation Dictionary",
+        "英文字根字典",
+        "DrEye-cj",
+        "DrEye-jc",
+        "The CMU Pronouncing Dictionary",
+    ],
+    "enabled_dicts_dbus": [
+        "DrEye4in1詞典",
+        "Collins Cobuild English Dictionary",
+    ],
+    "enabled_dicts_scan": [
+        "DrEye4in1詞典",
+        "🌐 Gemini AI 翻譯",
+    ],
     "vocab_record_enabled": True,        # 自動紀錄傳統 StarDict 詞典查詢命中的單字
-    "vocab_card_dicts": ["DrEye4in1詞典", "Collins Cobuild English Dictionary", "英文字根字典"],
-    "vocab_sort_mode": "recent",         # "recent", "freq", "alpha", "random"
+    "vocab_card_dicts": ["DrEye4in1詞典", "Collins Cobuild English Dictionary"],
+    "vocab_sort_mode": "random",         # "recent", "freq", "alpha", "random"
     "vocab_epub_layout": "per_word",     # "per_word" (一字一頁，預設) or "az_chapters" (依字母 A-Z 分章)
-    "result_font_size": 11,              # 結果視窗字型大小 (pt)
+    "result_font_size": 15,              # 結果視窗字型大小 (pt)
     "font_color_mode": "dynamic",        # "dynamic" or "custom"
-    "custom_font_color": "#ffffff",      # 自訂面板字形顏色
-    "badge_bg_style": "dark",            # (舊版相容欄位)
+    "custom_font_color": "#e66100",      # 自訂面板字形顏色
+    "badge_bg_style": "light",           # (舊版相容欄位)
     "badge_bg_color": "#182234",         # 自訂方塊/輸入框背景底色
     "badge_border_color": "#48b8fa",     # 自訂方塊/輸入框外框顏色
     "hide_panel_border": False,          # 取消 MATE Panel 圖示與輸入框外框
-    "badge_bg_opacity": 90,              # 背景不透明度 (0=完全透明 ~ 100=完全不透明)
+    "badge_bg_opacity": 0,               # 背景不透明度 (0=完全透明 ~ 100=完全不透明)
     "text_shadow": False,                # 面板文字描邊陰影
-    "show_hover_tooltip": True,          # 滑鼠懸停圖示時顯示詳細資訊 (Tooltip)
+    "show_hover_tooltip": False,         # 滑鼠懸停圖示時顯示詳細資訊 (Tooltip)
 }
 
 
