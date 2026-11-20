@@ -96,7 +96,7 @@ VIRTUAL_DICT_ENGINE_MAP = {d["bookname"]: d["engine"] for d in VIRTUAL_TRANSLATE
 
 DEFAULT_CONFIG = {
     "display_mode": "panel_entry",       # "panel_entry" (純面板查詢輸入框，預設) or "badge" (精簡方塊圖示)
-    "result_output_mode": "window",      # "window" (無焦點精簡結果視窗), "dbus_popup" (系統 D-Bus 通知泡泡), "calc_dbus_dict_window" (混合模式)
+    "result_output_mode": "window",      # "window" (無焦點精簡結果視窗) or "dbus_popup" (氣泡框彈出模式)
     "dbus_popup_style": "separate",      # "separate" (每本詞典獨立泡泡，最多 N 個) or "merged" (單一泡泡以粗體分隔線區隔)
     "dbus_popup_max_dicts": 3,           # 氣泡框最多顯示幾本命中的詞典 (1..5)
     "dbus_popup_timeout_sec": 8,         # 氣泡框停留秒數 (1..60)
@@ -1828,6 +1828,8 @@ class DictCalcWidget(Gtk.EventBox):
             else:
                 cfg["badge_bg_color"] = "#182234"
                 cfg["badge_bg_opacity"] = 90
+        if cfg.get("result_output_mode") not in ("window", "dbus_popup"):
+            cfg["result_output_mode"] = "window"
         return cfg
 
     def _save_config(self):
@@ -2164,8 +2166,17 @@ class DictCalcWidget(Gtk.EventBox):
             # Left icon toggles Scan Selection
             self.toggle_scan_selection()
 
+    def set_result_output_mode(self, mode):
+        self.config["result_output_mode"] = "dbus_popup" if mode == "dbus_popup" else "window"
+        self._save_config()
+        self._update_tooltip()
+
+    def toggle_result_output_mode(self, *_args):
+        cur = self.config.get("result_output_mode", "window")
+        self.set_result_output_mode("window" if cur == "dbus_popup" else "dbus_popup")
+
     def _on_panel_entry_populate_popup(self, _entry, menu):
-        """Integrate Applet controls (Preferences, Scan Selection, Open Window) into the Entry right-click menu."""
+        """Integrate Applet controls (Output mode switch, Scan Selection, Preferences) into Entry right-click menu."""
         menu.prepend(Gtk.SeparatorMenuItem())
 
         mi_prefs = Gtk.MenuItem(label="⚙️ 偏好設定與詞典順位管理...")
@@ -2182,9 +2193,14 @@ class DictCalcWidget(Gtk.EventBox):
         mi_scan_now.connect("activate", lambda *_: self.trigger_scan_selection_now())
         menu.prepend(mi_scan_now)
 
-        mi_open = Gtk.MenuItem(label="📖 開啟獨立查詢 / 計算機視窗...")
-        mi_open.connect("activate", lambda *_: self.open_popup_window(self.panel_entry.get_text().strip()))
-        menu.prepend(mi_open)
+        is_bubble = self.config.get("result_output_mode", "window") == "dbus_popup"
+        mi_mode = Gtk.MenuItem(
+            label="🪟 切換為無焦點視窗顯示 (目前：氣泡框)"
+            if is_bubble
+            else "💬 切換為氣泡框顯示 (目前：無焦點視窗)"
+        )
+        mi_mode.connect("activate", lambda *_: self.toggle_result_output_mode())
+        menu.prepend(mi_mode)
 
         menu.show_all()
 
@@ -2269,7 +2285,7 @@ class DictCalcWidget(Gtk.EventBox):
             if res_str is not None and auto_copy:
                 self.copy_to_clipboard(res_str)
 
-            use_dbus = out_mode in ("dbus_popup", "calc_dbus_dict_window")
+            use_dbus = out_mode == "dbus_popup"
             if use_dbus:
                 if err is not None:
                     self._notify_dbus(
@@ -2548,7 +2564,9 @@ class DictCalcWidget(Gtk.EventBox):
                 if len(tr_disp) > 900:
                     tr_disp = tr_disp[:897] + "…"
                 body = self._wrap_dbus_font(
-                    f"<b>{html.escape(tr_disp)}</b>\n<i>{html.escape(short_orig)}</i>"
+                    f"{html.escape(tr_disp)}\n"
+                    f"<span alpha='45%'>────────────────────</span>\n"
+                    f"<small><span alpha='72%'><i>{html.escape(short_orig)}</i></span></small>"
                 )
                 self._notify_dbus(
                     f"🌐 {engine_label} ({src_lbl} → {tgt_lbl}{fb_tag})",
@@ -2941,7 +2959,6 @@ class DictCalcWidget(Gtk.EventBox):
         for o_id, o_lbl in (
             ("window", "無焦點精簡結果視窗 (可捲動看完整詞典，不搶面板游標)"),
             ("dbus_popup", "氣泡框彈出模式 (可於「氣泡框設定」自訂位置、底色、字色與透明度)"),
-            ("calc_dbus_dict_window", "混合模式 (計算機用氣泡框秒出，查詞與翻譯用無焦點視窗)"),
         ):
             combo_out.append(o_id, o_lbl)
         combo_out.set_active_id(self.config.get("result_output_mode", "window"))
@@ -4051,12 +4068,12 @@ def setup_applet_context_menu(applet, widget):
     action_group.add_actions(
         [
             (
-                "OpenQueryAction",
-                Gtk.STOCK_FIND,
-                "開啟查詢 / 計算機視窗 (_Search & Calc)...",
+                "ToggleOutputModeAction",
+                Gtk.STOCK_REFRESH,
+                "切換氣泡框 / 無焦點視窗顯示 (_Toggle Output Mode)",
                 None,
-                "開啟離線詞典查詢與科學計算機視窗",
-                lambda *_: widget.open_popup_window(""),
+                "在氣泡框彈出模式與無焦點結果視窗之間切換",
+                widget.toggle_result_output_mode,
             ),
             (
                 "ScanNowAction",
@@ -4094,7 +4111,7 @@ def setup_applet_context_menu(applet, widget):
     )
 
     menu_xml = (
-        '<menuitem name="OpenQuery" action="OpenQueryAction"/>'
+        '<menuitem name="ToggleOutputMode" action="ToggleOutputModeAction"/>'
         '<menuitem name="ScanNow" action="ScanNowAction"/>'
         '<menuitem name="ToggleScan" action="ToggleScanAction"/>'
         "<separator/>"
