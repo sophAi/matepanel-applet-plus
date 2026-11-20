@@ -377,12 +377,17 @@ class StarDictManager:
         found.sort(key=lambda d: (d["group"], d["bookname"]))
         return found
 
+    def get_ordered_enabled_dicts(self, custom_enabled_list):
+        """Return enabled dictionary names strictly preserving the user's configured priority order."""
+        available = {d["bookname"] for d in self.all_dicts}
+        ordered = [name for name in custom_enabled_list if name in available]
+        return ordered
+
     def get_dicts_for_group(self, group_name, custom_enabled_list):
         if group_name == "all":
             return []  # empty means query all dictionaries in sdcv
         if group_name == "custom":
-            valid = [d["bookname"] for d in self.all_dicts if d["bookname"] in custom_enabled_list]
-            return valid
+            return self.get_ordered_enabled_dicts(custom_enabled_list)
         return [d["bookname"] for d in self.all_dicts if d["group"] == group_name]
 
     @classmethod
@@ -439,6 +444,10 @@ class StarDictManager:
                 defn = self.clean_definition(it.get("definition", ""))
                 if defn:
                     results.append({"dict": d_name, "word": w_res, "definition": defn})
+            # Sort returned entries strictly according to user's dictionary priority order
+            if dict_names:
+                order_map = {name: i for i, name in enumerate(dict_names)}
+                results.sort(key=lambda r: order_map.get(r["dict"], 999999))
             return results
         except Exception:
             return []
@@ -482,24 +491,16 @@ def draw_rounded_rect(ctx, x, y, w, h, r):
 
 class DictCalcPopupWindow(Gtk.Window):
     """
-    Fast Dictionary & Scientific Calculator popup window.
+    Compact Dictionary & Scientific Calculator popup window.
     - Supports instant math formula evaluation (auto-copied to system clipboard!)
-    - Supports multi-dictionary StarDict results with group switcher tabs
+    - Displays multi-dictionary StarDict results strictly in the user's configured priority order
     - Press Esc to hide immediately
     """
-
-    GROUP_OPTIONS = [
-        ("custom", "⭐ 常用詞典"),
-        ("en_zh", "🇬🇧 英漢/漢英"),
-        ("ja_zh", "🇯🇵 日漢/漢日"),
-        ("sci_en", "🔬 科技/英英"),
-        ("all", "📚 全部 41 套"),
-    ]
 
     def __init__(self, parent_widget):
         super().__init__(title="📖 StarDict 離線詞典 & 🧮 科學計算機")
         self.parent_widget = parent_widget
-        self.set_default_size(600, 480)
+        self.set_default_size(450, 440)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.connect("delete-event", self._on_delete_hide)
         self.connect("key-press-event", self._on_key_press)
@@ -519,25 +520,24 @@ class DictCalcPopupWindow(Gtk.Window):
         return False
 
     def _build_ui(self):
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        root.set_margin_top(12)
-        root.set_margin_bottom(12)
-        root.set_margin_start(14)
-        root.set_margin_end(14)
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        root.set_margin_top(10)
+        root.set_margin_bottom(10)
+        root.set_margin_start(12)
+        root.set_margin_end(12)
 
-        # Row 1: Search / Formula Entry + Action Buttons
-        top_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        # Row 1: Search / Formula Entry + Compact Action Buttons
+        top_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
 
         self.search_entry = Gtk.Entry()
         self.search_entry.set_hexpand(True)
-        self.search_entry.set_placeholder_text(
-            "輸入中/英/日單字查詞，或直接輸入數學公式（例如 2^10、sqrt(2)*pi、=128*3.14）..."
-        )
+        self.search_entry.set_placeholder_text("輸入單字查詞或數學公式 (如 2^10)...")
         self.search_entry.connect("activate", self._on_search_activate)
         self.search_entry.connect("changed", self._on_search_changed)
         top_box.pack_start(self.search_entry, True, True, 0)
 
-        btn_go = Gtk.Button(label="🔎 查詢 / 計算")
+        btn_go = Gtk.Button(label="🔎")
+        btn_go.set_tooltip_text("查詢 / 計算 (Enter)")
         btn_go.connect("clicked", self._on_search_activate)
         top_box.pack_start(btn_go, False, False, 0)
 
@@ -546,36 +546,18 @@ class DictCalcPopupWindow(Gtk.Window):
         btn_clear.connect("clicked", self._on_clear)
         top_box.pack_start(btn_clear, False, False, 0)
 
+        self.chk_scan = Gtk.ToggleButton(label="✂")
+        self.chk_scan.set_tooltip_text("開關滑鼠反白自動劃詞查詢 (Scan Selection)")
+        self.chk_scan.set_active(self.parent_widget.config.get("scan_selection_enabled", False))
+        self.chk_scan.connect("toggled", self._on_scan_toggled)
+        top_box.pack_start(self.chk_scan, False, False, 0)
+
         btn_prefs = Gtk.Button(label="⚙️")
-        btn_prefs.set_tooltip_text("偏好設定（詞典管理 / 快捷鍵 / 劃詞取詞）")
+        btn_prefs.set_tooltip_text("偏好設定（詞典順位管理 / 字型大小 / 快捷鍵）")
         btn_prefs.connect("clicked", lambda *_: self.parent_widget.show_preferences_dialog())
         top_box.pack_start(btn_prefs, False, False, 0)
 
         root.pack_start(top_box, False, False, 0)
-
-        # Row 2: Dictionary Group Quick Switcher + Scan Selection Toggle
-        bar2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-
-        self.group_buttons = {}
-        cur_grp = self.parent_widget.config.get("active_dict_group", "custom")
-        grp_leader = None
-        for g_code, g_label in self.GROUP_OPTIONS:
-            rb = Gtk.RadioButton.new_with_label_from_widget(grp_leader, g_label)
-            rb.set_mode(False)  # toggle-button appearance
-            if grp_leader is None:
-                grp_leader = rb
-            if g_code == cur_grp:
-                rb.set_active(True)
-            rb.connect("toggled", self._on_group_toggled, g_code)
-            bar2.pack_start(rb, False, False, 0)
-            self.group_buttons[g_code] = rb
-
-        self.chk_scan = Gtk.CheckButton(label="✂ 劃詞自動查")
-        self.chk_scan.set_active(self.parent_widget.config.get("scan_selection_enabled", False))
-        self.chk_scan.connect("toggled", self._on_scan_toggled)
-        bar2.pack_end(self.chk_scan, False, False, 0)
-
-        root.pack_start(bar2, False, False, 0)
 
         # Row 3: Highlighted Calculator Result Banner (auto-shown when formula detected)
         self.calc_frame = Gtk.Frame()
@@ -632,7 +614,7 @@ class DictCalcPopupWindow(Gtk.Window):
             "dict_hdr",
             weight=700,
             foreground="#38bdf8",
-            scale=1.12,
+            size_points=fs + 1.5,
             pixels_above_lines=8,
             pixels_below_lines=3,
         )
@@ -640,7 +622,7 @@ class DictCalcPopupWindow(Gtk.Window):
             "word_title",
             weight=700,
             foreground="#fbbf24",
-            scale=1.08,
+            size_points=fs + 1.0,
         )
         self.tag_body = buf.create_tag(
             "body_text",
@@ -650,28 +632,27 @@ class DictCalcPopupWindow(Gtk.Window):
         self.tag_muted = buf.create_tag(
             "muted",
             foreground="#94a3b8",
-            size_points=max(9, fs - 1),
+            size_points=max(8.5, fs - 1.0),
         )
 
     def update_font_size(self):
         fs = int(self.parent_widget.config.get("result_font_size", 11))
+        self.tag_dict_hdr.set_property("size-points", fs + 1.5)
+        self.tag_word.set_property("size-points", fs + 1.0)
         self.tag_body.set_property("size-points", fs)
-        self.tag_muted.set_property("size-points", max(9, fs - 1))
+        self.tag_muted.set_property("size-points", max(8.5, fs - 1.0))
 
     def _update_status_footer(self, extra_msg=""):
         hk_open = self.parent_widget.config.get("hotkey_open_window", "<Ctrl><Alt>d")
         hk_scan = self.parent_widget.config.get("hotkey_scan_selection", "<Ctrl><Alt>s")
-        n_total = len(self.parent_widget.dict_mgr.all_dicts)
+        n_en = len(self.parent_widget.config.get("enabled_dicts", DEFAULT_PREFERRED_DICTS))
         msg = extra_msg if extra_msg else (
-            f"已偵測 {n_total} 套離線詞典  |  呼叫視窗: {hk_open}  |  劃詞查詢: {hk_scan}  |  按 Esc 關閉"
+            f"已啟用 {n_en} 套詞典 | 視窗:{hk_open} | 劃詞:{hk_scan} | Esc 關閉"
         )
         self.status_lbl.set_markup(f"<small><span foreground='#94a3b8'>{html.escape(msg)}</span></small>")
 
     def sync_controls(self):
         self.chk_scan.set_active(self.parent_widget.config.get("scan_selection_enabled", False))
-        cur_grp = self.parent_widget.config.get("active_dict_group", "custom")
-        if cur_grp in self.group_buttons:
-            self.group_buttons[cur_grp].set_active(True)
         self.update_font_size()
         self._update_status_footer()
 
@@ -680,15 +661,6 @@ class DictCalcPopupWindow(Gtk.Window):
         self.calc_frame.hide()
         self.result_buf.set_text("")
         self.search_entry.grab_focus()
-
-    def _on_group_toggled(self, rb, group_code):
-        if not rb.get_active():
-            return
-        self.parent_widget.config["active_dict_group"] = group_code
-        self.parent_widget._save_config()
-        txt = self.search_entry.get_text().strip()
-        if txt:
-            self.run_query(txt, record_calc_history=False)
 
     def _on_scan_toggled(self, chk):
         self.parent_widget.set_scan_selection_enabled(chk.get_active())
@@ -793,13 +765,12 @@ class DictCalcPopupWindow(Gtk.Window):
             self.result_buf.get_end_iter(), f"🔎 正在查詢「{q}」...", self.tag_muted
         )
 
-        group_code = self.parent_widget.config.get("active_dict_group", "custom")
         custom_list = self.parent_widget.config.get("enabled_dicts", DEFAULT_PREFERRED_DICTS)
-        dict_names = self.parent_widget.dict_mgr.get_dicts_for_group(group_code, custom_list)
+        dict_names = self.parent_widget.dict_mgr.get_ordered_enabled_dicts(custom_list)
 
         def worker():
             results = self.parent_widget.dict_mgr.query_sync(q, dict_names=dict_names)
-            GLib.idle_add(self._on_dict_results_ready, seq, q, results, group_code)
+            GLib.idle_add(self._on_dict_results_ready, seq, q, results)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -826,7 +797,7 @@ class DictCalcPopupWindow(Gtk.Window):
                     buf.get_end_iter(), f"  • {h_expr}  =  {h_res}\n", self.tag_body
                 )
 
-    def _on_dict_results_ready(self, seq, query_word, results, group_code):
+    def _on_dict_results_ready(self, seq, query_word, results):
         if seq != self._query_seq:
             return False
 
@@ -838,7 +809,7 @@ class DictCalcPopupWindow(Gtk.Window):
                 buf.get_end_iter(),
                 f"找不到「{query_word}」的詞條釋義。\n\n"
                 f"💡 建議：\n"
-                f"• 點選上方「📚 全部 41 套」擴大搜尋範圍\n"
+                f"• 點選右上角「⚙️ 偏好設定 → 詞典管理」勾選更多詞典\n"
                 f"• 若要進行數學計算，可在算式最前面加上「=」（例如 =2^10）\n",
                 self.tag_muted,
             )
@@ -847,7 +818,7 @@ class DictCalcPopupWindow(Gtk.Window):
 
         for idx, item in enumerate(results):
             if idx > 0:
-                buf.insert_with_tags(buf.get_end_iter(), "\n" + ("─" * 52) + "\n", self.tag_muted)
+                buf.insert_with_tags(buf.get_end_iter(), "\n" + ("─" * 38) + "\n", self.tag_muted)
             buf.insert_with_tags(
                 buf.get_end_iter(), f"📖 {item['dict']}\n", self.tag_dict_hdr
             )
@@ -1438,7 +1409,7 @@ class DictCalcWidget(Gtk.EventBox):
 
         notebook.append_page(tab1, Gtk.Label(label="⚙️ 一般、快捷鍵與外觀"))
 
-        # ---------------- Tab 2: 41 StarDict Dictionaries Manager ----------------
+        # ---------------- Tab 2: StarDict Dictionaries Manager (with Priority Ordering) ----------------
         tab2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         tab2.set_margin_top(10)
         tab2.set_margin_bottom(10)
@@ -1448,32 +1419,43 @@ class DictCalcWidget(Gtk.EventBox):
         d_hdr = Gtk.Label(xalign=0.0)
         d_hdr.set_markup(
             f"<b>已掃描到 {len(self.dict_mgr.all_dicts)} 套離線 StarDict 詞典</b> "
-            f"<small>(勾選後將納入「⭐ 常用詞典」群組查詢)</small>"
+            f"<small>(勾選啟用詞典，並使用右側按鈕或拖曳調整顯示順位，越上方越優先顯示)</small>"
         )
         tab2.pack_start(d_hdr, False, False, 0)
 
-        # TreeView with checkboxes
+        # Build ordered list: enabled dicts in saved priority order first, then remaining disabled dicts
         store = Gtk.ListStore(bool, str, str, int)
-        enabled_set = set(self.config.get("enabled_dicts", DEFAULT_PREFERRED_DICTS))
+        saved_enabled = list(self.config.get("enabled_dicts", DEFAULT_PREFERRED_DICTS))
+        dict_by_name = {d["bookname"]: d for d in self.dict_mgr.all_dicts}
         grp_labels = {"en_zh": "英漢/漢英", "ja_zh": "日漢/漢日", "sci_en": "科技/英英"}
+
+        added_names = set()
+        for name in saved_enabled:
+            if name in dict_by_name and name not in added_names:
+                d = dict_by_name[name]
+                store.append([True, d["bookname"], grp_labels.get(d["group"], d["group"]), d["wordcount"]])
+                added_names.add(name)
         for d in self.dict_mgr.all_dicts:
-            store.append(
-                [
-                    d["bookname"] in enabled_set,
-                    d["bookname"],
-                    grp_labels.get(d["group"], d["group"]),
-                    d["wordcount"],
-                ]
-            )
+            if d["bookname"] not in added_names:
+                store.append([False, d["bookname"], grp_labels.get(d["group"], d["group"]), d["wordcount"]])
+                added_names.add(d["bookname"])
+
+        def save_dict_order_from_store(*_):
+            self.config["enabled_dicts"] = [row[1] for row in store if row[0]]
+            self._save_config()
+            if self.popup_win is not None:
+                self.popup_win.sync_controls()
 
         tree = Gtk.TreeView(model=store)
+        tree.set_reorderable(True)  # Also supports mouse drag-and-drop reordering!
+        store.connect("rows-reordered", lambda *_: GLib.idle_add(save_dict_order_from_store))
+        store.connect("row-deleted", lambda *_: GLib.idle_add(save_dict_order_from_store))
+
         rend_toggle = Gtk.CellRendererToggle()
 
         def on_dict_row_toggled(_cell, path_str):
             store[path_str][0] = not store[path_str][0]
-            new_enabled = [row[1] for row in store if row[0]]
-            self.config["enabled_dicts"] = new_enabled
-            self._save_config()
+            save_dict_order_from_store()
 
         rend_toggle.connect("toggled", on_dict_row_toggled)
         tree.append_column(Gtk.TreeViewColumn("啟用", rend_toggle, active=0))
@@ -1483,11 +1465,62 @@ class DictCalcWidget(Gtk.EventBox):
         tree.append_column(Gtk.TreeViewColumn("分類", Gtk.CellRendererText(), text=2))
         tree.append_column(Gtk.TreeViewColumn("詞條數", Gtk.CellRendererText(), text=3))
 
+        # Horizontal container: TreeView on left + Up/Down/Top/Bottom priority buttons on right
+        list_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         d_scroll = Gtk.ScrolledWindow()
         d_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         d_scroll.set_vexpand(True)
+        d_scroll.set_hexpand(True)
         d_scroll.add(tree)
-        tab2.pack_start(d_scroll, True, True, 0)
+        list_hbox.pack_start(d_scroll, True, True, 0)
+
+        order_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        btn_top = Gtk.Button(label="⏫ 置頂")
+        btn_up = Gtk.Button(label="▲ 上移")
+        btn_down = Gtk.Button(label="▼ 下移")
+        btn_bottom = Gtk.Button(label="⏬ 置底")
+
+        def move_selected_row(direction):
+            sel = tree.get_selection()
+            model, it = sel.get_selected()
+            if it is None:
+                return
+            path = model.get_path(it)
+            idx = path.get_indices()[0]
+            total = len(model)
+            if direction == "up" and idx > 0:
+                prev_it = model.get_iter(Gtk.TreePath.new_from_indices([idx - 1]))
+                model.swap(it, prev_it)
+                new_idx = idx - 1
+            elif direction == "down" and idx < total - 1:
+                next_it = model.get_iter(Gtk.TreePath.new_from_indices([idx + 1]))
+                model.swap(it, next_it)
+                new_idx = idx + 1
+            elif direction == "top" and idx > 0:
+                first_it = model.get_iter_first()
+                model.move_before(it, first_it)
+                new_idx = 0
+            elif direction == "bottom" and idx < total - 1:
+                last_it = model.get_iter(Gtk.TreePath.new_from_indices([total - 1]))
+                model.move_after(it, last_it)
+                new_idx = total - 1
+            else:
+                return
+            new_path = Gtk.TreePath.new_from_indices([new_idx])
+            sel.select_path(new_path)
+            tree.scroll_to_cell(new_path, None, False, 0.0, 0.0)
+            save_dict_order_from_store()
+
+        btn_top.connect("clicked", lambda *_: move_selected_row("top"))
+        btn_up.connect("clicked", lambda *_: move_selected_row("up"))
+        btn_down.connect("clicked", lambda *_: move_selected_row("down"))
+        btn_bottom.connect("clicked", lambda *_: move_selected_row("bottom"))
+
+        for b_ord in (btn_top, btn_up, btn_down, btn_bottom):
+            order_vbox.pack_start(b_ord, False, False, 0)
+        list_hbox.pack_start(order_vbox, False, False, 0)
+
+        tab2.pack_start(list_hbox, True, True, 0)
 
         d_btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         btn_sel_all = Gtk.Button(label="全部勾選")
@@ -1502,8 +1535,7 @@ class DictCalcWidget(Gtk.EventBox):
                     row[0] = False
                 else:
                     row[0] = row[1] in DEFAULT_PREFERRED_DICTS
-            self.config["enabled_dicts"] = [row[1] for row in store if row[0]]
-            self._save_config()
+            save_dict_order_from_store()
 
         btn_sel_all.connect("clicked", lambda *_: set_dict_selection("all"))
         btn_sel_none.connect("clicked", lambda *_: set_dict_selection("none"))
