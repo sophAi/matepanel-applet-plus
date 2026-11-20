@@ -8,7 +8,7 @@ Features:
   - Displays current desktop GTK Icon Theme weather icon (weather-clear, weather-showers,
     weather-storm, weather-fog, etc.), temperature, date/weekday, and HH:MM time (no seconds).
   - Exact minute-boundary timer alignment (0.0% idle CPU overhead, zero subprocesses).
-  - Customizable badge background color, border color, opacity (0..100%), font color & shadow.
+  - Customizable badge background color & opacity (0..100%), font color, font opacity & shadow (borderless).
 - Free, API-key-free Open-Meteo Weather + Air Quality (PM2.5 / US AQI) backend:
   - Default city: Taipei (25.0330, 121.5654); built-in Geocoding city search in Preferences.
   - Local JSON cache (~/.config/matepanel-applet-plus/weather-cache.json) for instant startup.
@@ -65,13 +65,33 @@ DEFAULT_CONFIG = {
     "calendar_font_size": 11,            # 彈窗月曆與預報字型大小 (pt)
     "show_world_clock": True,            # 彈窗底部顯示多時區世界時鐘
     "world_clocks": "Asia/Tokyo, Europe/London, America/New_York",
-    "badge_bg_color": "#182234",         # 面板方塊背景顏色
-    "badge_border_color": "#48b8fa",     # 面板方塊外框顏色
-    "badge_bg_opacity": 90,              # 面板方塊背景不透明度 (0..100%)
+    "badge_bg_color": "#182234",         # 面板背景顏色
+    "badge_bg_opacity": 90,              # 面板背景不透明度 (0..100%)
     "font_color_mode": "dynamic",        # "dynamic" or "custom"
     "custom_font_color": "#ffffff",      # 自訂面板字形顏色
+    "font_opacity": 100,                 # 面板文字不透明度 (10..100%)
     "text_shadow": False,                # 面板文字高對比描邊陰影
 }
+
+WORLD_CLOCK_PRESETS = [
+    ("東京", "Asia/Tokyo"),
+    ("首爾", "Asia/Seoul"),
+    ("香港", "Asia/Hong_Kong"),
+    ("新加坡", "Asia/Singapore"),
+    ("曼谷", "Asia/Bangkok"),
+    ("雪梨", "Australia/Sydney"),
+    ("杜拜", "Asia/Dubai"),
+    ("倫敦", "Europe/London"),
+    ("巴黎", "Europe/Paris"),
+    ("柏林", "Europe/Berlin"),
+    ("紐約", "America/New_York"),
+    ("芝加哥", "America/Chicago"),
+    ("洛杉磯", "America/Los_Angeles"),
+    ("溫哥華", "America/Vancouver"),
+    ("夏威夷", "Pacific/Honolulu"),
+    ("UTC", "UTC"),
+]
+WORLD_CLOCK_TZ_LABELS = {tz: label for label, tz in WORLD_CLOCK_PRESETS}
 
 TW_CITY_PRESETS = [
     ("台北", 25.0330, 121.5654),
@@ -430,12 +450,77 @@ class ClockWeatherPopupWindow(Gtk.Window):
         root.pack_start(content, True, True, 0)
 
         # Bottom World Clock & Status Footer
+        footer_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.footer_lbl = Gtk.Label(xalign=0.0)
-        self.footer_lbl.set_ellipsize(3)
-        root.pack_start(self.footer_lbl, False, False, 0)
+        self.footer_lbl.set_line_wrap(True)
+        self.footer_lbl.set_max_width_chars(86)
+        footer_row.pack_start(self.footer_lbl, True, True, 0)
+
+        self.btn_world_cities = Gtk.Button(label="🌍 選擇城市")
+        self.btn_world_cities.set_tooltip_text("自行勾選底部顯示的世界時鐘城市")
+        self.btn_world_cities.connect("clicked", self._open_world_clock_popover)
+        footer_row.pack_end(self.btn_world_cities, False, False, 0)
+        root.pack_start(footer_row, False, False, 0)
 
         self.add(root)
         self.show_all()
+
+    def _open_world_clock_popover(self, btn):
+        pop = Gtk.Popover.new(btn)
+        pop.set_position(Gtk.PositionType.TOP)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_margin_top(10)
+        box.set_margin_bottom(10)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+
+        hdr = Gtk.Label(xalign=0.0)
+        hdr.set_markup("<b>🌍 選擇世界時鐘城市</b>")
+        box.pack_start(hdr, False, False, 0)
+
+        raw = self.parent_widget.config.get("world_clocks", "")
+        cur_list = [s.strip() for s in raw.split(",") if s.strip()]
+        cur_set = set(cur_list)
+        preset_tzs = {tz for _, tz in WORLD_CLOCK_PRESETS}
+        custom_tzs = [tz for tz in cur_list if tz not in preset_tzs]
+
+        grid = Gtk.Grid(column_spacing=12, row_spacing=4)
+        chk_items = []
+        for idx, (label, tz_id) in enumerate(WORLD_CLOCK_PRESETS):
+            cb = Gtk.CheckButton(label=label)
+            cb.set_active(tz_id in cur_set)
+            grid.attach(cb, idx % 4, idx // 4, 1, 1)
+            chk_items.append((cb, tz_id))
+        box.pack_start(grid, False, False, 0)
+
+        custom_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        custom_row.pack_start(Gtk.Label(label="其他時區：", xalign=0.0), False, False, 0)
+        entry_custom = Gtk.Entry()
+        entry_custom.set_hexpand(True)
+        entry_custom.set_placeholder_text("如 Asia/Kolkata, Pacific/Auckland")
+        entry_custom.set_text(", ".join(custom_tzs))
+        custom_row.pack_start(entry_custom, True, True, 0)
+        box.pack_start(custom_row, False, False, 0)
+
+        def _sync_world(*_):
+            selected = [tz for cb, tz in chk_items if cb.get_active()]
+            extras = [s.strip() for s in entry_custom.get_text().split(",") if s.strip()]
+            for ex in extras:
+                if ex not in selected:
+                    selected.append(ex)
+            self.parent_widget.config["show_world_clock"] = True
+            self.parent_widget.config["world_clocks"] = ", ".join(selected)
+            self.parent_widget._save_config()
+            self._update_world_clock_footer()
+
+        for cb, _tz in chk_items:
+            cb.connect("toggled", _sync_world)
+        entry_custom.connect("activate", _sync_world)
+        entry_custom.connect("focus-out-event", lambda *_: (_sync_world(), False)[1])
+
+        pop.add(box)
+        pop.show_all()
+        pop.popup()
 
     def _compute_month_cells(self):
         cal = calendar.Calendar(firstweekday=0)
@@ -495,7 +580,7 @@ class ClockWeatherPopupWindow(Gtk.Window):
         for tz_str in [s.strip() for s in raw_tzs.split(",") if s.strip()]:
             try:
                 dt = now_utc.astimezone(ZoneInfo(tz_str))
-                short_name = tz_str.split("/")[-1].replace("_", " ")
+                short_name = WORLD_CLOCK_TZ_LABELS.get(tz_str) or tz_str.split("/")[-1].replace("_", " ")
                 parts.append(f"<b>{html.escape(short_name)}</b> {dt.strftime('%m/%d %H:%M')}")
             except Exception:
                 continue
@@ -1061,24 +1146,34 @@ class ClockWeatherWidget(Gtk.EventBox):
         parts.append(t_s)
         return "  ".join(parts)
 
+    def _compute_panel_font_size(self, ctx, txt, h):
+        """Maximize bold panel text height while guaranteeing zero vertical clipping."""
+        max_h = max(12.0, float(h) - 2.0)
+        fs = max(13.0, min(40.0, float(h) * 0.72))
+        ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        ctx.set_font_size(fs)
+        ext = ctx.text_extents(txt)
+        if ext.height > max_h and ext.height > 1.0:
+            fs *= max_h / ext.height
+            ctx.set_font_size(fs)
+            ext = ctx.text_extents(txt)
+        return fs, ext
+
     def _update_canvas_size(self):
         h = max(24, self.panel_size)
         txt = self._format_panel_text()
         show_icon = bool(self.config.get("show_weather_icon", True))
-        icon_sz = max(14, min(28, int(h - 6)))
-        fs = max(10.0, min(18.0, h * 0.44))
+        icon_sz = max(16, min(36, int(h - 2)))
 
         # Measure exact Cairo text width using a tiny image surface
         surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1)
         ctx = cairo.Context(surf)
-        ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-        ctx.set_font_size(fs)
-        ext = ctx.text_extents(txt)
-        text_w = ext.x_advance
+        _fs, ext = self._compute_panel_font_size(ctx, txt, h)
+        text_w = max(ext.x_advance, ext.width)
 
-        pad_x = 8
-        icon_w = (icon_sz + 5) if show_icon else 0
-        total_w = int(math.ceil(pad_x * 2 + icon_w + text_w + 4))
+        pad_x = 4
+        icon_w = (icon_sz + 4) if show_icon else 0
+        total_w = int(math.ceil(pad_x * 2 + icon_w + text_w + 2))
         self.canvas.set_size_request(max(56, total_w), h)
         self.canvas.queue_draw()
 
@@ -1110,39 +1205,34 @@ class ClockWeatherWidget(Gtk.EventBox):
         self.set_tooltip_markup("\n".join(lines))
 
     def _draw_styled_text(self, ctx, x, y, text, rgb):
+        font_alpha = max(0.10, min(1.0, int(self.config.get("font_opacity", 100)) / 100.0))
         if self.config.get("text_shadow", False):
             lum = rgb_luminance(rgb)
-            s_rgb = (0.0, 0.0, 0.0, 0.85) if lum > 0.45 else (1.0, 1.0, 1.0, 0.85)
+            s_a = 0.85 * font_alpha
+            s_rgb = (0.0, 0.0, 0.0, s_a) if lum > 0.45 else (1.0, 1.0, 1.0, s_a)
             ctx.set_source_rgba(*s_rgb)
-            for dx, dy in ((-0.8, 0.0), (0.8, 0.0), (0.0, -0.8), (0.0, 0.8)):
+            for dx, dy in ((-0.9, 0.0), (0.9, 0.0), (0.0, -0.9), (0.0, 0.9)):
                 ctx.move_to(x + dx, y + dy)
                 ctx.show_text(text)
-        ctx.set_source_rgba(rgb[0], rgb[1], rgb[2], 1.0)
+        ctx.set_source_rgba(rgb[0], rgb[1], rgb[2], font_alpha)
         ctx.move_to(x, y)
         ctx.show_text(text)
 
     def _on_draw(self, widget, ctx):
         alloc = widget.get_allocation()
         w, h = float(alloc.width), float(alloc.height)
-        pad_y = 1.0
-        bh = max(20.0, h - pad_y * 2)
-        bw = max(40.0, w - 2.0)
-        x, y = 1.0, pad_y
+        bh = max(20.0, h)
+        bw = max(40.0, w)
 
         bg_hex = self.config.get("badge_bg_color", "#182234")
-        bd_hex = self.config.get("badge_border_color", "#48b8fa")
         opacity = max(0, min(100, int(self.config.get("badge_bg_opacity", 90))))
         alpha = opacity / 100.0
         bg_rgb = hex_to_rgb(bg_hex, default=(0.094, 0.133, 0.204))
-        bd_rgb = hex_to_rgb(bd_hex, default=(0.282, 0.722, 0.980))
 
-        draw_rounded_rect(ctx, x + 0.5, y + 0.5, bw - 1.0, bh - 1.0, 4.5)
         if alpha > 0.0:
+            draw_rounded_rect(ctx, 0.0, 0.0, bw, bh, 4.0)
             ctx.set_source_rgba(bg_rgb[0], bg_rgb[1], bg_rgb[2], alpha)
-            ctx.fill_preserve()
-        ctx.set_source_rgba(bd_rgb[0], bd_rgb[1], bd_rgb[2], 0.92)
-        ctx.set_line_width(1.2)
-        ctx.stroke()
+            ctx.fill()
 
         # Text color
         if self.config.get("font_color_mode", "dynamic") == "custom":
@@ -1151,24 +1241,21 @@ class ClockWeatherWidget(Gtk.EventBox):
             is_light = opacity >= 30 and rgb_luminance(bg_rgb) > 0.55
             fg_rgb = (0.07, 0.09, 0.15) if is_light else (0.95, 0.98, 1.00)
 
-        cur_x = x + 7.0
+        cur_x = 4.0
         if self.config.get("show_weather_icon", True):
             cur = (self.weather_data or {}).get("current") or {}
             _desc, icon_name = wmo_to_info(cur.get("code", 0), is_day=cur.get("is_day", True))
-            icon_sz = max(14, min(28, int(bh - 4)))
+            icon_sz = max(16, min(36, int(bh - 2)))
             pb = self.get_weather_pixbuf(icon_name, icon_sz)
             if pb is not None:
-                iy = y + (bh - icon_sz) / 2.0
+                iy = (bh - icon_sz) / 2.0
                 Gdk.cairo_set_source_pixbuf(ctx, pb, cur_x, iy)
                 ctx.paint()
-            cur_x += icon_sz + 5.0
+            cur_x += icon_sz + 4.0
 
         txt = self._format_panel_text()
-        fs = max(10.0, min(18.0, h * 0.44))
-        ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-        ctx.set_font_size(fs)
-        ext = ctx.text_extents(txt)
-        ty = y + (bh - ext.height) / 2.0 - ext.y_bearing
+        _fs, ext = self._compute_panel_font_size(ctx, txt, bh)
+        ty = (bh - ext.height) / 2.0 - ext.y_bearing
         self._draw_styled_text(ctx, cur_x - ext.x_bearing, ty, txt, fg_rgb)
         return False
 
@@ -1322,22 +1409,44 @@ class ClockWeatherWidget(Gtk.EventBox):
         chk_row2.pack_start(spin_cal_fs, False, False, 0)
         outer.pack_start(chk_row2, False, False, 0)
 
-        wc_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        wc_row.set_margin_start(10)
-        chk_world = Gtk.CheckButton(label="顯示世界時鐘：")
+        wc_hdr_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        wc_hdr_row.set_margin_start(10)
+        chk_world = Gtk.CheckButton(label="在天氣月曆底部顯示世界時鐘（自行勾選城市）：")
         chk_world.set_active(self.config.get("show_world_clock", True))
-        entry_world = Gtk.Entry()
-        entry_world.set_hexpand(True)
-        entry_world.set_text(self.config.get("world_clocks", "Asia/Tokyo, Europe/London, America/New_York"))
-        wc_row.pack_start(chk_world, False, False, 0)
-        wc_row.pack_start(entry_world, True, True, 0)
-        outer.pack_start(wc_row, False, False, 0)
+        wc_hdr_row.pack_start(chk_world, False, False, 0)
+        outer.pack_start(wc_hdr_row, False, False, 0)
+
+        raw_wc = self.config.get("world_clocks", "Asia/Tokyo, Europe/London, America/New_York")
+        cur_wc_list = [s.strip() for s in raw_wc.split(",") if s.strip()]
+        cur_wc_set = set(cur_wc_list)
+        preset_tz_set = {tz for _, tz in WORLD_CLOCK_PRESETS}
+        custom_wc_list = [tz for tz in cur_wc_list if tz not in preset_tz_set]
+
+        wc_grid = Gtk.Grid(column_spacing=12, row_spacing=2)
+        wc_grid.set_margin_start(24)
+        wc_checkboxes = []
+        for idx, (label, tz_id) in enumerate(WORLD_CLOCK_PRESETS):
+            cb = Gtk.CheckButton(label=label)
+            cb.set_active(tz_id in cur_wc_set)
+            wc_grid.attach(cb, idx % 4, idx // 4, 1, 1)
+            wc_checkboxes.append((cb, tz_id))
+        outer.pack_start(wc_grid, False, False, 0)
+
+        wc_custom_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        wc_custom_row.set_margin_start(24)
+        wc_custom_row.pack_start(Gtk.Label(label="其他自訂時區 (IANA)：", xalign=0.0), False, False, 0)
+        entry_world_custom = Gtk.Entry()
+        entry_world_custom.set_hexpand(True)
+        entry_world_custom.set_placeholder_text("選填，逗號分隔，如 Asia/Kolkata, Pacific/Auckland")
+        entry_world_custom.set_text(", ".join(custom_wc_list))
+        wc_custom_row.pack_start(entry_world_custom, True, True, 0)
+        outer.pack_start(wc_custom_row, False, False, 0)
 
         outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
-        # 3. Panel Appearance (Custom BG / Border / Opacity / Font Color / Shadow)
+        # 3. Panel Appearance (Custom BG / Font Color / Font Opacity / Shadow — Borderless)
         s3 = Gtk.Label(xalign=0.0)
-        s3.set_markup("<b>3. 面板方塊底色、外框、透明度與字色設定</b>")
+        s3.set_markup("<b>3. 面板背景底色、文字顏色與透明度設定</b>")
         outer.pack_start(s3, False, False, 0)
 
         def make_cbtn(key, default_hex):
@@ -1351,20 +1460,17 @@ class ClockWeatherWidget(Gtk.EventBox):
         bg_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         bg_row.set_margin_start(10)
         bg_btn = make_cbtn("badge_bg_color", "#182234")
-        bd_btn = make_cbtn("badge_border_color", "#48b8fa")
         scale_op = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 100.0, 2.0)
         scale_op.set_digits(0)
         scale_op.set_draw_value(False)
-        scale_op.set_size_request(110, -1)
+        scale_op.set_size_request(140, -1)
         init_op = max(0, min(100, int(self.config.get("badge_bg_opacity", 90))))
         scale_op.set_value(float(init_op))
         lbl_op = Gtk.Label(label=f"{init_op}%")
         lbl_op.set_width_chars(4)
-        bg_row.pack_start(Gtk.Label(label="底色：", xalign=0.0), False, False, 0)
+        bg_row.pack_start(Gtk.Label(label="背景底色：", xalign=0.0), False, False, 0)
         bg_row.pack_start(bg_btn, False, False, 0)
-        bg_row.pack_start(Gtk.Label(label="外框：", xalign=0.0), False, False, 0)
-        bg_row.pack_start(bd_btn, False, False, 0)
-        bg_row.pack_start(Gtk.Label(label="透明度：", xalign=0.0), False, False, 0)
+        bg_row.pack_start(Gtk.Label(label="背景透明度：", xalign=0.0), False, False, 0)
         bg_row.pack_start(scale_op, True, True, 0)
         bg_row.pack_start(lbl_op, False, False, 0)
         outer.pack_start(bg_row, False, False, 0)
@@ -1386,6 +1492,21 @@ class ClockWeatherWidget(Gtk.EventBox):
         fc_row.pack_end(chk_shadow, False, False, 0)
         outer.pack_start(fc_row, False, False, 0)
 
+        fop_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        fop_row.set_margin_start(10)
+        scale_font_op = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 10.0, 100.0, 2.0)
+        scale_font_op.set_digits(0)
+        scale_font_op.set_draw_value(False)
+        scale_font_op.set_size_request(140, -1)
+        init_fop = max(10, min(100, int(self.config.get("font_opacity", 100))))
+        scale_font_op.set_value(float(init_fop))
+        lbl_font_op = Gtk.Label(label=f"{init_fop}%")
+        lbl_font_op.set_width_chars(4)
+        fop_row.pack_start(Gtk.Label(label="文字透明度：", xalign=0.0), False, False, 0)
+        fop_row.pack_start(scale_font_op, True, True, 0)
+        fop_row.pack_start(lbl_font_op, False, False, 0)
+        outer.pack_start(fop_row, False, False, 0)
+
         lbl_status = Gtk.Label(xalign=0.0)
         lbl_status.set_markup("<small><span foreground='#94a3b8'>所有變更即時套用至 MATE Panel。</span></small>")
         outer.pack_start(lbl_status, False, False, 0)
@@ -1405,14 +1526,20 @@ class ClockWeatherWidget(Gtk.EventBox):
             self.config["use_24h"] = chk_24h.get_active()
             self.config["calendar_font_size"] = int(spin_cal_fs.get_value_as_int())
             self.config["show_world_clock"] = chk_world.get_active()
-            self.config["world_clocks"] = entry_world.get_text().strip()
+            sel_wc = [tz for cb, tz in wc_checkboxes if cb.get_active()]
+            for ex in [s.strip() for s in entry_world_custom.get_text().split(",") if s.strip()]:
+                if ex not in sel_wc:
+                    sel_wc.append(ex)
+            self.config["world_clocks"] = ", ".join(sel_wc)
             self.config["badge_bg_color"] = rgba_to_hex(bg_btn.get_rgba())
-            self.config["badge_border_color"] = rgba_to_hex(bd_btn.get_rgba())
             op_v = max(0, min(100, int(round(scale_op.get_value()))))
             self.config["badge_bg_opacity"] = op_v
             lbl_op.set_text(f"{op_v}%")
             self.config["font_color_mode"] = "dynamic" if rb_fc_dyn.get_active() else "custom"
             self.config["custom_font_color"] = rgba_to_hex(fc_btn.get_rgba())
+            fop_v = max(10, min(100, int(round(scale_font_op.get_value()))))
+            self.config["font_opacity"] = fop_v
+            lbl_font_op.set_text(f"{fop_v}%")
             self.config["text_shadow"] = chk_shadow.get_active()
             self._save_config()
             self._sync_weather_timer()
@@ -1499,10 +1626,13 @@ class ClockWeatherWidget(Gtk.EventBox):
             ),
         )
         bg_btn.connect("color-set", apply_all)
-        bd_btn.connect("color-set", apply_all)
         fc_btn.connect("color-set", lambda *_: (rb_fc_cus.set_active(True), apply_all()))
         scale_op.connect("value-changed", apply_all)
-        entry_world.connect("activate", apply_all)
+        scale_font_op.connect("value-changed", apply_all)
+        entry_world_custom.connect("activate", apply_all)
+        entry_world_custom.connect("focus-out-event", lambda *_: (apply_all(), False)[1])
+        for cb, _tz in wc_checkboxes:
+            cb.connect("toggled", apply_all)
         for w in (chk_w_icon, chk_w_temp, chk_date, chk_wd, chk_24h, chk_world, rb_fc_dyn, rb_fc_cus, chk_shadow):
             w.connect("toggled", apply_all)
         for sp in (spin_interval, spin_cal_fs):
