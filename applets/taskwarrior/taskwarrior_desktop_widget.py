@@ -18,11 +18,13 @@ Features:
 
 import calendar
 from datetime import date, datetime, timedelta
+import glob
 import html
 import json
 import math
 import os
 import signal
+import subprocess
 import sys
 
 import gi
@@ -34,12 +36,13 @@ import cairo
 _COMMON_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "common"))
 if _COMMON_DIR not in sys.path:
     sys.path.insert(0, _COMMON_DIR)
-from taskwarrior_shared import TaskwarriorBackend
+from taskwarrior_shared import TaskwarriorBackend, parse_tw_timestamp
 
 CONFIG_DIR = os.path.expanduser("~/.config/matepanel-applet-plus")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "taskwarrior-desktop.json")
 TASK_COLORS_PATH = os.path.join(CONFIG_DIR, "task-colors.json")
 WEATHER_CACHE_PATH = os.path.join(CONFIG_DIR, "weather-cache.json")
+BACKUP_DIR = os.path.join(CONFIG_DIR, "backups")
 AUTOSTART_PATH = os.path.expanduser("~/.config/autostart/taskwarrior-desktop-calendar.desktop")
 
 
@@ -97,10 +100,10 @@ TASK_COLOR_PRESETS = [
 ]
 
 DEFAULT_CONFIG = {
-    "x": 80,
-    "y": 60,
-    "width": 940,
-    "height": 620,
+    "x": 457,
+    "y": 51,
+    "width": 1419,
+    "height": 956,
     "mini_x": None,
     "mini_y": None,
     "locked": False,
@@ -109,11 +112,19 @@ DEFAULT_CONFIG = {
     "cell_opacity": 42,         # 0..100% 日期格子底色透明度
     "today_bg_color": "#1a5c4d",        # 今日日期背景顏色
     "today_border_color": "#38e0a6",    # 今日日期邊框顏色
-    "cur_month_bg_color": "#141f2e",    # 本月日期背景顏色
-    "other_month_bg_color": "#0d141f",  # 非本月日期背景顏色
+    "cur_month_bg_color": "#393939",    # 本月日期背景顏色
+    "other_month_bg_color": "#000000",  # 非本月日期背景顏色
     "fg_color": "#f1f5f9",      # 文字顏色
     "text_shadow": True,        # 透明背景時文字陰影增強可讀性
-    "font_size": 11,            # 9..18
+    "font_size": 18,            # 9..24 介面字型大小（頂部列、星期列、日期數字、天氣）
+    "task_font_size": 18,       # 6..28 任務膠囊全域預設字型大小
+    "detail_font_size": 16,     # 9..24 詳細任務內容視窗字型大小
+    "task_columns": 1,          # 1 = 全域預設單欄, 2 = 全域預設垂直分割成兩列
+    "date_cell_overrides": {},  # 單日獨立排版覆寫: {"YYYY-MM-DD": {"task_columns": 2, "task_font_size": 9}}
+    "retention_days": 180,      # 啟動時保留天數（0 = 不自動刪除；>0 時清理超過此天數的任務與單日設定）
+    "auto_backup_enabled": True,   # 每日自動備份（保留最近 3 天）
+    "auto_backup_keep_days": 3,    # 自動備份保留份數（預設最近 3 天）
+    "auto_shrink_task_font": True,  # 當任務超過日期框大小時，自動縮小任務字型以完整顯示
     "show_completed": True,     # 在日期格子內顯示已完成任務
     "show_weather": True,       # 在日期列顯示 7 天天氣預報
     "due_soon_days": 3,
@@ -228,7 +239,7 @@ class MiniDesktopIconWindow(Gtk.Window):
         self.parent_cal = parent_cal
         self.set_title("Taskwarrior Desktop Icon")
         self.set_decorated(False)
-        self.set_type_hint(Gdk.WindowTypeHint.DESKTOP)
+        self.set_type_hint(Gdk.WindowTypeHint.DOCK)
         self.set_keep_below(True)
         self.set_skip_taskbar_hint(True)
         self.set_skip_pager_hint(True)
@@ -414,7 +425,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self.set_title("Taskwarrior Desktop Calendar")
         self.set_decorated(False)
-        self.set_type_hint(Gdk.WindowTypeHint.DESKTOP)
+        self.set_type_hint(Gdk.WindowTypeHint.DOCK)
         self.set_keep_below(True)
         self.set_skip_taskbar_hint(True)
         self.set_skip_pager_hint(True)
@@ -427,6 +438,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         self.icon_theme = Gtk.IconTheme.get_default()
         self._icon_cache = {}
         self.prefs_win = None
+        self._detail_rebuilders = []
 
         today = date.today()
         self.view_year = today.year
@@ -446,6 +458,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         self._config_monitor = None
         self._config_debounce_id = None
         self._geom_save_id = None
+        self._backup_timer_id = None
         self._is_minimized = False
         self._is_maximized = False
         self._pre_max_geom = None
@@ -488,8 +501,11 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         self.resize(w, h)
         self.move(x, y)
 
+        self._run_auto_backup_if_needed()
+        self._run_startup_cleanup()
         self._start_file_monitor()
         self._start_config_monitor()
+        self._backup_timer_id = GLib.timeout_add_seconds(3600, self._on_auto_backup_timer)
         self.reload_tasks()
         self.show_all()
         # Re-assert desktop layer hints after map (Compiz friendly)
@@ -519,6 +535,515 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
                 json.dump(self.config, f, indent=2, ensure_ascii=False)
         except Exception:
             pass
+
+    def _run_startup_cleanup(self):
+        """
+        Run ONCE on widget startup when retention_days > 0:
+        1. Remove expired date_cell_overrides (< today - retention_days) from taskwarrior-desktop.json.
+        2. Remove expired Taskwarrior tasks (including completed, deleted, pending, waiting, recurring)
+           older than retention_days via official `task` CLI (`delete` -> `purge`), and prune their
+           UUIDs from task-colors.json.
+        When retention_days == 0, performs NO deletion at all.
+        """
+        try:
+            days = int(self.config.get("retention_days", 180))
+        except (TypeError, ValueError):
+            days = 180
+        if days <= 0:
+            return
+
+        cutoff_date = date.today() - timedelta(days=days)
+        cutoff_str = cutoff_date.strftime("%Y-%m-%d")
+
+        # 1. Clean expired date_cell_overrides in taskwarrior-desktop.json
+        overrides = self.config.get("date_cell_overrides")
+        if isinstance(overrides, dict) and overrides:
+            expired_keys = [k for k in list(overrides.keys()) if isinstance(k, str) and len(k) == 10 and k < cutoff_str]
+            if expired_keys:
+                for k in expired_keys:
+                    overrides.pop(k, None)
+                self._save_config()
+
+        # 2. Clean expired tasks in ~/.task via official Taskwarrior CLI
+        if not TaskwarriorBackend.is_available():
+            return
+        try:
+            proc = subprocess.run(
+                ["task", "rc.verbose=nothing", "export"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+            raw = (proc.stdout or "").strip()
+            if not raw:
+                return
+            all_tasks = json.loads(raw)
+            if not isinstance(all_tasks, list):
+                return
+        except Exception:
+            return
+
+        to_delete = []
+        to_purge = []
+        for t in all_tasks:
+            if not isinstance(t, dict):
+                continue
+            uid = str(t.get("uuid") or "").strip()
+            if not uid:
+                continue
+            status = str(t.get("status") or "").lower()
+            # Determine task's effective reference date
+            ref_dt = None
+            if status in ("completed", "deleted"):
+                for field in ("end", "due", "modified", "entry"):
+                    ref_dt = parse_tw_timestamp(t.get(field))
+                    if ref_dt is not None:
+                        break
+            else:
+                for field in ("due", "wait", "scheduled", "entry"):
+                    ref_dt = parse_tw_timestamp(t.get(field))
+                    if ref_dt is not None:
+                        break
+            if ref_dt is None:
+                continue
+            if ref_dt.date() < cutoff_date:
+                to_purge.append(uid)
+                if status != "deleted":
+                    to_delete.append(uid)
+
+        if not to_purge:
+            return
+
+        # Delete non-deleted tasks first (with recurrence confirmation disabled), then purge all expired UUIDs
+        try:
+            if to_delete:
+                subprocess.run(
+                    [
+                        "task",
+                        "rc.confirmation=no",
+                        "rc.recurrence.confirmation=no",
+                        "rc.bulk=0",
+                        "rc.verbose=nothing",
+                        ",".join(to_delete),
+                        "delete",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=15,
+                    check=False,
+                )
+            subprocess.run(
+                [
+                    "task",
+                    "rc.confirmation=no",
+                    "rc.bulk=0",
+                    "rc.verbose=nothing",
+                    ",".join(to_purge),
+                    "purge",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+                check=False,
+            )
+        except Exception:
+            pass
+
+        # Prune expired UUIDs from task-colors.json
+        color_changed = False
+        for uid in to_purge:
+            if uid in self.task_colors:
+                self.task_colors.pop(uid, None)
+                color_changed = True
+        if color_changed:
+            self._save_task_colors()
+
+    def _get_date_cell_settings(self, d_str):
+        """Return (task_font_size_float, task_columns_int, has_manual_fs) for a specific YYYY-MM-DD cell."""
+        g_fs = max(6, min(28, int(self.config.get("task_font_size", 10))))
+        g_cols = 2 if int(self.config.get("task_columns", 1)) >= 2 else 1
+        has_manual_fs = False
+        overrides = self.config.get("date_cell_overrides")
+        if isinstance(overrides, dict):
+            ov = overrides.get(d_str)
+            if isinstance(ov, dict):
+                if "task_font_size" in ov:
+                    try:
+                        g_fs = max(6, min(28, int(ov["task_font_size"])))
+                        has_manual_fs = True
+                    except (TypeError, ValueError):
+                        pass
+                if "task_columns" in ov:
+                    try:
+                        g_cols = 2 if int(ov["task_columns"]) >= 2 else 1
+                    except (TypeError, ValueError):
+                        pass
+        return float(g_fs), g_cols, has_manual_fs
+
+    def _set_date_cell_override(self, d_str, key, val):
+        """Set a per-date override; automatically prune if it matches global default."""
+        overrides = self.config.setdefault("date_cell_overrides", {})
+        if not isinstance(overrides, dict):
+            overrides = {}
+            self.config["date_cell_overrides"] = overrides
+        g_default = (
+            (2 if int(self.config.get("task_columns", 1)) >= 2 else 1)
+            if key == "task_columns"
+            else max(6, min(28, int(self.config.get("task_font_size", 10))))
+        )
+        ov = overrides.get(d_str)
+        if not isinstance(ov, dict):
+            ov = {}
+        if val == g_default:
+            ov.pop(key, None)
+        else:
+            ov[key] = val
+        if ov:
+            overrides[d_str] = ov
+        else:
+            overrides.pop(d_str, None)
+        self._save_config()
+        self._refresh_view()
+
+    def _reset_date_cell_override(self, d_str):
+        overrides = self.config.get("date_cell_overrides")
+        if isinstance(overrides, dict) and d_str in overrides:
+            overrides.pop(d_str, None)
+            self._save_config()
+            self._refresh_view()
+
+    def _reset_all_date_overrides(self, *_args):
+        if self.config.get("date_cell_overrides"):
+            self.config["date_cell_overrides"] = {}
+            self._save_config()
+            self._refresh_view()
+
+    # =========================================================================
+    # Backup Bundle Export / Import & Rolling 3-Day Automatic Backup
+    # =========================================================================
+
+    def _export_all_tasks_raw(self):
+        if not TaskwarriorBackend.is_available():
+            return []
+        try:
+            proc = subprocess.run(
+                ["task", "rc.verbose=nothing", "export"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            raw = (proc.stdout or "").strip()
+            if not raw:
+                return []
+            data = json.loads(raw)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _build_backup_bundle(self):
+        tasks = self._export_all_tasks_raw()
+        return {
+            "format": "matepanel-taskwarrior-bundle",
+            "version": 1,
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "desktop_config": dict(self.config),
+            "task_colors": dict(self.task_colors),
+            "tasks": tasks,
+        }
+
+    def _write_backup_bundle(self, filepath):
+        try:
+            parent = os.path.dirname(os.path.abspath(filepath))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            bundle = self._build_backup_bundle()
+            tmp_path = filepath + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(bundle, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, filepath)
+            return True, len(bundle["tasks"]), ""
+        except Exception as e:
+            return False, 0, str(e)
+
+    def _run_auto_backup_if_needed(self):
+        """Maintain rolling daily backups (default: newest 3 days) in BACKUP_DIR."""
+        if not self.config.get("auto_backup_enabled", True):
+            return
+        try:
+            keep_days = max(1, int(self.config.get("auto_backup_keep_days", 3)))
+        except (TypeError, ValueError):
+            keep_days = 3
+
+        today_str = date.today().strftime("%Y-%m-%d")
+        today_file = os.path.join(BACKUP_DIR, f"auto-backup-{today_str}.json")
+        if not os.path.isfile(today_file):
+            ok, _cnt, _err = self._write_backup_bundle(today_file)
+            if not ok:
+                return
+
+        # Rotate: keep only the newest `keep_days` auto-backup files, delete oldest beyond limit
+        try:
+            files = sorted(glob.glob(os.path.join(BACKUP_DIR, "auto-backup-????-??-??.json")), reverse=True)
+            for old_f in files[keep_days:]:
+                try:
+                    os.remove(old_f)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _on_auto_backup_timer(self):
+        self._run_auto_backup_if_needed()
+        return True
+
+    def _clamp_geometry_to_workarea(self):
+        """Ensure imported x/y/width/height and mini_x/mini_y stay inside current screen workarea."""
+        display = Gdk.Display.get_default()
+        if display is None:
+            return
+        gdk_win = self.get_window()
+        mon = display.get_monitor_at_window(gdk_win) if gdk_win is not None else display.get_primary_monitor()
+        if mon is None and display.get_n_monitors() > 0:
+            mon = display.get_monitor(0)
+        if mon is None:
+            return
+        wa = mon.get_workarea()
+        if wa.width <= 0 or wa.height <= 0:
+            return
+
+        w = max(520, min(int(wa.width), int(self.config.get("width", 940))))
+        h = max(380, min(int(wa.height), int(self.config.get("height", 620))))
+        x = max(int(wa.x), min(int(wa.x + wa.width - w), int(self.config.get("x", wa.x + 40))))
+        y = max(int(wa.y), min(int(wa.y + wa.height - h), int(self.config.get("y", wa.y + 40))))
+        self.config["x"] = x
+        self.config["y"] = y
+        self.config["width"] = w
+        self.config["height"] = h
+
+        mx = self.config.get("mini_x")
+        my = self.config.get("mini_y")
+        if mx is not None and my is not None:
+            sz = MiniDesktopIconWindow.ICON_SIZE
+            self.config["mini_x"] = max(int(wa.x), min(int(wa.x + wa.width - sz), int(mx)))
+            self.config["mini_y"] = max(int(wa.y), min(int(wa.y + wa.height - sz), int(my)))
+
+    def _show_info_dialog(self, title, text, msg_type=Gtk.MessageType.INFO):
+        md = Gtk.MessageDialog(
+            transient_for=None,
+            flags=Gtk.DialogFlags.MODAL,
+            message_type=msg_type,
+            buttons=Gtk.ButtonsType.OK,
+            text=title,
+        )
+        md.format_secondary_text(text)
+        md.set_position(Gtk.WindowPosition.CENTER)
+        md.set_keep_above(True)
+        md.run()
+        md.destroy()
+
+    def _open_export_dialog(self, *_args):
+        dlg = Gtk.FileChooserDialog(
+            title="匯出 Taskwarrior 任務與桌面月曆設定",
+            transient_for=None,
+            action=Gtk.FileChooserAction.SAVE,
+        )
+        dlg.set_position(Gtk.WindowPosition.CENTER)
+        dlg.set_keep_above(True)
+        dlg.set_do_overwrite_confirmation(True)
+        dlg.add_button("取消", Gtk.ResponseType.CANCEL)
+        dlg.add_button("匯出", Gtk.ResponseType.ACCEPT)
+        dlg.set_current_name(f"taskwarrior-backup-{date.today().strftime('%Y-%m-%d')}.json")
+        flt = Gtk.FileFilter()
+        flt.set_name("Taskwarrior 備份封包 (*.json)")
+        flt.add_pattern("*.json")
+        dlg.add_filter(flt)
+
+        if dlg.run() == Gtk.ResponseType.ACCEPT:
+            path = dlg.get_filename()
+            dlg.destroy()
+            if path:
+                if not path.endswith(".json"):
+                    path += ".json"
+                ok, n_tasks, err = self._write_backup_bundle(path)
+                if ok:
+                    self._show_info_dialog(
+                        "匯出成功",
+                        f"已將 {n_tasks} 筆任務、{len(self.task_colors)} 筆任務顏色與完整桌面設定匯出至：\n{path}",
+                    )
+                else:
+                    self._show_info_dialog("匯出失敗", err, Gtk.MessageType.ERROR)
+        else:
+            dlg.destroy()
+
+    def _open_import_dialog(self, *_args):
+        dlg = Gtk.FileChooserDialog(
+            title="匯入 Taskwarrior 任務與桌面月曆設定",
+            transient_for=None,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dlg.set_position(Gtk.WindowPosition.CENTER)
+        dlg.set_keep_above(True)
+        dlg.add_button("取消", Gtk.ResponseType.CANCEL)
+        dlg.add_button("下一步", Gtk.ResponseType.ACCEPT)
+        if os.path.isdir(BACKUP_DIR):
+            dlg.set_current_folder(BACKUP_DIR)
+        flt = Gtk.FileFilter()
+        flt.set_name("Taskwarrior 備份封包 (*.json)")
+        flt.add_pattern("*.json")
+        dlg.add_filter(flt)
+
+        if dlg.run() != Gtk.ResponseType.ACCEPT:
+            dlg.destroy()
+            return
+        path = dlg.get_filename()
+        dlg.destroy()
+        if not path or not os.path.isfile(path):
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                bundle = json.load(f)
+            if not isinstance(bundle, dict) or bundle.get("format") != "matepanel-taskwarrior-bundle":
+                raise ValueError("檔案格式不符（非 matepanel-taskwarrior-bundle 備份檔）")
+        except Exception as e:
+            self._show_info_dialog("無法讀取備份檔", str(e), Gtk.MessageType.ERROR)
+            return
+
+        b_tasks = bundle.get("tasks") if isinstance(bundle.get("tasks"), list) else []
+        b_colors = bundle.get("task_colors") if isinstance(bundle.get("task_colors"), dict) else {}
+        b_cfg = bundle.get("desktop_config") if isinstance(bundle.get("desktop_config"), dict) else {}
+        b_ov = b_cfg.get("date_cell_overrides") if isinstance(b_cfg.get("date_cell_overrides"), dict) else {}
+        exp_at = str(bundle.get("exported_at") or "未知時間")
+
+        cdlg = Gtk.Dialog(title="確認匯入備份封包", transient_for=None, flags=Gtk.DialogFlags.MODAL)
+        cdlg.set_position(Gtk.WindowPosition.CENTER)
+        cdlg.set_keep_above(True)
+        cdlg.add_button("取消", Gtk.ResponseType.CANCEL)
+        cdlg.add_button("開始匯入", Gtk.ResponseType.OK)
+        cdlg.set_default_response(Gtk.ResponseType.OK)
+
+        area = cdlg.get_content_area()
+        area.set_spacing(8)
+        area.set_margin_top(12)
+        area.set_margin_bottom(12)
+        area.set_margin_start(14)
+        area.set_margin_end(14)
+
+        lbl_sum = Gtk.Label(xalign=0.0)
+        lbl_sum.set_markup(
+            f"<b>備份檔案：</b>{html.escape(os.path.basename(path))}\n"
+            f"<b>匯出時間：</b>{html.escape(exp_at)}\n"
+            f"<b>包含內容：</b>{len(b_tasks)} 筆任務、{len(b_colors)} 筆任務顏色、{len(b_ov)} 筆單日排版設定"
+        )
+        area.pack_start(lbl_sum, False, False, 0)
+
+        rb_merge = Gtk.RadioButton.new_with_label_from_widget(
+            None, "合併匯入（推薦：保留本機其他任務，同 UUID 自動更新並合併顏色與設定）"
+        )
+        rb_replace = Gtk.RadioButton.new_with_label_from_widget(
+            rb_merge, "完整覆蓋還原（先清空本機 ~/.task 與設定，再完全還原此備份檔）"
+        )
+        rb_merge.set_active(True)
+        area.pack_start(rb_merge, False, False, 0)
+        area.pack_start(rb_replace, False, False, 0)
+
+        chk_apply_geom = Gtk.CheckButton(label="同時套用備份中的視窗位置與大小（自動夾限至目前螢幕範圍）")
+        chk_apply_geom.set_active(True)
+        area.pack_start(chk_apply_geom, False, False, 0)
+
+        cdlg.show_all()
+        resp = cdlg.run()
+        is_replace = rb_replace.get_active()
+        apply_geom = chk_apply_geom.get_active()
+        cdlg.destroy()
+        if resp != Gtk.ResponseType.OK:
+            return
+
+        # 1. Import Taskwarrior tasks via official CLI
+        imported_ok = True
+        err_detail = ""
+        if TaskwarriorBackend.is_available():
+            try:
+                if is_replace:
+                    existing = self._export_all_tasks_raw()
+                    ex_del = [str(t["uuid"]) for t in existing if isinstance(t, dict) and t.get("uuid") and str(t.get("status", "")).lower() != "deleted"]
+                    ex_all = [str(t["uuid"]) for t in existing if isinstance(t, dict) and t.get("uuid")]
+                    if ex_del:
+                        subprocess.run(
+                            ["task", "rc.confirmation=no", "rc.recurrence.confirmation=no", "rc.bulk=0", "rc.verbose=nothing", ",".join(ex_del), "delete"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15, check=False,
+                        )
+                    if ex_all:
+                        subprocess.run(
+                            ["task", "rc.confirmation=no", "rc.bulk=0", "rc.verbose=nothing", ",".join(ex_all), "purge"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15, check=False,
+                        )
+                if b_tasks:
+                    proc = subprocess.run(
+                        ["task", "rc.verbose=nothing", "import"],
+                        input=json.dumps(b_tasks, ensure_ascii=False),
+                        text=True,
+                        capture_output=True,
+                        timeout=20,
+                        check=False,
+                    )
+                    if proc.returncode != 0:
+                        imported_ok = False
+                        err_detail = (proc.stderr or proc.stdout or "").strip()
+            except Exception as e:
+                imported_ok = False
+                err_detail = str(e)
+
+        # 2. Import task_colors
+        clean_colors = {str(k): str(v) for k, v in b_colors.items() if isinstance(v, str) and v.startswith("#")}
+        if is_replace:
+            self.task_colors = clean_colors
+        else:
+            self.task_colors.update(clean_colors)
+        self._save_task_colors()
+
+        # 3. Import desktop_config
+        geom_keys = {"x", "y", "width", "height", "mini_x", "mini_y"}
+        if is_replace:
+            new_cfg = dict(DEFAULT_CONFIG)
+            for k, v in b_cfg.items():
+                if not apply_geom and k in geom_keys:
+                    new_cfg[k] = self.config.get(k, new_cfg.get(k))
+                else:
+                    new_cfg[k] = v
+            self.config = new_cfg
+        else:
+            merged_ov = dict(self.config.get("date_cell_overrides") or {})
+            merged_ov.update(b_ov)
+            for k, v in b_cfg.items():
+                if k == "date_cell_overrides":
+                    continue
+                if not apply_geom and k in geom_keys:
+                    continue
+                self.config[k] = v
+            self.config["date_cell_overrides"] = merged_ov
+
+        self._clamp_geometry_to_workarea()
+        self._save_config()
+
+        if apply_geom and not self._is_minimized and not self._is_maximized:
+            self.resize(int(self.config["width"]), int(self.config["height"]))
+            self.move(int(self.config["x"]), int(self.config["y"]))
+
+        self.reload_tasks()
+        if imported_ok:
+            self._show_info_dialog(
+                "匯入完成",
+                f"已成功匯入 {len(b_tasks)} 筆任務、{len(clean_colors)} 筆任務顏色與桌面月曆設定！",
+            )
+        else:
+            self._show_info_dialog(
+                "設定已匯入，但任務匯入出現警告",
+                err_detail or "請確認 Taskwarrior (`task`) 狀態。",
+                Gtk.MessageType.WARNING,
+            )
 
     def _load_task_colors(self):
         if os.path.exists(TASK_COLORS_PATH):
@@ -755,7 +1280,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
                 self._start_manual_drag(edge, event.x_root, event.y_root)
                 return True
         if event.button == 3:
-            self._show_context_menu(event)
+            self._show_context_menu(event, clicked_date=None)
             return True
         return False
 
@@ -813,7 +1338,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
             self._start_manual_drag("move", event.x_root, event.y_root)
             return True
         if event.button == 3:
-            self._show_context_menu(event)
+            self._show_context_menu(event, clicked_date=None)
             return True
         return False
 
@@ -1117,7 +1642,10 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         cur_m_bg_rgb = hex_to_rgb(self.config.get("cur_month_bg_color", "#141f2e"), default=(0.08, 0.12, 0.18))
         other_m_bg_rgb = hex_to_rgb(self.config.get("other_month_bg_color", "#0d141f"), default=(0.05, 0.08, 0.12))
         cell_a = max(0.0, min(1.0, float(self.config.get("cell_opacity", 42)) / 100.0))
-        base_fs = float(max(9, min(18, int(self.config.get("font_size", 11)))))
+        base_fs = float(max(9, min(24, int(self.config.get("font_size", 11)))))
+        task_fs = float(max(6, min(28, int(self.config.get("task_font_size", 10)))))
+        task_cols_cfg = 2 if int(self.config.get("task_columns", 1)) >= 2 else 1
+        auto_shrink = bool(self.config.get("auto_shrink_task_font", True))
         show_comp = bool(self.config.get("show_completed", True))
         show_weather = bool(self.config.get("show_weather", True))
         use_shadow = bool(self.config.get("text_shadow", True))
@@ -1146,7 +1674,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         self._cell_rects = []
         self._task_hit_rects = []
 
-        pill_fs = max(8.5, base_fs - 1.2)
+        pill_fs = task_fs
         pill_h = max(14.0, pill_fs + 5.0)
         pill_gap = 2.5
 
@@ -1325,21 +1853,55 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
             if not combined:
                 continue
 
-            cur_y = cy + base_fs + 7.0
-            avail_h = (cy + ch - 3.0) - cur_y
-            if avail_h < pill_h:
+            start_y = cy + base_fs + 7.0
+            avail_h = (cy + ch - 3.0) - start_y
+            d_task_fs, d_task_cols, has_manual_fs = self._get_date_cell_settings(d_str)
+            c_pill_fs = d_task_fs
+            c_pill_h = max(12.0, c_pill_fs + 5.0)
+            c_pill_gap = pill_gap
+            n_items = len(combined)
+            n_cols = 2 if (d_task_cols == 2 and cw >= 92.0) else 1
+            rows_needed = (n_items + n_cols - 1) // n_cols
+
+            if auto_shrink and not has_manual_fs and rows_needed > 0 and avail_h > 0.0:
+                needed_h = rows_needed * c_pill_h + max(0, rows_needed - 1) * c_pill_gap
+                if needed_h > avail_h:
+                    c_pill_gap = 1.5 if rows_needed <= 8 else 1.0
+                    slot_h = (avail_h - max(0, rows_needed - 1) * c_pill_gap) / float(rows_needed)
+                    min_pill_h = 9.0
+                    if slot_h >= min_pill_h:
+                        c_pill_h = slot_h
+                        c_pill_fs = max(6.0, min(d_task_fs, c_pill_h - 3.2))
+                    else:
+                        c_pill_h = min_pill_h
+                        c_pill_fs = 6.0
+
+            if avail_h < c_pill_h:
                 continue
 
-            max_slots = max(1, int((avail_h + pill_gap) // (pill_h + pill_gap)))
-            has_overflow = len(combined) > max_slots
-            draw_slots = max(1, max_slots - 1) if (has_overflow and max_slots >= 2) else max_slots
+            max_rows = max(1, int((avail_h + c_pill_gap + 0.01) // (c_pill_h + c_pill_gap)))
+            max_slots = max_rows * n_cols
+            has_overflow = n_items > max_slots
+            if has_overflow and max_rows >= 2:
+                draw_rows = max_rows - 1
+                draw_slots = draw_rows * n_cols
+            else:
+                draw_rows = max_rows
+                draw_slots = max_slots
+
+            col_gap = 3.0 if n_cols == 2 else 0.0
+            col_pw = (cw - 7.0 - col_gap) / float(n_cols)
 
             ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
-            ctx.set_font_size(pill_fs)
+            ctx.set_font_size(c_pill_fs)
 
-            for t, is_comp in combined[:draw_slots]:
-                px = cx + 3.5
-                pw = cw - 7.0
+            drawn_count = 0
+            for item_i, (t, is_comp) in enumerate(combined[:draw_slots]):
+                row_i = item_i // n_cols
+                col_i = item_i % n_cols
+                px = cx + 3.5 + col_i * (col_pw + col_gap)
+                py = start_y + row_i * (c_pill_h + c_pill_gap)
+                pw = col_pw
                 custom_hex = self.task_colors.get(t.get("uuid", ""))
                 txt_rgb = (1.0, 1.0, 1.0)
                 if custom_hex:
@@ -1368,30 +1930,31 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
                     pri_pfx = f"[{pri}] " if pri else ""
                     label_txt = pri_pfx + str(t.get("description", ""))
 
-                draw_rounded_rect(ctx, px, cur_y, pw, pill_h, 3.5)
+                draw_rounded_rect(ctx, px, py, pw, c_pill_h, min(3.5, c_pill_h / 3.0))
                 ctx.set_source_rgba(*p_bg)
                 ctx.fill()
 
-                disp = self._truncate_text(ctx, label_txt, max(12.0, pw - 8.0))
+                disp = self._truncate_text(ctx, label_txt, max(10.0, pw - 6.0))
                 ext = ctx.text_extents(disp)
-                ty = cur_y + (pill_h - ext.height) / 2.0 - ext.y_bearing
+                ty = py + (c_pill_h - ext.height) / 2.0 - ext.y_bearing
                 ctx.set_source_rgba(txt_rgb[0], txt_rgb[1], txt_rgb[2], 0.80 if is_comp else 0.98)
-                ctx.move_to(px + 4.0 - ext.x_bearing, ty)
+                ctx.move_to(px + 3.0 - ext.x_bearing, ty)
                 ctx.show_text(disp)
 
-                self._task_hit_rects.append((px, cur_y, pw, pill_h, t, is_comp))
-                cur_y += pill_h + pill_gap
+                self._task_hit_rects.append((px, py, pw, c_pill_h, t, is_comp))
+                drawn_count += 1
 
             if has_overflow:
-                rem = len(combined) - draw_slots
+                rem = n_items - drawn_count
                 more_s = f"+{rem} 更多..."
                 ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-                ctx.set_font_size(max(8.0, pill_fs - 0.5))
+                ctx.set_font_size(max(7.0, c_pill_fs - 0.5))
                 m_ext = ctx.text_extents(more_s)
+                more_y = start_y + draw_rows * (c_pill_h + c_pill_gap)
                 self._draw_text(
                     ctx,
                     cx + 5.0 - m_ext.x_bearing,
-                    min(cy + ch - 3.5, cur_y + m_ext.height + 1.0),
+                    min(cy + ch - 3.5, more_y + m_ext.height + 1.0),
                     more_s,
                     (0.55, 0.85, 1.0),
                     0.95,
@@ -1411,7 +1974,12 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
                 return True
 
         if event.button == 3:
-            self._show_context_menu(event)
+            clicked_date = None
+            for cx, cy, cw, ch, d_obj in self._cell_rects:
+                if cx <= event.x <= cx + cw and cy <= event.y <= cy + ch:
+                    clicked_date = d_obj
+                    break
+            self._show_context_menu(event, clicked_date=clicked_date)
             return True
 
         if event.button != 1:
@@ -1786,20 +2354,438 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
             TaskwarriorBackend.undo_last()
             self.reload_tasks()
 
-    def _show_context_menu(self, event):
+    def _toggle_task_columns(self, *_args):
+        cur = 2 if int(self.config.get("task_columns", 1)) >= 2 else 1
+        self.config["task_columns"] = 1 if cur == 2 else 2
+        self._save_config()
+        self._refresh_view()
+
+    def _adjust_task_font_size(self, delta):
+        cur = int(self.config.get("task_font_size", 10))
+        nxt = max(6, min(28, cur + int(delta)))
+        if nxt != cur:
+            self.config["task_font_size"] = nxt
+            self._save_config()
+            self._refresh_view()
+
+    def _format_tw_dt(self, raw_ts):
+        dt = parse_tw_timestamp(raw_ts)
+        if dt is None:
+            return ""
+        return dt.strftime("%Y-%m-%d %H:%M")
+
+    def _get_task_accent_hex(self, task, is_comp=False):
+        uid = str(task.get("uuid") or "")
+        custom_hex = self.task_colors.get(uid)
+        if custom_hex:
+            return custom_hex
+        if is_comp:
+            return "#10b981"
+        due_lvl = task.get("_due_level", "normal")
+        pri = task.get("priority", "")
+        if due_lvl == "crit" or pri == "H":
+            return "#dc2626"
+        if due_lvl == "warn" or pri == "M":
+            return "#d97706"
+        return "#2563eb"
+
+    def _open_day_detail_window(self, d_obj):
+        """Open a dedicated, resizable, scrollable detail window for all tasks on `d_obj`."""
+        win = Gtk.Window(title="任務詳細內容")
+        win.set_default_size(580, 480)
+        win.set_position(Gtk.WindowPosition.CENTER)
+        win.set_keep_above(True)
+
+        state = {"date": d_obj}
+
+        def _on_key(_w, ev):
+            if ev.keyval == Gdk.KEY_Escape:
+                win.destroy()
+                return True
+            return False
+
+        win.connect("key-press-event", _on_key)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        outer.set_margin_top(12)
+        outer.set_margin_bottom(12)
+        outer.set_margin_start(14)
+        outer.set_margin_end(14)
+
+        # Top header bar
+        hdr_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        btn_prev = Gtk.Button(label="◀ 前一天")
+        btn_next = Gtk.Button(label="後一天 ▶")
+        lbl_title = Gtk.Label(xalign=0.0)
+        lbl_title.set_margin_start(6)
+        btn_add = Gtk.Button(label="＋ 新增任務")
+        hdr_row.pack_start(btn_prev, False, False, 0)
+        hdr_row.pack_start(btn_next, False, False, 0)
+        hdr_row.pack_start(lbl_title, True, True, 0)
+        hdr_row.pack_end(btn_add, False, False, 0)
+        outer.pack_start(hdr_row, False, False, 0)
+
+        lbl_sub = Gtk.Label(xalign=0.0)
+        outer.pack_start(lbl_sub, False, False, 0)
+
+        sc = Gtk.ScrolledWindow()
+        sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        list_box.set_margin_top(4)
+        list_box.set_margin_bottom(4)
+        list_box.set_margin_end(6)
+        sc.add(list_box)
+        outer.pack_start(sc, True, True, 0)
+
+        btm = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_clear_day = Gtk.Button(label="🗑 清空當日任務")
+        btn_clear_day.set_tooltip_text("清空此日期的所有待辦與已完成任務（會先跳出確認視窗）")
+        btn_close = Gtk.Button(label="關閉 (Esc)")
+        btn_close.connect("clicked", lambda *_: win.destroy())
+        btm.pack_start(btn_clear_day, False, False, 0)
+        btm.pack_end(btn_close, False, False, 0)
+        outer.pack_end(btm, False, False, 0)
+
+        def rebuild():
+            cur_d = state["date"]
+            d_str = cur_d.strftime("%Y-%m-%d")
+            wd = self.WEEKDAYS_ZH[cur_d.weekday()]
+            dfs = max(9, min(24, int(self.config.get("detail_font_size", 12))))
+            title_sz = int((dfs + 2) * 1024)
+            body_sz = int(dfs * 1024)
+            meta_sz = int(max(8, dfs - 1.5) * 1024)
+
+            win.set_title(f"任務詳細內容 — {d_str} ({wd})")
+            lbl_title.set_markup(f"<span size='{title_sz}'><b>📅 {d_str}（{wd}）</b></span>")
+
+            p_list = list(self._by_date_pending.get(d_str, []))
+            c_list = list(self._by_date_completed.get(d_str, []))
+            btn_clear_day.set_label(f"🗑 清空當日任務（{len(p_list) + len(c_list)} 筆）")
+
+            sub_parts = [f"待辦 <b>{len(p_list)}</b> 筆 · 已完成 <b>{len(c_list)}</b> 筆"]
+            daily_map = (self.weather_data or {}).get("daily_by_date") or {}
+            day_fc = daily_map.get(d_str)
+            if isinstance(day_fc, dict):
+                tmax = day_fc.get("t_max")
+                tmin = day_fc.get("t_min")
+                pop = day_fc.get("precip_prob")
+                w_bits = []
+                if tmax is not None and tmin is not None:
+                    w_bits.append(f"{int(round(float(tmax)))}°/{int(round(float(tmin)))}°")
+                if pop is not None:
+                    w_bits.append(f"降雨 {int(round(float(pop)))}%")
+                if w_bits:
+                    sub_parts.append("天氣：" + " · ".join(w_bits))
+            lbl_sub.set_markup(f"<span size='{meta_sz}'>{'   |   '.join(sub_parts)}</span>")
+
+            for ch in list_box.get_children():
+                list_box.remove(ch)
+
+            def _add_card(task, is_comp):
+                uid = str(task.get("uuid") or "")
+                accent = self._get_task_accent_hex(task, is_comp=is_comp)
+                frame = Gtk.Frame()
+                frame.set_shadow_type(Gtk.ShadowType.ETCHED_IN)
+                hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+                hbox.set_margin_top(8)
+                hbox.set_margin_bottom(8)
+                hbox.set_margin_start(8)
+                hbox.set_margin_end(8)
+
+                # Vertical color bar
+                bar = Gtk.DrawingArea()
+                bar.set_size_request(5, -1)
+                bar_rgb = hex_to_rgb(accent, default=(0.15, 0.39, 0.92))
+
+                def _draw_bar(w_bar, ctx, rgb=bar_rgb):
+                    a = w_bar.get_allocation()
+                    draw_rounded_rect(ctx, 0, 0, max(2.0, float(a.width)), max(2.0, float(a.height)), 2.5)
+                    ctx.set_source_rgba(rgb[0], rgb[1], rgb[2], 0.95)
+                    ctx.fill()
+                    return False
+
+                bar.connect("draw", _draw_bar)
+                hbox.pack_start(bar, False, False, 0)
+
+                # Main text body
+                vcol = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+                desc_esc = html.escape(str(task.get("description", "")))
+                pri = str(task.get("priority") or "")
+                pri_badge = f"<span foreground='{accent}'><b>[{html.escape(pri)}]</b></span> " if pri else ""
+                status_txt = "已完成" if is_comp else ("逾期" if task.get("_due_level") == "crit" else "待辦")
+                title_lbl = Gtk.Label(xalign=0.0)
+                title_lbl.set_selectable(True)
+                title_lbl.set_line_wrap(True)
+                if is_comp:
+                    title_lbl.set_markup(
+                        f"<span size='{body_sz}'><s>{desc_esc}</s></span>  "
+                        f"<span size='{meta_sz}' foreground='#10b981'>[{status_txt}]</span>"
+                    )
+                else:
+                    title_lbl.set_markup(
+                        f"<span size='{body_sz}'>{pri_badge}<b>{desc_esc}</b></span>  "
+                        f"<span size='{meta_sz}' alpha='70%'>[{status_txt}]</span>"
+                    )
+                vcol.pack_start(title_lbl, False, False, 0)
+
+                meta = []
+                proj = str(task.get("project") or "").strip()
+                if proj:
+                    meta.append(f"專案：{proj}")
+                tags = task.get("tags") or []
+                if tags:
+                    meta.append("標籤：" + " ".join(f"+{t}" for t in tags))
+                due_s = self._format_tw_dt(task.get("due"))
+                if due_s:
+                    meta.append(f"到期：{due_s}")
+                entry_s = self._format_tw_dt(task.get("entry"))
+                if entry_s:
+                    meta.append(f"建立：{entry_s}")
+                if is_comp:
+                    end_s = self._format_tw_dt(task.get("end"))
+                    if end_s:
+                        meta.append(f"完成：{end_s}")
+                urg = task.get("urgency")
+                if urg is not None and not is_comp:
+                    try:
+                        meta.append(f"緊急度：{float(urg):.1f}")
+                    except (TypeError, ValueError):
+                        pass
+                if meta:
+                    meta_lbl = Gtk.Label(xalign=0.0)
+                    meta_lbl.set_selectable(True)
+                    meta_lbl.set_line_wrap(True)
+                    meta_lbl.set_markup(f"<span size='{meta_sz}' alpha='78%'>{html.escape('  |  '.join(meta))}</span>")
+                    vcol.pack_start(meta_lbl, False, False, 0)
+
+                anns = task.get("annotations") or []
+                if isinstance(anns, list) and anns:
+                    ann_lines = []
+                    for a in anns:
+                        if not isinstance(a, dict):
+                            continue
+                        a_ts = self._format_tw_dt(a.get("entry"))
+                        a_desc = str(a.get("description") or "").strip()
+                        if a_desc:
+                            ann_lines.append(f"  • [{a_ts}] {a_desc}" if a_ts else f"  • {a_desc}")
+                    if ann_lines:
+                        ann_lbl = Gtk.Label(xalign=0.0)
+                        ann_lbl.set_selectable(True)
+                        ann_lbl.set_line_wrap(True)
+                        ann_lbl.set_markup(
+                            f"<span size='{meta_sz}'><b>📝 註解：</b>\n{html.escape(chr(10).join(ann_lines))}</span>"
+                        )
+                        vcol.pack_start(ann_lbl, False, False, 0)
+
+                hbox.pack_start(vcol, True, True, 0)
+
+                # Action buttons
+                act_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+                act_box.set_valign(Gtk.Align.START)
+
+                btn_done = Gtk.Button(label="↩" if is_comp else "✓")
+                btn_done.set_tooltip_text("恢復為待辦" if is_comp else "標記為完成")
+                btn_done.set_relief(Gtk.ReliefStyle.NONE)
+                if is_comp:
+                    btn_done.connect("clicked", lambda *_, u=uid: (TaskwarriorBackend.restore_task(u), self.reload_tasks(), rebuild()))
+                else:
+                    btn_done.connect("clicked", lambda *_, u=uid: (TaskwarriorBackend.mark_done(u), self.reload_tasks(), rebuild()))
+
+                btn_edit = Gtk.Button(label="✎")
+                btn_edit.set_tooltip_text("編輯任務與顏色")
+                btn_edit.set_relief(Gtk.ReliefStyle.NONE)
+                btn_edit.connect("clicked", lambda *_, tk=task, ic=is_comp: (self._open_edit_dialog(tk, is_completed=ic), rebuild()))
+
+                btn_del = Gtk.Button(label="🗑")
+                btn_del.set_tooltip_text("刪除任務")
+                btn_del.set_relief(Gtk.ReliefStyle.NONE)
+                btn_del.connect("clicked", lambda *_, u=uid: (TaskwarriorBackend.delete_task(u), self.reload_tasks(), rebuild()))
+
+                act_box.pack_start(btn_done, False, False, 0)
+                act_box.pack_start(btn_edit, False, False, 0)
+                act_box.pack_start(btn_del, False, False, 0)
+                hbox.pack_end(act_box, False, False, 0)
+
+                frame.add(hbox)
+                list_box.pack_start(frame, False, False, 0)
+
+            if not p_list and not c_list:
+                empty_lbl = Gtk.Label(xalign=0.5)
+                empty_lbl.set_margin_top(30)
+                empty_lbl.set_markup(f"<span size='{body_sz}' alpha='65%'>這一天目前沒有任何待辦或已完成任務。</span>")
+                list_box.pack_start(empty_lbl, False, False, 0)
+            else:
+                if p_list:
+                    sh1 = Gtk.Label(xalign=0.0)
+                    sh1.set_markup(f"<span size='{body_sz}'><b>📌 待辦任務（{len(p_list)}）</b></span>")
+                    list_box.pack_start(sh1, False, False, 0)
+                    for t in p_list:
+                        _add_card(t, False)
+                if c_list:
+                    sh2 = Gtk.Label(xalign=0.0)
+                    sh2.set_margin_top(6 if p_list else 0)
+                    sh2.set_markup(f"<span size='{body_sz}'><b>✅ 已完成任務（{len(c_list)}）</b></span>")
+                    list_box.pack_start(sh2, False, False, 0)
+                    for t in c_list:
+                        _add_card(t, True)
+
+            list_box.show_all()
+
+        btn_prev.connect("clicked", lambda *_: (state.__setitem__("date", state["date"] - timedelta(days=1)), rebuild()))
+        btn_next.connect("clicked", lambda *_: (state.__setitem__("date", state["date"] + timedelta(days=1)), rebuild()))
+        btn_add.connect("clicked", lambda *_: (self._open_add_dialog(state["date"]), rebuild()))
+        btn_clear_day.connect("clicked", lambda *_: (self._clear_date_tasks(state["date"]), rebuild()))
+
+        self._detail_rebuilders.append(rebuild)
+        win.connect("destroy", lambda *_: self._detail_rebuilders.remove(rebuild) if rebuild in self._detail_rebuilders else None)
+
+        win.add(outer)
+        rebuild()
+        win.show_all()
+
+    def _clear_date_tasks(self, d_obj):
+        """Clear all pending & completed tasks for a specific date after explicit user confirmation."""
+        d_str = d_obj.strftime("%Y-%m-%d")
+        p_list = list(self._by_date_pending.get(d_str, []))
+        c_list = list(self._by_date_completed.get(d_str, []))
+        all_items = p_list + c_list
+        uuids = [str(t.get("uuid") or "").strip() for t in all_items if t.get("uuid")]
+        if not uuids:
+            self._show_info_dialog(f"{d_str} 沒有任務", f"{d_str} 目前沒有任何待辦或已完成任務可清空。")
+            return
+
+        md = Gtk.MessageDialog(
+            transient_for=None,
+            flags=Gtk.DialogFlags.MODAL,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.NONE,
+            text=f"確定要清空 {d_str} 的全部任務嗎？",
+        )
+        md.format_secondary_text(
+            f"即將刪除 {d_str} 共 {len(uuids)} 筆任務（待辦 {len(p_list)} 筆、已完成 {len(c_list)} 筆）。\n"
+            f"此操作將透過 Taskwarrior 永久移除該日任務，請確認是否繼續。"
+        )
+        md.add_button("取消", Gtk.ResponseType.CANCEL)
+        md.add_button("確認清空", Gtk.ResponseType.OK)
+        md.set_default_response(Gtk.ResponseType.CANCEL)
+        md.set_position(Gtk.WindowPosition.CENTER)
+        md.set_keep_above(True)
+        resp = md.run()
+        md.destroy()
+        if resp != Gtk.ResponseType.OK:
+            return
+
+        if TaskwarriorBackend.is_available():
+            try:
+                subprocess.run(
+                    [
+                        "task",
+                        "rc.confirmation=no",
+                        "rc.recurrence.confirmation=no",
+                        "rc.bulk=0",
+                        "rc.verbose=nothing",
+                        ",".join(uuids),
+                        "delete",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=15,
+                    check=False,
+                )
+                subprocess.run(
+                    [
+                        "task",
+                        "rc.confirmation=no",
+                        "rc.bulk=0",
+                        "rc.verbose=nothing",
+                        ",".join(uuids),
+                        "purge",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=15,
+                    check=False,
+                )
+            except Exception:
+                pass
+
+        color_changed = False
+        for uid in uuids:
+            if uid in self.task_colors:
+                self.task_colors.pop(uid, None)
+                color_changed = True
+        if color_changed:
+            self._save_task_colors()
+        self.reload_tasks()
+
+    def _show_context_menu(self, event, clicked_date=None):
         menu = Gtk.Menu()
-        items = [
-            ("＋ 新增任務...", lambda *_: self._open_add_dialog(date.today())),
-            ("🔄 立即同步 Taskwarrior", lambda *_: self.reload_tasks()),
-            ("↩ 復原上一步 (Undo)", self._on_undo),
-            (None, None),
-            ("🔓 解鎖拖曳與縮放" if self.config.get("locked") else "🔒 鎖定桌面位置", self._on_toggle_lock),
-            ("❐ 還原視窗大小" if self._is_maximized else "□ 放大至工作區全螢幕", self.toggle_maximize_workarea),
-            ("— 縮小為桌面小圖示", self.minimize_to_icon),
-            ("⚙ 外觀與位置設定...", self.show_preferences_dialog),
-            (None, None),
-            ("✕ 關閉桌面月曆", lambda *_: Gtk.main_quit()),
-        ]
+        add_date = clicked_date or date.today()
+        add_lbl = f"＋ 新增任務 ({add_date.strftime('%m/%d')})..." if clicked_date else "＋ 新增任務..."
+
+        if clicked_date is not None:
+            d_str = clicked_date.strftime("%Y-%m-%d")
+            d_lbl = clicked_date.strftime("%m/%d")
+            d_fs_f, d_cols, _has_mfs = self._get_date_cell_settings(d_str)
+            d_fs = int(round(d_fs_f))
+            has_ov = isinstance(self.config.get("date_cell_overrides"), dict) and d_str in self.config["date_cell_overrides"]
+            n_day_tasks = len(self._by_date_pending.get(d_str, [])) + len(self._by_date_completed.get(d_str, []))
+            layout_items = [
+                (
+                    f"✓ {d_lbl} 垂直分割成兩列（切回單欄）" if d_cols >= 2 else f"◫ {d_lbl} 任務垂直分割成兩列",
+                    lambda *_, ds=d_str, nc=(1 if d_cols >= 2 else 2): self._set_date_cell_override(ds, "task_columns", nc),
+                ),
+                (
+                    f"A+ 放大 {d_lbl} 任務字型（目前 {d_fs} pt）",
+                    lambda *_, ds=d_str, nfs=min(28, d_fs + 1): self._set_date_cell_override(ds, "task_font_size", nfs),
+                ),
+                (
+                    f"A- 縮小 {d_lbl} 任務字型（目前 {d_fs} pt）",
+                    lambda *_, ds=d_str, nfs=max(6, d_fs - 1): self._set_date_cell_override(ds, "task_font_size", nfs),
+                ),
+            ]
+            if has_ov:
+                layout_items.append(
+                    (f"↺ 恢復 {d_lbl} 預設排版", lambda *_, ds=d_str: self._reset_date_cell_override(ds))
+                )
+            items = [
+                (
+                    f"📋 顯示 {d_lbl} 詳細任務內容（{n_day_tasks} 筆）...",
+                    lambda *_, dobj=clicked_date: self._open_day_detail_window(dobj),
+                ),
+                (add_lbl, lambda *_: self._open_add_dialog(add_date)),
+                (None, None),
+                *layout_items,
+                (None, None),
+                (
+                    f"🗑 清空 {d_lbl} 任務（{n_day_tasks} 筆）...",
+                    lambda *_, dobj=clicked_date: self._clear_date_tasks(dobj),
+                ),
+                (None, None),
+                ("🔄 立即同步 Taskwarrior", lambda *_: self.reload_tasks()),
+                ("↩ 復原上一步 (Undo)", self._on_undo),
+            ]
+        else:
+            is_two_col = int(self.config.get("task_columns", 1)) >= 2
+            cur_tfs = max(6, min(28, int(self.config.get("task_font_size", 10))))
+            items = [
+                (add_lbl, lambda *_: self._open_add_dialog(add_date)),
+                ("🔄 立即同步 Taskwarrior", lambda *_: self.reload_tasks()),
+                ("↩ 復原上一步 (Undo)", self._on_undo),
+                (None, None),
+                ("✓ 全域預設雙欄（點擊切回單欄）" if is_two_col else "◫ 全域任務垂直分割成兩列", self._toggle_task_columns),
+                (f"A+ 放大全域任務字型（目前 {cur_tfs} pt）", lambda *_: self._adjust_task_font_size(+1)),
+                (f"A- 縮小全域任務字型（目前 {cur_tfs} pt）", lambda *_: self._adjust_task_font_size(-1)),
+                (None, None),
+                ("🔓 解鎖拖曳與縮放" if self.config.get("locked") else "🔒 鎖定桌面位置", self._on_toggle_lock),
+                ("❐ 還原視窗大小" if self._is_maximized else "□ 放大至工作區全螢幕", self.toggle_maximize_workarea),
+                ("— 縮小為桌面小圖示", self.minimize_to_icon),
+                ("⚙ 外觀與位置設定...", self.show_preferences_dialog),
+                ("📤 匯出備份...", self._open_export_dialog),
+                ("📥 匯入還原...", self._open_import_dialog),
+                (None, None),
+                ("✕ 關閉桌面月曆", lambda *_: Gtk.main_quit()),
+            ]
         for lbl, cb in items:
             if lbl is None:
                 menu.append(Gtk.SeparatorMenuItem())
@@ -1819,18 +2805,35 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
             self.prefs_win.present()
             return
 
-        win = Gtk.Window(title="Taskwarrior 桌面嵌入式月曆 — 外觀與位置設定")
-        win.set_default_size(460, 380)
+        win = Gtk.Window(title="Taskwarrior 桌面嵌入式月曆 — 偏好設定")
+        win.set_default_size(520, 390)
         win.set_position(Gtk.WindowPosition.CENTER)
         win.set_keep_above(True)
         self.prefs_win = win
         win.connect("destroy", lambda *_: setattr(self, "prefs_win", None))
 
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        box.set_margin_top(12)
-        box.set_margin_bottom(12)
-        box.set_margin_start(14)
-        box.set_margin_end(14)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        outer.set_margin_top(12)
+        outer.set_margin_bottom(12)
+        outer.set_margin_start(14)
+        outer.set_margin_end(14)
+
+        notebook = Gtk.Notebook()
+        outer.pack_start(notebook, True, True, 0)
+
+        def make_tab(title):
+            tb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            tb.set_margin_top(12)
+            tb.set_margin_bottom(12)
+            tb.set_margin_start(14)
+            tb.set_margin_end(14)
+            notebook.append_page(tb, Gtk.Label(label=title))
+            return tb
+
+        tab_appear = make_tab("🎨 外觀與顏色")
+        tab_layout = make_tab("📅 月曆與排版")
+        tab_detail = make_tab("📋 詳細任務視窗")
+        tab_sys = make_tab("⚙ 系統與備份")
 
         def make_cbtn(key, default_hex):
             b = Gtk.ColorButton()
@@ -1846,7 +2849,8 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
             b = max(0, min(255, int(round(rgba.blue * 255))))
             return f"#{r:02x}{g:02x}{b:02x}"
 
-        col_grid = Gtk.Grid(column_spacing=10, row_spacing=6)
+        # --- Tab 1: 外觀與顏色 ---
+        col_grid = Gtk.Grid(column_spacing=10, row_spacing=8)
         bg_btn = make_cbtn("bg_color", "#0f172a")
         fg_btn = make_cbtn("fg_color", "#f1f5f9")
         today_bg_btn = make_cbtn("today_bg_color", "#1a5c4d")
@@ -1868,7 +2872,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         col_grid.attach(cur_m_bg_btn, 1, 2, 1, 1)
         col_grid.attach(Gtk.Label(label="非本月日期背景：", xalign=0.0), 2, 2, 1, 1)
         col_grid.attach(other_m_bg_btn, 3, 2, 1, 1)
-        box.pack_start(col_grid, False, False, 0)
+        tab_appear.pack_start(col_grid, False, False, 0)
 
         op_row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         scale_bg_op = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 100.0, 2.0)
@@ -1880,7 +2884,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         op_row1.pack_start(Gtk.Label(label="整體背景透明度：", xalign=0.0), False, False, 0)
         op_row1.pack_start(scale_bg_op, True, True, 0)
         op_row1.pack_start(lbl_bg_op, False, False, 0)
-        box.pack_start(op_row1, False, False, 0)
+        tab_appear.pack_start(op_row1, False, False, 0)
 
         op_row2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         scale_cell_op = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 100.0, 2.0)
@@ -1892,36 +2896,108 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         op_row2.pack_start(Gtk.Label(label="日期格子透明度：", xalign=0.0), False, False, 0)
         op_row2.pack_start(scale_cell_op, True, True, 0)
         op_row2.pack_start(lbl_cell_op, False, False, 0)
-        box.pack_start(op_row2, False, False, 0)
+        tab_appear.pack_start(op_row2, False, False, 0)
 
+        chk_shadow = Gtk.CheckButton(label="文字陰影（透明背景時增強可讀性）")
+        chk_shadow.set_active(self.config.get("text_shadow", True))
+        tab_appear.pack_start(chk_shadow, False, False, 0)
+
+        # --- Tab 2: 月曆與排版 ---
         fs_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        fs_row.pack_start(Gtk.Label(label="字型大小 (pt)：", xalign=0.0), False, False, 0)
+        fs_row.pack_start(Gtk.Label(label="介面字型 (pt)：", xalign=0.0), False, False, 0)
         spin_fs = Gtk.SpinButton(
-            adjustment=Gtk.Adjustment(float(self.config.get("font_size", 11)), 9.0, 18.0, 1.0, 2.0, 0.0),
+            adjustment=Gtk.Adjustment(float(self.config.get("font_size", 11)), 9.0, 24.0, 1.0, 2.0, 0.0),
             climb_rate=1.0,
             digits=0,
         )
         fs_row.pack_start(spin_fs, False, False, 0)
-        chk_shadow = Gtk.CheckButton(label="文字陰影")
-        chk_shadow.set_active(self.config.get("text_shadow", True))
-        chk_comp = Gtk.CheckButton(label="顯示已完成任務")
+        fs_row.pack_start(Gtk.Label(label="全域任務字型 (pt)：", xalign=0.0), False, False, 6)
+        spin_task_fs = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(float(self.config.get("task_font_size", 10)), 6.0, 28.0, 1.0, 2.0, 0.0),
+            climb_rate=1.0,
+            digits=0,
+        )
+        fs_row.pack_start(spin_task_fs, False, False, 0)
+        tab_layout.pack_start(fs_row, False, False, 0)
+
+        chk_comp = Gtk.CheckButton(label="在日期格子內顯示已完成任務")
         chk_comp.set_active(self.config.get("show_completed", True))
-        fs_row.pack_start(chk_shadow, False, False, 0)
-        fs_row.pack_start(chk_comp, False, False, 0)
-        box.pack_start(fs_row, False, False, 0)
+        tab_layout.pack_start(chk_comp, False, False, 0)
 
-        chk_weather = Gtk.CheckButton(label="在日期列顯示 7 天天氣預報（共用天氣小工具快取）")
+        chk_weather = Gtk.CheckButton(label="在日期列顯示 7 天天氣預報與今日 AQI 圓點（共用天氣小工具快取）")
         chk_weather.set_active(self.config.get("show_weather", True))
-        box.pack_start(chk_weather, False, False, 0)
+        tab_layout.pack_start(chk_weather, False, False, 0)
 
+        chk_two_col = Gtk.CheckButton(label="全域預設：任務垂直分割成兩列顯示（容納更多任務）")
+        chk_two_col.set_active(int(self.config.get("task_columns", 1)) >= 2)
+        tab_layout.pack_start(chk_two_col, False, False, 0)
+
+        chk_auto_shrink = Gtk.CheckButton(label="當任務超過日期框大小時，自動縮小任務字型以完整顯示所有任務")
+        chk_auto_shrink.set_active(self.config.get("auto_shrink_task_font", True))
+        tab_layout.pack_start(chk_auto_shrink, False, False, 0)
+
+        ov_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_reset_ov = Gtk.Button(label="↺ 重置全部單日獨立排版")
+        btn_reset_ov.set_tooltip_text("清除所有透過右鍵單獨設定的日期字型與雙欄排版，恢復全域預設")
+        btn_reset_ov.connect("clicked", self._reset_all_date_overrides)
+        ov_row.pack_start(btn_reset_ov, False, False, 0)
+        tab_layout.pack_start(ov_row, False, False, 2)
+
+        # --- Tab 3: 詳細任務視窗 ---
+        dt_fs_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        dt_fs_row.pack_start(Gtk.Label(label="詳細任務內容視窗字型大小 (pt)：", xalign=0.0), False, False, 0)
+        spin_detail_fs = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(float(self.config.get("detail_font_size", 12)), 9.0, 24.0, 1.0, 2.0, 0.0),
+            climb_rate=1.0,
+            digits=0,
+        )
+        dt_fs_row.pack_start(spin_detail_fs, False, False, 0)
+        tab_detail.pack_start(dt_fs_row, False, False, 0)
+
+        lbl_dt_hint = Gtk.Label(xalign=0.0)
+        lbl_dt_hint.set_line_wrap(True)
+        lbl_dt_hint.set_markup(
+            "<small><span alpha='75%'>調整此字型大小會即時套用於「詳細任務內容」視窗的標題、任務內文、中繼欄位與註解。\n"
+            "在任一日期框上按右鍵點選「📋 顯示詳細任務內容...」即可開啟該視窗。</span></small>"
+        )
+        tab_detail.pack_start(lbl_dt_hint, False, False, 0)
+
+        # --- Tab 4: 系統與備份 ---
         chk_lock = Gtk.CheckButton(label="🔒 鎖定桌面位置與大小（取消勾選即可拖曳頂部移動、右下角縮放）")
         chk_lock.set_active(self.config.get("locked", False))
-        box.pack_start(chk_lock, False, False, 0)
+        tab_sys.pack_start(chk_lock, False, False, 0)
 
         chk_autostart = Gtk.CheckButton(label="🚀 開機進入桌面時自動啟動桌面月曆")
         chk_autostart.set_active(is_autostart_enabled())
         chk_autostart.connect("toggled", lambda c: set_autostart_enabled(c.get_active()))
-        box.pack_start(chk_autostart, False, False, 0)
+        tab_sys.pack_start(chk_autostart, False, False, 0)
+
+        ret_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        ret_row.pack_start(Gtk.Label(label="啟動時資料保留天數（0 = 不自動刪除）：", xalign=0.0), False, False, 0)
+        spin_ret = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(float(max(0, int(self.config.get("retention_days", 180)))), 0.0, 3650.0, 10.0, 30.0, 0.0),
+            climb_rate=1.0,
+            digits=0,
+        )
+        spin_ret.set_tooltip_text("每次重啟 Widget 時，自動透過 Taskwarrior CLI 清除超過此天數的歷史任務與單日排版；設為 0 則完全停用")
+        ret_row.pack_start(spin_ret, False, False, 0)
+        tab_sys.pack_start(ret_row, False, False, 0)
+
+        chk_auto_backup = Gtk.CheckButton(
+            label="💾 每日自動備份任務與設定（保留最近 3 天，自動刪除最舊備份）"
+        )
+        chk_auto_backup.set_tooltip_text(f"備份存放位置：{BACKUP_DIR}")
+        chk_auto_backup.set_active(self.config.get("auto_backup_enabled", True))
+        tab_sys.pack_start(chk_auto_backup, False, False, 0)
+
+        bk_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_export = Gtk.Button(label="📤 匯出備份...")
+        btn_export.connect("clicked", self._open_export_dialog)
+        btn_import = Gtk.Button(label="📥 匯入還原...")
+        btn_import.connect("clicked", self._open_import_dialog)
+        bk_row.pack_start(btn_export, False, False, 0)
+        bk_row.pack_start(btn_import, False, False, 0)
+        tab_sys.pack_start(bk_row, False, False, 4)
 
         def apply_all(*_):
             self.config["bg_color"] = rgba_to_hex(bg_btn.get_rgba())
@@ -1937,26 +3013,42 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
             lbl_bg_op.set_text(f"{bo}%")
             lbl_cell_op.set_text(f"{co}%")
             self.config["font_size"] = int(spin_fs.get_value_as_int())
+            self.config["task_font_size"] = int(spin_task_fs.get_value_as_int())
+            self.config["detail_font_size"] = int(spin_detail_fs.get_value_as_int())
+            self.config["task_columns"] = 2 if chk_two_col.get_active() else 1
+            self.config["auto_shrink_task_font"] = chk_auto_shrink.get_active()
+            self.config["retention_days"] = max(0, int(spin_ret.get_value_as_int()))
+            self.config["auto_backup_enabled"] = chk_auto_backup.get_active()
             self.config["text_shadow"] = chk_shadow.get_active()
             self.config["show_completed"] = chk_comp.get_active()
             self.config["show_weather"] = chk_weather.get_active()
             self.config["locked"] = chk_lock.get_active()
             self._save_config()
             self._refresh_view()
+            for rb in list(self._detail_rebuilders):
+                try:
+                    rb()
+                except Exception:
+                    pass
 
         for cb in (bg_btn, fg_btn, today_bg_btn, today_bd_btn, cur_m_bg_btn, other_m_bg_btn):
             cb.connect("color-set", apply_all)
         scale_bg_op.connect("value-changed", apply_all)
         scale_cell_op.connect("value-changed", apply_all)
         spin_fs.connect("value-changed", apply_all)
-        for c in (chk_shadow, chk_comp, chk_weather, chk_lock):
+        spin_task_fs.connect("value-changed", apply_all)
+        spin_detail_fs.connect("value-changed", apply_all)
+        spin_ret.connect("value-changed", apply_all)
+        for c in (chk_shadow, chk_comp, chk_two_col, chk_auto_shrink, chk_weather, chk_lock, chk_auto_backup):
             c.connect("toggled", apply_all)
 
+        btm_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         btn_close = Gtk.Button(label="關閉")
         btn_close.connect("clicked", lambda *_: win.destroy())
-        box.pack_end(btn_close, False, False, 0)
+        btm_row.pack_end(btn_close, False, False, 0)
+        outer.pack_end(btm_row, False, False, 0)
 
-        win.add(box)
+        win.add(outer)
         win.show_all()
 
     def _on_destroy(self, *_args):
@@ -1978,6 +3070,11 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         if self._config_monitor is not None:
             try:
                 self._config_monitor.cancel()
+            except Exception:
+                pass
+        if self._backup_timer_id is not None:
+            try:
+                GLib.source_remove(self._backup_timer_id)
             except Exception:
                 pass
         if self.mini_win is not None:

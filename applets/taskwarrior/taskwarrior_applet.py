@@ -65,7 +65,7 @@ DEFAULT_CONFIG = {
     "pomo_cycles": 4,                    # 番茄鐘循環次數設定 (預設 4 個循環)
     "pomo_sync_task_start": True,        # 綁定任務啟動番茄鐘時同步執行 task start / stop
     "pomo_sound_enabled": True,          # 番茄鐘專注 / 中場休息倒數完畢時播放提示音效
-    "pomo_sound_volume": 80,             # 番茄鐘提示音效音量 (0..100%)
+    "pomo_sound_volume": 75,             # 番茄鐘提示音效音量 (0..100%)
     "left_click_action": "calendar",     # "calendar" (開啟雙欄月曆任務看板) or "menu" (開啟傳統下拉快速選單)
     "calendar_show_completed": True,     # 在月曆格子與右側清單中顯示歷史已完成任務 (依 end 完成日期對應)
     "calendar_font_size": 16,            # 月曆看板基準字型大小 (pt/px, 範圍 8..22)

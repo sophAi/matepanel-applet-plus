@@ -85,13 +85,13 @@ DEFAULT_CONFIG = {
     "text_shadow": False,                # 面板文字高對比描邊陰影
     "show_hover_tooltip": False,         # 滑鼠懸停圖示時顯示詳細資訊 (Tooltip)
     "notify_weather_change": True,       # 天氣圖案改變時自動彈出氣泡框提醒
-    "detail_display_mode": "custom_bubble",  # "embedded" (完整視窗) | "custom_bubble" (精簡月曆 RGBA 氣泡框)
+    "detail_display_mode": "embedded",   # "embedded" (完整視窗) | "custom_bubble" (精簡月曆 RGBA 氣泡框)
     "bubble_position": "top_left",       # top_left / top_center / top_right / center / bottom_left / bottom_right
     "bubble_offset_x": 0,                # 氣泡水平偏移 (px)
     "bubble_offset_y": 0,                # 氣泡垂直偏移 (px)
-    "bubble_bg_color": "#5e5c64",        # 自訂氣泡背景顏色
-    "bubble_fg_color": "#deddda",        # 自訂氣泡文字顏色
-    "bubble_bg_opacity": 98,             # 自訂氣泡背景不透明度 (0..100%)
+    "bubble_bg_color": "#f6f5f4",        # 自訂氣泡背景顏色
+    "bubble_fg_color": "#4d4d4d",        # 自訂氣泡文字顏色
+    "bubble_bg_opacity": 94,             # 自訂氣泡背景不透明度 (0..100%)
     "bubble_timeout_sec": 12,            # 氣泡自動關閉秒數 (0 = 常駐直到點擊關閉)
 }
 

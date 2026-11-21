@@ -124,7 +124,7 @@ DEFAULT_CONFIG = {
     "translate_engine": "gemini",        # "google", "gemini", "openai_compat", "deepl"
     "translate_fallback_google": True,   # 所選引擎超額或連線失敗時自動降級回 Google 翻譯
     "gemini_api_key": "",                # Gemini API Free Tier Key (Google AI Studio，請於偏好設定自行填入)
-    "gemini_model": "gemini-3-flash-preview",
+    "gemini_model": "gemini-3.1-flash-lite",
     "openai_base_url": "https://api.groq.com/openai/v1",  # 支援 Groq / OpenRouter / 本機 Ollama
     "openai_api_key": "",
     "openai_model": "llama-3.3-70b-versatile",
@@ -153,7 +153,7 @@ DEFAULT_CONFIG = {
         "🌐 Gemini AI 翻譯",
     ],
     "vocab_record_enabled": True,        # 自動紀錄傳統 StarDict 詞典查詢命中的單字
-    "vocab_card_dicts": ["DrEye4in1詞典", "Collins Cobuild English Dictionary"],
+    "vocab_card_dicts": ["DrEye4in1詞典"],
     "vocab_sort_mode": "random",         # "recent", "freq", "alpha", "random"
     "vocab_epub_layout": "per_word",     # "per_word" (一字一頁，預設) or "az_chapters" (依字母 A-Z 分章)
     "result_font_size": 15,              # 結果視窗字型大小 (pt)
@@ -2681,6 +2681,19 @@ class DictCalcWidget(Gtk.EventBox):
             shadow_css = "text-shadow: none;"
 
         entry_w = max(60, min(320, int(self.config.get("panel_entry_width", 170))))
+        if hide_border:
+            focus_css = (
+                f"  box-shadow: inset 0 0 0 2px rgba({br255}, {bg255}, {bb255}, 0.95);\n"
+            )
+        else:
+            focus_css = (
+                f"  border: 2px solid rgba({br255}, {bg255}, {bb255}, 1.0);\n"
+                f"  padding-top: 0px;\n"
+                f"  padding-bottom: 0px;\n"
+                f"  padding-left: 4px;\n"
+                f"  padding-right: 4px;\n"
+                f"  box-shadow: 0 0 2px rgba({br255}, {bg255}, {bb255}, 0.45);\n"
+            )
         css_str = (
             f"#dict-calc-panel-entry {{\n"
             f"  {bg_css}\n"
@@ -2694,6 +2707,9 @@ class DictCalcWidget(Gtk.EventBox):
             f"  min-height: 0px;\n"
             f"  min-width: {entry_w}px;\n"
             f"  {shadow_css}\n"
+            f"}}\n"
+            f"#dict-calc-panel-entry:focus {{\n"
+            f"{focus_css}"
             f"}}\n"
             f"#dict-calc-panel-entry image {{\n"
             f"  color: {fg_hex};\n"
