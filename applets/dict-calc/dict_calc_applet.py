@@ -5246,9 +5246,11 @@ def applet_fill(applet):
     )
 
     widget = DictCalcWidget(applet=applet)
+    widget.canvas.set_no_show_all(True)
+    widget.panel_entry.set_no_show_all(True)
     init_size = applet.get_size()
-    if init_size:
-        widget.set_panel_size(init_size)
+    widget.set_panel_size(init_size if init_size else 32)
+    widget._sync_entry_visibility()
 
     setup_applet_context_menu(applet, widget)
 

@@ -283,6 +283,15 @@ def pomo_phase_to_colors(phase, running):
             "#f87171",
             "crit",
         )
+    if phase == "countdown":
+        # Custom countdown timer -> Vivid Violet / Indigo
+        return (
+            (0.24, 0.16, 0.48),
+            (0.66, 0.48, 0.98),
+            (0.98, 0.96, 1.00),
+            "#a78bfa",
+            "normal",
+        )
     else:
         # Break state -> Refreshing Cyan-Green
         return (
@@ -1158,13 +1167,17 @@ class TaskwarriorWidget(Gtk.EventBox):
             w_min = int(self.config.get("pomo_work_min", 25))
             return f"{w_min:02d}:00"
         sec = max(0, int(self.pomo_remaining_sec))
+        if sec >= 3600:
+            hrs = sec // 3600
+            rem = sec % 3600
+            return f"{hrs}:{rem // 60:02d}:{rem % 60:02d}"
         return f"{sec // 60:02d}:{sec % 60:02d}"
 
     def _sync_pomo_timer(self):
         if self.pomo_timer_id is not None:
             GLib.source_remove(self.pomo_timer_id)
             self.pomo_timer_id = None
-        if self.pomo_running and self.pomo_phase in ("work", "break"):
+        if self.pomo_running and self.pomo_phase in ("work", "break", "countdown"):
             self.pomo_timer_id = GLib.timeout_add_seconds(1, self._on_pomo_tick)
 
     def _sync_bound_task_active(self, should_be_active):
@@ -1219,16 +1232,193 @@ class TaskwarriorWidget(Gtk.EventBox):
         self._sync_pomo_timer()
         self._on_pomo_state_updated()
 
+    def start_countdown(self, total_sec, label="", target_desc=""):
+        """Start a custom countdown timer using the Pomodoro panel badge display."""
+        if self.pomo_phase == "work" and self.pomo_running:
+            self._sync_bound_task_active(False)
+        self.pomo_phase = "countdown"
+        self.pomo_total_sec = max(1, int(total_sec))
+        self.pomo_remaining_sec = self.pomo_total_sec
+        self.countdown_label = (label or "").strip()
+        self.countdown_target_desc = (target_desc or "").strip()
+        self.pomo_running = True
+        self._sync_pomo_timer()
+        self._on_pomo_state_updated()
+
+    def show_countdown_dialog(self, *_args):
+        """Open a dialog to configure either a duration countdown (H:M:S) or target-time countdown (HH:MM:SS)."""
+        RESP_STOP = 201
+        RESP_PAUSE = 202
+        dlg = Gtk.Dialog(title="⏱️ 倒數計時模式", transient_for=None, flags=Gtk.DialogFlags.MODAL)
+        dlg.set_position(Gtk.WindowPosition.CENTER)
+        dlg.set_keep_above(True)
+
+        is_active = self.pomo_phase != "idle"
+        btn_stop = dlg.add_button("⏹ 停止", RESP_STOP)
+        pause_lbl = "⏸ 暫停" if (is_active and self.pomo_running) else "▶️ 繼續"
+        btn_pause = dlg.add_button(pause_lbl, RESP_PAUSE)
+        btn_stop.set_sensitive(is_active)
+        btn_pause.set_sensitive(is_active)
+        dlg.add_button("取消", Gtk.ResponseType.CANCEL)
+        dlg.add_button("🔄 重新倒數", Gtk.ResponseType.OK)
+        dlg.set_default_response(Gtk.ResponseType.OK)
+
+        area = dlg.get_content_area()
+        area.set_spacing(10)
+        area.set_margin_top(12)
+        area.set_margin_bottom(12)
+        area.set_margin_start(14)
+        area.set_margin_end(14)
+
+        # Optional note
+        note_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        note_row.pack_start(Gtk.Label(label="提醒備註（選填）：", xalign=0.0), False, False, 0)
+        e_note = Gtk.Entry()
+        e_note.set_placeholder_text("例如：開會、泡茶、下班...")
+        e_note.set_text(getattr(self, "countdown_label", "") or "")
+        e_note.set_activates_default(True)
+        note_row.pack_start(e_note, True, True, 0)
+        area.pack_start(note_row, False, False, 0)
+
+        # Mode 1: Duration (H:M:S)
+        rb_dur = Gtk.RadioButton.new_with_label_from_widget(None, "倒數指定時長（幾小時 幾分 幾秒）")
+        rb_dur.set_active(True)
+        area.pack_start(rb_dur, False, False, 0)
+
+        dur_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        dur_box.set_margin_start(22)
+        dur_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        spin_dh = Gtk.SpinButton(adjustment=Gtk.Adjustment(0.0, 0.0, 99.0, 1.0, 5.0, 0.0), climb_rate=1.0, digits=0)
+        spin_dm = Gtk.SpinButton(adjustment=Gtk.Adjustment(10.0, 0.0, 59.0, 1.0, 5.0, 0.0), climb_rate=1.0, digits=0)
+        spin_ds = Gtk.SpinButton(adjustment=Gtk.Adjustment(0.0, 0.0, 59.0, 1.0, 10.0, 0.0), climb_rate=1.0, digits=0)
+        for sp, unit in ((spin_dh, "小時"), (spin_dm, "分"), (spin_ds, "秒")):
+            sp.set_numeric(True)
+            sp.set_update_policy(Gtk.SpinButtonUpdatePolicy.ALWAYS)
+            sp.set_activates_default(True)
+            dur_row.pack_start(sp, False, False, 0)
+            dur_row.pack_start(Gtk.Label(label=unit, xalign=0.0), False, False, 2)
+        dur_box.pack_start(dur_row, False, False, 0)
+
+        preset_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        for lbl, ph, pm, ps in (
+            ("30秒", 0, 0, 30),
+            ("1分", 0, 1, 0),
+            ("3分", 0, 3, 0),
+            ("5分", 0, 5, 0),
+            ("10分", 0, 10, 0),
+            ("30分", 0, 30, 0),
+            ("1小時", 1, 0, 0),
+        ):
+            pb = Gtk.Button(label=lbl)
+            pb.connect(
+                "clicked",
+                lambda _w, h=ph, m=pm, s=ps: (
+                    rb_dur.set_active(True),
+                    spin_dh.set_value(h),
+                    spin_dm.set_value(m),
+                    spin_ds.set_value(s),
+                ),
+            )
+            preset_row.pack_start(pb, False, False, 0)
+        dur_box.pack_start(preset_row, False, False, 0)
+        area.pack_start(dur_box, False, False, 0)
+
+        # Mode 2: Target wall-clock time (HH:MM:SS)
+        rb_tgt = Gtk.RadioButton.new_with_label_from_widget(rb_dur, "倒數至指定時刻（到幾點 幾分 幾秒）")
+        area.pack_start(rb_tgt, False, False, 0)
+
+        now_plus = datetime.now() + timedelta(minutes=10)
+        tgt_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        tgt_box.set_margin_start(22)
+        tgt_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        spin_th = Gtk.SpinButton(adjustment=Gtk.Adjustment(float(now_plus.hour), 0.0, 23.0, 1.0, 2.0, 0.0), climb_rate=1.0, digits=0)
+        spin_tm = Gtk.SpinButton(adjustment=Gtk.Adjustment(float(now_plus.minute), 0.0, 59.0, 1.0, 5.0, 0.0), climb_rate=1.0, digits=0)
+        spin_ts = Gtk.SpinButton(adjustment=Gtk.Adjustment(0.0, 0.0, 59.0, 1.0, 10.0, 0.0), climb_rate=1.0, digits=0)
+        for sp, unit in ((spin_th, "點"), (spin_tm, "分"), (spin_ts, "秒")):
+            sp.set_numeric(True)
+            sp.set_update_policy(Gtk.SpinButtonUpdatePolicy.ALWAYS)
+            sp.set_activates_default(True)
+            tgt_row.pack_start(sp, False, False, 0)
+            tgt_row.pack_start(Gtk.Label(label=unit, xalign=0.0), False, False, 2)
+        tgt_box.pack_start(tgt_row, False, False, 0)
+
+        lbl_preview = Gtk.Label(xalign=0.0)
+        tgt_box.pack_start(lbl_preview, False, False, 0)
+        area.pack_start(tgt_box, False, False, 0)
+
+        def _commit_spins():
+            for sp in (spin_dh, spin_dm, spin_ds, spin_th, spin_tm, spin_ts):
+                try:
+                    sp.update()
+                except Exception:
+                    pass
+
+        def _compute_target_delta():
+            _commit_spins()
+            now = datetime.now()
+            th = spin_th.get_value_as_int()
+            tm = spin_tm.get_value_as_int()
+            ts = spin_ts.get_value_as_int()
+            target = now.replace(hour=th, minute=tm, second=ts, microsecond=0)
+            day_tag = "今日"
+            if target <= now:
+                target += timedelta(days=1)
+                day_tag = "明日"
+            diff = max(1, int(round((target - now).total_seconds())))
+            return diff, f"{day_tag} {th:02d}:{tm:02d}:{ts:02d}"
+
+        def _refresh_preview(*_):
+            is_dur = rb_dur.get_active()
+            dur_box.set_sensitive(is_dur)
+            tgt_box.set_sensitive(not is_dur)
+            diff, tdesc = _compute_target_delta()
+            dh, rem = divmod(diff, 3600)
+            dm, ds = divmod(rem, 60)
+            lbl_preview.set_markup(
+                f"<small><span alpha='78%'>目標：{tdesc}（距離現在 {dh:02d}:{dm:02d}:{ds:02d}）</span></small>"
+            )
+
+        rb_dur.connect("toggled", _refresh_preview)
+        rb_tgt.connect("toggled", _refresh_preview)
+        for sp in (spin_th, spin_tm, spin_ts):
+            sp.connect("value-changed", _refresh_preview)
+        _refresh_preview()
+
+        dlg.show_all()
+        resp = dlg.run()
+        if resp == Gtk.ResponseType.OK:
+            _commit_spins()
+            note = e_note.get_text().strip()
+            if rb_dur.get_active():
+                total_sec = (
+                    spin_dh.get_value_as_int() * 3600
+                    + spin_dm.get_value_as_int() * 60
+                    + spin_ds.get_value_as_int()
+                )
+                if total_sec > 0:
+                    self.start_countdown(total_sec, label=note)
+            else:
+                diff, tdesc = _compute_target_delta()
+                self.start_countdown(diff, label=note, target_desc=tdesc)
+        elif resp == RESP_STOP:
+            self.pomo_stop()
+        elif resp == RESP_PAUSE:
+            self.pomo_toggle_pause_resume()
+        dlg.destroy()
+
     def pomo_reset_current_phase(self, *_args):
-        """Reset countdown timer of the current phase (Work or Break) back to full duration."""
-        if self.pomo_phase == "break":
+        """Reset countdown timer of the current phase (Work, Break, or Countdown) back to full duration."""
+        if self.pomo_phase == "countdown":
+            self.pomo_remaining_sec = max(1, int(self.pomo_total_sec))
+        elif self.pomo_phase == "break":
             b_min = max(1, int(self.config.get("pomo_break_min", 5)))
             self.pomo_total_sec = b_min * 60
+            self.pomo_remaining_sec = self.pomo_total_sec
         else:
             self.pomo_phase = "work"
             w_min = max(1, int(self.config.get("pomo_work_min", 25)))
             self.pomo_total_sec = w_min * 60
-        self.pomo_remaining_sec = self.pomo_total_sec
+            self.pomo_remaining_sec = self.pomo_total_sec
         self.pomo_running = True
         if self.pomo_phase == "work":
             self._sync_bound_task_active(True)
@@ -1320,6 +1510,15 @@ class TaskwarriorWidget(Gtk.EventBox):
                     beep=not sound_on,
                 )
                 self.pomo_stop()
+        elif self.pomo_phase == "countdown":
+            if sound_on:
+                play_pomo_sound("work_done", sound_vol)
+            c_lbl = getattr(self, "countdown_label", "")
+            c_tgt = getattr(self, "countdown_target_desc", "")
+            title = f"⏱️ 倒數計時結束！{f'（{c_lbl}）' if c_lbl else ''}"
+            body = f"目標時刻 {c_tgt} 已到達！" if c_tgt else "設定的倒數計時已結束！"
+            send_desktop_notification(title, body, urgent=True, beep=not sound_on)
+            self.pomo_stop()
 
     def _on_pomo_state_updated(self):
         self._update_tooltip()
@@ -1454,7 +1653,8 @@ class TaskwarriorWidget(Gtk.EventBox):
         show_task, show_pomo = self._which_badges_to_draw()
 
         task_bw = max(32, int(h * 1.22))
-        pomo_bw = max(50, int(h * 1.78))  # wide enough for large bold '24:59' countdown digits
+        is_long_time = self.pomo_phase != "idle" and int(self.pomo_remaining_sec) >= 3600
+        pomo_bw = max(68, int(h * 2.30)) if is_long_time else max(50, int(h * 1.78))
 
         badges_w = 0
         if show_task and show_pomo:
@@ -3290,6 +3490,14 @@ def setup_applet_context_menu(applet, widget):
                 widget.show_calendar_window,
             ),
             (
+                "CountdownTimerAction",
+                None,
+                "倒數計時模式 (_Countdown)...",
+                None,
+                "設定幾小時幾分幾秒，或倒數至指定時刻（幾點幾分幾秒）",
+                widget.show_countdown_dialog,
+            ),
+            (
                 "PomoToggleAction",
                 Gtk.STOCK_MEDIA_PLAY,
                 "番茄鐘：開始 / 暫停 / 繼續 (_Pomodoro Toggle)",
@@ -3356,11 +3564,16 @@ def setup_applet_context_menu(applet, widget):
         ]
     )
 
+    act_cd = action_group.get_action("CountdownTimerAction")
+    if act_cd is not None:
+        act_cd.set_icon_name("appointment-soon")
+
     menu_xml = (
         '<menuitem name="CalendarView" action="CalendarViewAction"/>'
         '<menuitem name="ShowTasksMenu" action="ShowTasksMenuAction"/>'
         '<menuitem name="AddTask" action="AddTaskAction"/>'
         "<separator/>"
+        '<menuitem name="CountdownTimer" action="CountdownTimerAction"/>'
         '<menuitem name="PomoToggle" action="PomoToggleAction"/>'
         '<menuitem name="PomoReset" action="PomoResetAction"/>'
         '<menuitem name="PomoSkip" action="PomoSkipAction"/>'
@@ -3385,8 +3598,7 @@ def applet_fill(applet):
 
     widget = TaskwarriorWidget(applet=applet)
     init_size = applet.get_size()
-    if init_size:
-        widget.set_panel_size(init_size)
+    widget.set_panel_size(init_size if init_size else 32)
 
     setup_applet_context_menu(applet, widget)
 

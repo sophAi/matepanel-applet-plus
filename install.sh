@@ -16,7 +16,9 @@ TEMP_SERVICE_FILE="org.mate.panel.applet.TempMonitorAppletFactory.service"
 TASK_DIR="${REPO_DIR}/applets/taskwarrior"
 TASK_EXEC="${TASK_DIR}/taskwarrior_applet.py"
 TASK_DESKTOP_EXEC="${TASK_DIR}/taskwarrior_desktop_widget.py"
-TASK_DESKTOP_AUTOSTART="${HOME}/.config/autostart/taskwarrior-desktop-widget.desktop"
+TASK_DESKTOP_AUTOSTART="${HOME}/.config/autostart/taskwarrior-desktop-calendar.desktop"
+PANEL_LAYOUT_FILE="${HOME}/.config/matepanel-applet-plus/panel-layout.dconf"
+PANEL_LAYOUT_AUTOSTART="${HOME}/.config/autostart/matepanel-layout-restore.desktop"
 TASK_APPLET_FILE="org.mate.panel.TaskwarriorApplet.mate-panel-applet"
 TASK_SERVICE_FILE="org.mate.panel.applet.TaskwarriorAppletFactory.service"
 
@@ -48,6 +50,9 @@ usage() {
   install-desktop                       安裝並啟動「Taskwarrior 桌面嵌入式月曆」開機自啟 (免 sudo)
   uninstall-desktop                     移除並停止「Taskwarrior 桌面嵌入式月曆」開機自啟 (免 sudo)
   reload-desktop                        重新啟動「Taskwarrior 桌面嵌入式月曆」(免 sudo)
+  save-panel-layout                     儲存目前 MATE Panel 佈局快照，並啟用開機延遲自動還原 (防止重開機跑位，免 sudo)
+  restore-panel-layout                  立即從已儲存快照還原 MATE Panel 佈局 (免 sudo)
+  disable-panel-layout                  停用開機自動還原 MATE Panel 佈局 (免 sudo)
 EOF
 }
 
@@ -199,6 +204,34 @@ EOF
         pkill -f "taskwarrior_desktop_widget.py" 2>/dev/null || true
         nohup /usr/bin/python3 "${TASK_DESKTOP_EXEC}" >/dev/null 2>&1 &
         echo "🔄 已重新啟動「Taskwarrior 桌面嵌入式月曆」"
+        ;;
+    save-panel-layout)
+        mkdir -p "$(dirname "${PANEL_LAYOUT_FILE}")" "$(dirname "${PANEL_LAYOUT_AUTOSTART}")"
+        dconf dump /org/mate/panel/objects/ > "${PANEL_LAYOUT_FILE}"
+        cat > "${PANEL_LAYOUT_AUTOSTART}" <<EOF
+[Desktop Entry]
+Type=Application
+Name=MATE Panel Layout Restore
+Comment=Restore saved MATE Panel applet positions after startup
+Exec=sh -c 'sleep 4 && [ -f "${PANEL_LAYOUT_FILE}" ] && dconf load /org/mate/panel/objects/ < "${PANEL_LAYOUT_FILE}"'
+Terminal=false
+X-MATE-Autostart-enabled=true
+X-MATE-Autostart-Delay=2
+EOF
+        echo "✅ 已儲存目前 MATE Panel 佈局快照至：${PANEL_LAYOUT_FILE}"
+        echo "✅ 已啟用開機延遲自動還原（${PANEL_LAYOUT_AUTOSTART}），重開機後將自動鎖定面板位置！"
+        ;;
+    restore-panel-layout)
+        if [[ ! -f "${PANEL_LAYOUT_FILE}" ]]; then
+            echo "❌ 找不到面板佈局快照：${PANEL_LAYOUT_FILE}，請先執行 $0 save-panel-layout"
+            exit 1
+        fi
+        dconf load /org/mate/panel/objects/ < "${PANEL_LAYOUT_FILE}"
+        echo "✅ 已從快照還原 MATE Panel 佈局（${PANEL_LAYOUT_FILE}）"
+        ;;
+    disable-panel-layout)
+        rm -f "${PANEL_LAYOUT_AUTOSTART}"
+        echo "✅ 已停用開機自動還原 MATE Panel 佈局"
         ;;
     *)
         usage

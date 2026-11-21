@@ -2867,13 +2867,18 @@ class ClockWeatherWidget(Gtk.EventBox):
         h = max(24, self.panel_size)
         clock_txt = self._format_clock_text()
         temp_txt = self._format_temp_text()
+        show_temp = bool(self.config.get("show_weather_temp", True))
+        show_aqi = bool(self.config.get("show_air_quality", True))
         aqi_col = self._get_aqi_dot_color()
+        # Reserve stable width from startup even before weather cache/network arrives
+        measure_temp = temp_txt if temp_txt else ("25°" if show_temp else "")
+        reserve_aqi = (aqi_col is not None) or show_aqi
         show_icon = bool(self.config.get("show_weather_icon", True))
         icon_sz = max(16, min(36, int(h - 2)))
 
         surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1)
         ctx = cairo.Context(surf)
-        sample_txt = " ".join(s for s in (clock_txt, temp_txt) if s) or "12:00"
+        sample_txt = " ".join(s for s in (clock_txt, measure_temp) if s) or "12:00"
         fs, _ext = self._compute_panel_font_size(ctx, sample_txt, h)
 
         pad_x = 4.0
@@ -2882,20 +2887,20 @@ class ClockWeatherWidget(Gtk.EventBox):
             c_ext = ctx.text_extents(clock_txt)
             cur_x += max(c_ext.x_advance, c_ext.width)
 
-        has_weather = show_icon or bool(temp_txt) or (aqi_col is not None)
+        has_weather = show_icon or bool(measure_temp) or reserve_aqi
         if clock_txt and has_weather:
             cur_x += 8.0
 
         if show_icon:
-            cur_x += icon_sz + (3.0 if (temp_txt or aqi_col is not None) else 0.0)
+            cur_x += icon_sz + (3.0 if (measure_temp or reserve_aqi) else 0.0)
 
-        if temp_txt:
-            t_ext = ctx.text_extents(temp_txt)
+        if measure_temp:
+            t_ext = ctx.text_extents(measure_temp)
             cur_x += max(t_ext.x_advance, t_ext.width)
-            if aqi_col is not None:
+            if reserve_aqi:
                 cur_x += 6.0
 
-        if aqi_col is not None:
+        if reserve_aqi:
             dot_r = max(4.2, min(6.5, fs * 0.28))
             cur_x += dot_r * 2.0 + 3.0
 
@@ -3883,8 +3888,7 @@ def applet_fill(applet):
 
     widget = ClockWeatherWidget(applet=applet)
     init_size = applet.get_size()
-    if init_size:
-        widget.set_panel_size(init_size)
+    widget.set_panel_size(init_size if init_size else 32)
 
     setup_applet_context_menu(applet, widget)
     applet.connect("button-press-event", widget.handle_applet_button_press)

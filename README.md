@@ -21,8 +21,9 @@ Custom MATE Panel Applets collection and development repository for Linux deskto
 
 事件驅動（`Gio.FileMonitor` 監聽 `~/.task`，`0.0%` 閒置 CPU）的 MATE 面板 Taskwarrior 任務管理、番茄鐘倒數小程式與桌面嵌入式月曆：
 - **雙欄式互動月曆任務看板**：左側 7×6 彩色月曆（含到期任務微縮標題與歷史已完成任務 `✓` 歸檔），右側當日任務與未排程待辦操作清單，支援偏好設定調整月曆字型大小與月曆紅頂風格 `TASK` 面板方塊。
-- **整合番茄鐘專注計時器與倒數提示音效**：
+- **整合番茄鐘專注計時器、自訂倒數計時與提示音效**：
   - 支援自訂專注工作時間（預設 25 分鐘）、中場休息時間（預設 5 分鐘）與循環次數，提供開始、暫停、繼續、重新計時、切換階段、桌面通知與面板大字體倒數圖示自動切換。
+  - **自訂倒數計時模式（右鍵選單 → `倒數計時模式...`）**：支援設定「幾小時幾分幾秒」（含 `30秒～1小時` 快選與 0 分鐘短時倒數）或「倒數至指定時刻（幾點幾分幾秒，自動跨日判斷）」，視窗內附 **停止 / 暫停・繼續 / 重新倒數** 按鈕，沿用番茄鐘面板方塊顯示（≥ 1 小時自動顯示 `H:MM:SS`），時間到播放與番茄鐘工作結束相同的提示音效與桌面通知。
   - **三段階段提示音效與音量控制**：專注完成、5 分鐘中場休息結束、全部循環完成皆會播放區分提示音效；偏好設定「🍅 番茄鐘」分頁內建音效開關、音量滑桿（`0%～100%`）與即時試聽按鈕。
 - **Taskwarrior 桌面嵌入式互動月曆（`taskwarrior_desktop_widget.py`）**：
   - 無邊框 RGBA 透明視窗平貼於桌布上方、所有一般視窗下方（`DOCK` 視窗層級 + `keep_below` + `stick` + `skip_taskbar/pager`，完整相容 **Marco** 與 **Compiz**＋Caja；點選桌面檔案絕不被壓到桌布後面，且點擊 MATE Panel「顯示桌面」按鈕不會被隱藏），並支援不依賴視窗管理員的直接拖曳移動與右下角／右邊緣／下邊緣自由縮放，與 Taskwarrior Applet／CLI 即時同步。
@@ -120,6 +121,11 @@ Custom MATE Panel Applets collection and development repository for Linux deskto
 ./install.sh reload-desktop     # 更新程式碼後重新啟動桌面月曆
 ./install.sh uninstall-desktop  # 移除開機自啟並停止桌面月曆
 
-# 5. 從系統 MATE Panel 移除註冊
+# 5. 鎖定 MATE Panel 面板佈局（防止多螢幕或重開機時 Applet 跑位，免 sudo）
+./install.sh save-panel-layout     # 儲存目前面板佈局快照並啟用開機延遲自動還原
+./install.sh restore-panel-layout  # 立即從已儲存快照還原面板佈局
+./install.sh disable-panel-layout  # 停用開機自動還原面板佈局
+
+# 6. 從系統 MATE Panel 移除註冊
 ./install.sh uninstall
 ```

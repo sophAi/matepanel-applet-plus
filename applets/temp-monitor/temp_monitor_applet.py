@@ -2188,8 +2188,7 @@ def applet_fill(applet):
 
     widget = TempMonitorWidget(applet=applet)
     init_size = applet.get_size()
-    if init_size:
-        widget.set_panel_size(init_size)
+    widget.set_panel_size(init_size if init_size else 32)
 
     setup_applet_context_menu(applet, widget)
 
