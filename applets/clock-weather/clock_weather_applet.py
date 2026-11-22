@@ -93,6 +93,9 @@ DEFAULT_CONFIG = {
     "bubble_fg_color": "#4d4d4d",        # 自訂氣泡文字顏色
     "bubble_bg_opacity": 94,             # 自訂氣泡背景不透明度 (0..100%)
     "bubble_timeout_sec": 12,            # 氣泡自動關閉秒數 (0 = 常駐直到點擊關閉)
+    "cal_cur_month_bg_color": "#212933",    # 當月日期底色 (氣泡框與詳細月曆共用)
+    "cal_other_month_bg_color": "#171c24",  # 非當月日期底色 (氣泡框與詳細月曆共用)
+    "cal_forecast_bg_color": "#293345",     # 一週天氣預報日期底色 (氣泡框與詳細月曆共用)
 }
 
 WORLD_CLOCK_PRESETS = [
@@ -616,7 +619,18 @@ class CustomCalendarBubbleWindow(Gtk.Window):
         cal_page.pack_start(nav, False, False, 0)
 
         self.cal_canvas = Gtk.DrawingArea()
-        self.cal_canvas.set_size_request(448, 326)
+        fs_b = float(max(8, min(24, self._font_size)))
+        b_cell_w = max(64, int(round(fs_b * 5.6)))
+        b_cell_h = max(50, int(round(fs_b * 4.4)))
+        b_cal_w = b_cell_w * 7 + 8
+        b_cal_h = int(round(fs_b * 2.1)) + b_cell_h * 6 + 8
+        try:
+            ml, mt, mr, mb = self.parent_widget._get_active_monitor_bounds()
+            b_cal_w = min(b_cal_w, max(448, (mr - ml) - 56))
+            b_cal_h = min(b_cal_h, max(326, (mb - mt) - 130))
+        except Exception:
+            pass
+        self.cal_canvas.set_size_request(int(b_cal_w), int(b_cal_h))
         self.cal_canvas.connect("draw", self._on_draw_calendar)
         cal_page.pack_start(self.cal_canvas, True, True, 0)
         self.stack.add_named(cal_page, "calendar")
@@ -825,7 +839,7 @@ class CustomCalendarBubbleWindow(Gtk.Window):
         alloc = widget.get_allocation()
         w, h = float(alloc.width), float(alloc.height)
         fg_r, fg_g, fg_b = self._fg_rgb
-        base_fs = float(max(8, min(16, self._font_size)))
+        base_fs = float(max(8, min(24, self._font_size)))
 
         header_h = max(20.0, base_fs * 1.9)
         grid_x = 2.0
@@ -857,7 +871,12 @@ class CustomCalendarBubbleWindow(Gtk.Window):
         else:
             today_aqi_hex = "#34d399"
         aqi_r, aqi_g, aqi_b = hex_to_rgb(today_aqi_hex, default=(0.20, 0.83, 0.60))
-        icon_sz = max(14, min(22, int(min(col_w * 0.36, row_h * 0.44))))
+        icon_sz = max(14, min(40, int(min(col_w * 0.42, row_h * 0.42, base_fs * 1.85))))
+
+        cfg = self.parent_widget.config
+        cur_m_rgb = hex_to_rgb(cfg.get("cal_cur_month_bg_color", "#212933"), default=(0.13, 0.16, 0.20))
+        other_m_rgb = hex_to_rgb(cfg.get("cal_other_month_bg_color", "#171c24"), default=(0.09, 0.11, 0.14))
+        fc_rgb = hex_to_rgb(cfg.get("cal_forecast_bg_color", "#293345"), default=(0.16, 0.20, 0.27))
 
         for idx, d_obj in enumerate(self.cell_dates):
             r_idx = idx // 7
@@ -873,14 +892,18 @@ class CustomCalendarBubbleWindow(Gtk.Window):
             day_fc = daily_map.get(d_str)
 
             draw_rounded_rect(ctx, cx, cy, cw, ch, 5.0)
+            cell_bg_rgb = None
             if is_today:
-                ctx.set_source_rgba(aqi_r, aqi_g, aqi_b, 0.32)
+                ctx.set_source_rgba(aqi_r, aqi_g, aqi_b, 0.34)
             elif day_fc is not None:
-                ctx.set_source_rgba(0.20, 0.34, 0.50, 0.28)
+                cell_bg_rgb = fc_rgb
+                ctx.set_source_rgba(fc_rgb[0], fc_rgb[1], fc_rgb[2], 0.72)
             elif in_month:
-                ctx.set_source_rgba(fg_r, fg_g, fg_b, 0.06)
+                cell_bg_rgb = cur_m_rgb
+                ctx.set_source_rgba(cur_m_rgb[0], cur_m_rgb[1], cur_m_rgb[2], 0.62)
             else:
-                ctx.set_source_rgba(fg_r, fg_g, fg_b, 0.02)
+                cell_bg_rgb = other_m_rgb
+                ctx.set_source_rgba(other_m_rgb[0], other_m_rgb[1], other_m_rgb[2], 0.42)
             ctx.fill()
 
             if is_today:
@@ -888,6 +911,13 @@ class CustomCalendarBubbleWindow(Gtk.Window):
                 ctx.set_source_rgba(aqi_r, aqi_g, aqi_b, 0.96)
                 ctx.set_line_width(1.6)
                 ctx.stroke()
+
+            # Auto-adapt cell text contrast if user chose a dark/light cell color
+            if cell_bg_rgb is not None:
+                c_lum = rgb_luminance(cell_bg_rgb)
+                c_fg = (0.08, 0.10, 0.14) if c_lum > 0.58 else (0.95, 0.97, 1.00)
+            else:
+                c_fg = (fg_r, fg_g, fg_b)
 
             # Day number (top-left)
             ctx.select_font_face(
@@ -897,13 +927,13 @@ class CustomCalendarBubbleWindow(Gtk.Window):
             )
             ctx.set_font_size(base_fs)
             if not in_month:
-                ctx.set_source_rgba(fg_r, fg_g, fg_b, 0.32)
+                ctx.set_source_rgba(c_fg[0], c_fg[1], c_fg[2], 0.45)
             elif is_today:
                 ctx.set_source_rgba(fg_r, fg_g, fg_b, 1.00)
             elif c_idx >= 5:
-                ctx.set_source_rgba(0.98, 0.62, 0.55, 0.96)
+                ctx.set_source_rgba(0.98, 0.52, 0.44, 0.98)
             else:
-                ctx.set_source_rgba(fg_r, fg_g, fg_b, 0.95)
+                ctx.set_source_rgba(c_fg[0], c_fg[1], c_fg[2], 0.96)
             ctx.move_to(cx + 4.0, cy + base_fs + 2.0)
             ctx.show_text(str(d_obj.day))
 
@@ -922,10 +952,10 @@ class CustomCalendarBubbleWindow(Gtk.Window):
 
                 if tmax is not None and tmin is not None:
                     t_str = f"{int(round(tmax))}°/{int(round(tmin))}°"
-                    t_fs = max(7.5, min(base_fs - 1.0, cw * 0.175))
+                    t_fs = max(8.0, min(base_fs * 0.92, cw * 0.19))
                     ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
                     ctx.set_font_size(t_fs)
-                    ctx.set_source_rgba(fg_r, fg_g, fg_b, 0.96)
+                    ctx.set_source_rgba(c_fg[0], c_fg[1], c_fg[2], 0.96)
                     t_ext = ctx.text_extents(t_str)
                     ty = cy + ch - (t_fs + 4.5 if show_prob else 4.0)
                     ctx.move_to(cx + (cw - t_ext.width) / 2.0 - t_ext.x_bearing, ty)
@@ -933,11 +963,11 @@ class CustomCalendarBubbleWindow(Gtk.Window):
 
                 if show_prob:
                     p_str = f"{int(round(pprob))}%"
-                    p_fs = max(7.0, min(base_fs - 2.0, cw * 0.16))
+                    p_fs = max(7.5, min(base_fs * 0.84, cw * 0.175))
                     ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
                     ctx.set_font_size(p_fs)
                     p_ext = ctx.text_extents(p_str)
-                    drop_sz = max(5.5, p_fs * 0.85)
+                    drop_sz = max(6.0, p_fs * 0.90)
                     drop_gap = 2.0
                     total_pw = drop_sz * 0.72 + drop_gap + p_ext.width
                     start_px = cx + (cw - total_pw) / 2.0
@@ -2115,9 +2145,28 @@ class ClockWeatherPopupWindow(Gtk.Window):
         wdata = self.parent_widget.weather_data or {}
         city = wdata.get("city") or self.parent_widget.config.get("city_name", "台北")
         upd = wdata.get("updated_at", "尚未更新")
-        fs = max(8, min(20, int(self.parent_widget.config.get("calendar_font_size", 11))))
+        fs = max(8, min(24, int(self.parent_widget.config.get("calendar_font_size", 11))))
         t_pt = int((fs + 2.5) * 1024)
         s_pt = int(max(8.5, fs - 1.0) * 1024)
+
+        # Dynamically expand calendar canvas & window when font size grows so cells never feel cramped
+        e_cell_w = max(72, int(round(fs * 6.0)))
+        e_cell_h = max(58, int(round(fs * 4.7)))
+        e_cal_w = e_cell_w * 7 + 12
+        e_cal_h = int(round(fs * 2.3)) + e_cell_h * 6 + 12
+        try:
+            ml, mt, mr, mb = self.parent_widget._get_active_monitor_bounds()
+            e_cal_w = min(e_cal_w, max(500, (mr - ml) - 380))
+            e_cal_h = min(e_cal_h, max(390, (mb - mt) - 180))
+        except Exception:
+            pass
+        self.cal_canvas.set_size_request(int(e_cal_w), int(e_cal_h))
+        if self.get_realized():
+            cur_w, cur_h = self.get_size()
+            need_w = int(e_cal_w) + 340
+            need_h = int(e_cal_h) + 125
+            if cur_w < need_w or cur_h < need_h:
+                self.resize(max(cur_w, need_w), max(cur_h, need_h))
 
         self.month_lbl.set_markup(
             f"<span size='{t_pt}'><b>{self.view_year} 年 {self.view_month:02d} 月</b></span>   "
@@ -2176,7 +2225,7 @@ class ClockWeatherPopupWindow(Gtk.Window):
         alloc = widget.get_allocation()
         w, h = float(alloc.width), float(alloc.height)
 
-        base_fs = float(max(8, min(20, int(self.parent_widget.config.get("calendar_font_size", 11)))))
+        base_fs = float(max(8, min(24, int(self.parent_widget.config.get("calendar_font_size", 11)))))
         draw_rounded_rect(ctx, 0, 0, w, h, 8.0)
         ctx.set_source_rgba(0.10, 0.13, 0.17, 0.96)
         ctx.fill()
@@ -2212,7 +2261,12 @@ class ClockWeatherPopupWindow(Gtk.Window):
         else:
             today_aqi_hex = "#34d399"
         aqi_r, aqi_g, aqi_b = hex_to_rgb(today_aqi_hex, default=(0.20, 0.83, 0.60))
-        icon_sz = max(14, min(22, int(min(col_w * 0.34, row_h * 0.36))))
+        icon_sz = max(14, min(42, int(min(col_w * 0.40, row_h * 0.40, base_fs * 1.85))))
+
+        cfg = self.parent_widget.config
+        cur_m_rgb = hex_to_rgb(cfg.get("cal_cur_month_bg_color", "#212933"), default=(0.13, 0.16, 0.20))
+        other_m_rgb = hex_to_rgb(cfg.get("cal_other_month_bg_color", "#171c24"), default=(0.09, 0.11, 0.14))
+        fc_rgb = hex_to_rgb(cfg.get("cal_forecast_bg_color", "#293345"), default=(0.16, 0.20, 0.27))
 
         if not self.cell_dates:
             self._compute_month_cells()
@@ -2232,17 +2286,21 @@ class ClockWeatherPopupWindow(Gtk.Window):
             day_fc = daily_map.get(d_str)
 
             draw_rounded_rect(ctx, cx, cy, cw, ch, 5.0)
+            cell_bg_rgb = None
             if is_today:
                 scale = 0.44 if is_sel else 0.30
                 ctx.set_source_rgba(aqi_r * scale, aqi_g * scale, aqi_b * scale, 0.95)
             elif is_sel:
                 ctx.set_source_rgba(0.16, 0.34, 0.54, 0.96)
             elif day_fc is not None:
-                ctx.set_source_rgba(0.16, 0.20, 0.27, 0.95)
+                cell_bg_rgb = fc_rgb
+                ctx.set_source_rgba(fc_rgb[0], fc_rgb[1], fc_rgb[2], 0.95)
             elif is_cur_m:
-                ctx.set_source_rgba(0.13, 0.16, 0.20, 0.90)
+                cell_bg_rgb = cur_m_rgb
+                ctx.set_source_rgba(cur_m_rgb[0], cur_m_rgb[1], cur_m_rgb[2], 0.92)
             else:
-                ctx.set_source_rgba(0.09, 0.11, 0.14, 0.55)
+                cell_bg_rgb = other_m_rgb
+                ctx.set_source_rgba(other_m_rgb[0], other_m_rgb[1], other_m_rgb[2], 0.65)
             ctx.fill_preserve()
 
             if is_today:
@@ -2259,17 +2317,20 @@ class ClockWeatherPopupWindow(Gtk.Window):
                 ctx.set_line_width(0.8)
             ctx.stroke()
 
+            is_light_cell = cell_bg_rgb is not None and rgb_luminance(cell_bg_rgb) > 0.58
+            c_fg = (0.08, 0.10, 0.14) if is_light_cell else (0.94, 0.97, 1.00)
+
             # Day number (top-left)
             ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
             ctx.set_font_size(base_fs)
             if is_today:
                 ctx.set_source_rgba(aqi_r, aqi_g, aqi_b, 1.0)
             elif not is_cur_m:
-                ctx.set_source_rgba(0.45, 0.50, 0.58, 0.70)
+                ctx.set_source_rgba(c_fg[0], c_fg[1], c_fg[2], 0.45)
             elif c_idx >= 5:
-                ctx.set_source_rgba(0.98, 0.62, 0.55, 0.96)
+                ctx.set_source_rgba(0.95, 0.46, 0.38, 0.98)
             else:
-                ctx.set_source_rgba(0.92, 0.96, 1.00, 0.96)
+                ctx.set_source_rgba(c_fg[0], c_fg[1], c_fg[2], 0.96)
             ctx.move_to(cx + 5.0, cy + base_fs + 3.0)
             ctx.show_text(str(d_obj.day))
 
@@ -2284,26 +2345,27 @@ class ClockWeatherPopupWindow(Gtk.Window):
                 tmax = day_fc.get("t_max")
                 tmin = day_fc.get("t_min")
                 pprob = day_fc.get("precip_prob")
+                show_prob = pprob is not None and pprob >= 30 and ch >= 46
 
                 if tmax is not None and tmin is not None:
                     t_str = f"{int(round(tmax))}°/{int(round(tmin))}°"
-                    t_fs = max(7.5, min(base_fs - 1.2, cw * 0.175))
+                    t_fs = max(8.0, min(base_fs * 0.92, cw * 0.19))
                     ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
                     ctx.set_font_size(t_fs)
-                    ctx.set_source_rgba(0.96, 0.98, 1.00, 0.95)
+                    ctx.set_source_rgba(c_fg[0], c_fg[1], c_fg[2], 0.96)
                     t_ext = ctx.text_extents(t_str)
-                    ty = cy + ch - (t_fs + 5.0 if (pprob is not None and pprob >= 30 and ch >= 50) else 5.0)
+                    ty = cy + ch - (t_fs + 5.0 if show_prob else 5.0)
                     ctx.move_to(cx + (cw - t_ext.width) / 2.0 - t_ext.x_bearing, ty)
                     ctx.show_text(t_str)
 
-                if pprob is not None and pprob >= 30 and ch >= 50:
+                if show_prob:
                     p_str = f"{int(round(pprob))}%"
-                    p_fs = max(7.0, min(base_fs - 2.0, cw * 0.16))
-                    ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+                    p_fs = max(7.5, min(base_fs * 0.84, cw * 0.175))
+                    ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
                     ctx.set_font_size(p_fs)
-                    ctx.set_source_rgba(0.45, 0.82, 1.00, 0.95)
+                    ctx.set_source_rgba(0.12, 0.56, 0.86, 0.98) if is_light_cell else ctx.set_source_rgba(0.45, 0.82, 1.00, 0.96)
                     p_ext = ctx.text_extents(p_str)
-                    drop_sz = max(6.0, p_fs * 0.88)
+                    drop_sz = max(6.0, p_fs * 0.90)
                     drop_gap = 2.5
                     total_pw = drop_sz * 0.72 + drop_gap + p_ext.width
                     start_px = cx + (cw - total_pw) / 2.0
@@ -3439,7 +3501,7 @@ class ClockWeatherWidget(Gtk.EventBox):
             adjustment=Gtk.Adjustment(
                 value=float(self.config.get("calendar_font_size", 11)),
                 lower=8.0,
-                upper=20.0,
+                upper=24.0,
                 step_increment=1.0,
                 page_increment=2.0,
                 page_size=0.0,
@@ -3543,6 +3605,19 @@ class ClockWeatherWidget(Gtk.EventBox):
         b_col_row.pack_start(lbl_b_op, False, False, 0)
         tab_bubble.pack_start(b_col_row, False, False, 0)
 
+        cal_bg_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        cal_bg_row.set_margin_start(10)
+        cal_cur_bg_btn = make_cbtn("cal_cur_month_bg_color", "#212933")
+        cal_other_bg_btn = make_cbtn("cal_other_month_bg_color", "#171c24")
+        cal_fc_bg_btn = make_cbtn("cal_forecast_bg_color", "#293345")
+        cal_bg_row.pack_start(Gtk.Label(label="當月日期底色：", xalign=0.0), False, False, 0)
+        cal_bg_row.pack_start(cal_cur_bg_btn, False, False, 0)
+        cal_bg_row.pack_start(Gtk.Label(label="非當月日期底色：", xalign=0.0), False, False, 0)
+        cal_bg_row.pack_start(cal_other_bg_btn, False, False, 0)
+        cal_bg_row.pack_start(Gtk.Label(label="一週日期底色：", xalign=0.0), False, False, 0)
+        cal_bg_row.pack_start(cal_fc_bg_btn, False, False, 0)
+        tab_bubble.pack_start(cal_bg_row, False, False, 0)
+
         b_test_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         b_test_row.set_margin_start(10)
         btn_test_bubble = Gtk.Button(label="🧪 測試精簡月曆氣泡")
@@ -3595,6 +3670,9 @@ class ClockWeatherWidget(Gtk.EventBox):
             self.config["bubble_offset_y"] = int(spin_b_oy.get_value_as_int())
             self.config["bubble_bg_color"] = rgba_to_hex(b_bg_btn.get_rgba())
             self.config["bubble_fg_color"] = rgba_to_hex(b_fg_btn.get_rgba())
+            self.config["cal_cur_month_bg_color"] = rgba_to_hex(cal_cur_bg_btn.get_rgba())
+            self.config["cal_other_month_bg_color"] = rgba_to_hex(cal_other_bg_btn.get_rgba())
+            self.config["cal_forecast_bg_color"] = rgba_to_hex(cal_fc_bg_btn.get_rgba())
             bop_v = max(10, min(100, int(round(scale_b_op.get_value()))))
             self.config["bubble_bg_opacity"] = bop_v
             lbl_b_op.set_text(f"{bop_v}%")
@@ -3717,6 +3795,9 @@ class ClockWeatherWidget(Gtk.EventBox):
         btn_test_alert.connect("clicked", _on_test_alert)
         b_bg_btn.connect("color-set", apply_all)
         b_fg_btn.connect("color-set", apply_all)
+        cal_cur_bg_btn.connect("color-set", apply_all)
+        cal_other_bg_btn.connect("color-set", apply_all)
+        cal_fc_bg_btn.connect("color-set", apply_all)
         scale_b_op.connect("value-changed", apply_all)
         combo_detail_mode.connect("changed", apply_all)
         combo_b_pos.connect("changed", apply_all)

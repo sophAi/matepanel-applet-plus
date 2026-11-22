@@ -40,7 +40,9 @@ from taskwarrior_shared import TaskwarriorBackend, parse_tw_timestamp
 
 CONFIG_DIR = os.path.expanduser("~/.config/matepanel-applet-plus")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "taskwarrior-desktop.json")
-TASK_COLORS_PATH = os.path.join(CONFIG_DIR, "task-colors.json")
+TASK_DATA_DIR = os.path.expanduser("~/.task")
+OVERRIDES_PATH = os.path.join(TASK_DATA_DIR, "taskwarrior-desktop-overrides.json")
+LEGACY_TASK_COLORS_PATH = os.path.join(CONFIG_DIR, "task-colors.json")
 WEATHER_CACHE_PATH = os.path.join(CONFIG_DIR, "weather-cache.json")
 BACKUP_DIR = os.path.join(CONFIG_DIR, "backups")
 AUTOSTART_PATH = os.path.expanduser("~/.config/autostart/taskwarrior-desktop-calendar.desktop")
@@ -120,8 +122,7 @@ DEFAULT_CONFIG = {
     "task_font_size": 18,       # 6..28 任務膠囊全域預設字型大小
     "detail_font_size": 16,     # 9..24 詳細任務內容視窗字型大小
     "task_columns": 1,          # 1 = 全域預設單欄, 2 = 全域預設垂直分割成兩列
-    "date_cell_overrides": {},  # 單日獨立覆寫: {"YYYY-MM-DD": {"task_columns": 2, "task_font_size": 9, "bg_color": "#...", "border_color": "#...", "border_width": 2.0}}
-    "retention_days": 180,      # 啟動時保留天數（0 = 不自動刪除；>0 時清理超過此天數的任務與單日設定）
+    "retention_days": 180,      # 啟動時保留天數（0 = 不自動刪除；>0 時清理超過此天數的任務與單日覆寫）
     "auto_backup_enabled": True,   # 每日自動備份（保留最近 3 天）
     "auto_backup_keep_days": 3,    # 自動備份保留份數（預設最近 3 天）
     "auto_shrink_task_font": True,  # 當任務超過日期框大小時，自動縮小任務字型以完整顯示
@@ -433,8 +434,10 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         self.set_resizable(True)
         self.stick()
 
+        self._legacy_date_overrides = {}
+        self._last_saved_overrides_mtime = 0.0
         self.config = self._load_config()
-        self.task_colors = self._load_task_colors()
+        self.task_colors, self.date_cell_overrides = self._load_overrides(allow_migrate=True)
         self.weather_data = self._load_weather_cache()
         self.icon_theme = Gtk.IconTheme.get_default()
         self._icon_cache = {}
@@ -524,7 +527,12 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
                 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                     loaded = json.load(f)
                 if isinstance(loaded, dict):
-                    cfg.update(loaded)
+                    legacy_ov = loaded.pop("date_cell_overrides", None)
+                    if isinstance(legacy_ov, dict) and legacy_ov:
+                        self._legacy_date_overrides = legacy_ov
+                    for k, v in loaded.items():
+                        if k in DEFAULT_CONFIG:
+                            cfg[k] = v
             except Exception:
                 pass
         return cfg
@@ -532,18 +540,19 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
     def _save_config(self):
         try:
             os.makedirs(CONFIG_DIR, exist_ok=True)
+            clean_cfg = {k: v for k, v in self.config.items() if k != "date_cell_overrides"}
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(self.config, f, indent=2, ensure_ascii=False)
+                json.dump(clean_cfg, f, indent=2, ensure_ascii=False)
         except Exception:
             pass
 
     def _run_startup_cleanup(self):
         """
         Run ONCE on widget startup when retention_days > 0:
-        1. Remove expired date_cell_overrides (< today - retention_days) from taskwarrior-desktop.json.
+        1. Remove expired date_cell_overrides (< today - retention_days) from ~/.task/taskwarrior-desktop-overrides.json.
         2. Remove expired Taskwarrior tasks (including completed, deleted, pending, waiting, recurring)
            older than retention_days via official `task` CLI (`delete` -> `purge`), and prune their
-           UUIDs from task-colors.json.
+           UUIDs from task_colors in ~/.task/taskwarrior-desktop-overrides.json.
         When retention_days == 0, performs NO deletion at all.
         """
         try:
@@ -556,14 +565,19 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         cutoff_date = date.today() - timedelta(days=days)
         cutoff_str = cutoff_date.strftime("%Y-%m-%d")
 
-        # 1. Clean expired date_cell_overrides in taskwarrior-desktop.json
-        overrides = self.config.get("date_cell_overrides")
-        if isinstance(overrides, dict) and overrides:
-            expired_keys = [k for k in list(overrides.keys()) if isinstance(k, str) and len(k) == 10 and k < cutoff_str]
+        # 1. Clean expired date_cell_overrides in ~/.task/taskwarrior-desktop-overrides.json
+        overrides_changed = False
+        if isinstance(self.date_cell_overrides, dict) and self.date_cell_overrides:
+            expired_keys = [
+                k for k in list(self.date_cell_overrides.keys())
+                if isinstance(k, str) and len(k) == 10 and k < cutoff_str
+            ]
             if expired_keys:
                 for k in expired_keys:
-                    overrides.pop(k, None)
-                self._save_config()
+                    self.date_cell_overrides.pop(k, None)
+                overrides_changed = True
+        if overrides_changed:
+            self._save_overrides()
 
         # 2. Clean expired tasks in ~/.task via official Taskwarrior CLI
         if not TaskwarriorBackend.is_available():
@@ -665,7 +679,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         g_fs = max(6, min(28, int(self.config.get("task_font_size", 10))))
         g_cols = 2 if int(self.config.get("task_columns", 1)) >= 2 else 1
         has_manual_fs = False
-        overrides = self.config.get("date_cell_overrides")
+        overrides = self.date_cell_overrides
         if isinstance(overrides, dict):
             ov = overrides.get(d_str)
             if isinstance(ov, dict):
@@ -684,7 +698,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
 
     def _get_date_cell_style(self, d_str):
         """Return (bg_color_hex_or_None, border_color_hex_or_None, border_width_float_or_None) for a date cell."""
-        overrides = self.config.get("date_cell_overrides")
+        overrides = self.date_cell_overrides
         if not isinstance(overrides, dict):
             return None, None, None
         ov = overrides.get(d_str)
@@ -701,12 +715,10 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         return bg_c, bd_c, bd_w
 
     def _set_date_cell_style(self, d_str, bg_color=None, border_color=None, border_width=None):
-        """Update per-date custom bg_color / border_color / border_width in date_cell_overrides."""
-        overrides = self.config.setdefault("date_cell_overrides", {})
-        if not isinstance(overrides, dict):
-            overrides = {}
-            self.config["date_cell_overrides"] = overrides
-        ov = overrides.get(d_str)
+        """Update per-date custom bg_color / border_color / border_width in ~/.task/taskwarrior-desktop-overrides.json."""
+        if not isinstance(self.date_cell_overrides, dict):
+            self.date_cell_overrides = {}
+        ov = self.date_cell_overrides.get(d_str)
         if not isinstance(ov, dict):
             ov = {}
         if bg_color:
@@ -722,24 +734,22 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         else:
             ov.pop("border_width", None)
         if ov:
-            overrides[d_str] = ov
+            self.date_cell_overrides[d_str] = ov
         else:
-            overrides.pop(d_str, None)
-        self._save_config()
+            self.date_cell_overrides.pop(d_str, None)
+        self._save_overrides()
         self._refresh_view()
 
     def _set_date_cell_override(self, d_str, key, val):
         """Set a per-date override; automatically prune if it matches global default."""
-        overrides = self.config.setdefault("date_cell_overrides", {})
-        if not isinstance(overrides, dict):
-            overrides = {}
-            self.config["date_cell_overrides"] = overrides
+        if not isinstance(self.date_cell_overrides, dict):
+            self.date_cell_overrides = {}
         g_default = (
             (2 if int(self.config.get("task_columns", 1)) >= 2 else 1)
             if key == "task_columns"
             else max(6, min(28, int(self.config.get("task_font_size", 10))))
         )
-        ov = overrides.get(d_str)
+        ov = self.date_cell_overrides.get(d_str)
         if not isinstance(ov, dict):
             ov = {}
         if val == g_default:
@@ -747,23 +757,22 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         else:
             ov[key] = val
         if ov:
-            overrides[d_str] = ov
+            self.date_cell_overrides[d_str] = ov
         else:
-            overrides.pop(d_str, None)
-        self._save_config()
+            self.date_cell_overrides.pop(d_str, None)
+        self._save_overrides()
         self._refresh_view()
 
     def _reset_date_cell_override(self, d_str):
-        overrides = self.config.get("date_cell_overrides")
-        if isinstance(overrides, dict) and d_str in overrides:
-            overrides.pop(d_str, None)
-            self._save_config()
+        if isinstance(self.date_cell_overrides, dict) and d_str in self.date_cell_overrides:
+            self.date_cell_overrides.pop(d_str, None)
+            self._save_overrides()
             self._refresh_view()
 
     def _reset_all_date_overrides(self, *_args):
-        if self.config.get("date_cell_overrides"):
-            self.config["date_cell_overrides"] = {}
-            self._save_config()
+        if self.date_cell_overrides:
+            self.date_cell_overrides = {}
+            self._save_overrides()
             self._refresh_view()
 
     # =========================================================================
@@ -793,10 +802,10 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         tasks = self._export_all_tasks_raw()
         return {
             "format": "matepanel-taskwarrior-bundle",
-            "version": 1,
+            "version": 2,
             "exported_at": datetime.now().isoformat(timespec="seconds"),
-            "desktop_config": dict(self.config),
             "task_colors": dict(self.task_colors),
+            "date_cell_overrides": dict(self.date_cell_overrides),
             "tasks": tasks,
         }
 
@@ -917,7 +926,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
                 if ok:
                     self._show_info_dialog(
                         "匯出成功",
-                        f"已將 {n_tasks} 筆任務、{len(self.task_colors)} 筆任務顏色與完整桌面設定匯出至：\n{path}",
+                        f"已將 {n_tasks} 筆任務、{len(self.task_colors)} 筆任務顏色與 {len(self.date_cell_overrides)} 筆單日覆寫匯出至：\n{path}\n（不含本機靜態偏好設定）",
                     )
                 else:
                     self._show_info_dialog("匯出失敗", err, Gtk.MessageType.ERROR)
@@ -961,7 +970,12 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         b_tasks = bundle.get("tasks") if isinstance(bundle.get("tasks"), list) else []
         b_colors = bundle.get("task_colors") if isinstance(bundle.get("task_colors"), dict) else {}
         b_cfg = bundle.get("desktop_config") if isinstance(bundle.get("desktop_config"), dict) else {}
-        b_ov = b_cfg.get("date_cell_overrides") if isinstance(b_cfg.get("date_cell_overrides"), dict) else {}
+        if isinstance(bundle.get("date_cell_overrides"), dict):
+            b_ov = bundle.get("date_cell_overrides")
+        elif isinstance(b_cfg.get("date_cell_overrides"), dict):
+            b_ov = b_cfg.get("date_cell_overrides")
+        else:
+            b_ov = {}
         exp_at = str(bundle.get("exported_at") or "未知時間")
 
         cdlg = Gtk.Dialog(title="確認匯入備份封包", transient_for=None, flags=Gtk.DialogFlags.MODAL)
@@ -982,28 +996,24 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         lbl_sum.set_markup(
             f"<b>備份檔案：</b>{html.escape(os.path.basename(path))}\n"
             f"<b>匯出時間：</b>{html.escape(exp_at)}\n"
-            f"<b>包含內容：</b>{len(b_tasks)} 筆任務、{len(b_colors)} 筆任務顏色、{len(b_ov)} 筆單日排版設定"
+            f"<b>包含內容：</b>{len(b_tasks)} 筆任務、{len(b_colors)} 筆任務顏色、{len(b_ov)} 筆單日覆寫\n"
+            f"<small>（不覆蓋本機 taskwarrior-desktop.json 靜態偏好設定）</small>"
         )
         area.pack_start(lbl_sum, False, False, 0)
 
         rb_merge = Gtk.RadioButton.new_with_label_from_widget(
-            None, "合併匯入（推薦：保留本機其他任務，同 UUID 自動更新並合併顏色與設定）"
+            None, "合併匯入（推薦：保留本機其他任務，同 UUID 自動更新並合併顏色與單日覆寫）"
         )
         rb_replace = Gtk.RadioButton.new_with_label_from_widget(
-            rb_merge, "完整覆蓋還原（先清空本機 ~/.task 與設定，再完全還原此備份檔）"
+            rb_merge, "完整覆蓋還原（先清空本機 ~/.task 與覆寫檔，再完全還原此備份檔）"
         )
         rb_merge.set_active(True)
         area.pack_start(rb_merge, False, False, 0)
         area.pack_start(rb_replace, False, False, 0)
 
-        chk_apply_geom = Gtk.CheckButton(label="同時套用備份中的視窗位置與大小（自動夾限至目前螢幕範圍）")
-        chk_apply_geom.set_active(True)
-        area.pack_start(chk_apply_geom, False, False, 0)
-
         cdlg.show_all()
         resp = cdlg.run()
         is_replace = rb_replace.get_active()
-        apply_geom = chk_apply_geom.get_active()
         cdlg.destroy()
         if resp != Gtk.ResponseType.OK:
             return
@@ -1043,73 +1053,103 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
                 imported_ok = False
                 err_detail = str(e)
 
-        # 2. Import task_colors
+        # 2. Import task_colors & date_cell_overrides into ~/.task/taskwarrior-desktop-overrides.json
         clean_colors = {str(k): str(v) for k, v in b_colors.items() if isinstance(v, str) and v.startswith("#")}
+        clean_ov = {str(k): dict(v) for k, v in b_ov.items() if isinstance(v, dict)}
         if is_replace:
             self.task_colors = clean_colors
+            self.date_cell_overrides = clean_ov
         else:
             self.task_colors.update(clean_colors)
-        self._save_task_colors()
-
-        # 3. Import desktop_config
-        geom_keys = {"x", "y", "width", "height", "mini_x", "mini_y"}
-        if is_replace:
-            new_cfg = dict(DEFAULT_CONFIG)
-            for k, v in b_cfg.items():
-                if not apply_geom and k in geom_keys:
-                    new_cfg[k] = self.config.get(k, new_cfg.get(k))
-                else:
-                    new_cfg[k] = v
-            self.config = new_cfg
-        else:
-            merged_ov = dict(self.config.get("date_cell_overrides") or {})
-            merged_ov.update(b_ov)
-            for k, v in b_cfg.items():
-                if k == "date_cell_overrides":
-                    continue
-                if not apply_geom and k in geom_keys:
-                    continue
-                self.config[k] = v
-            self.config["date_cell_overrides"] = merged_ov
-
-        self._clamp_geometry_to_workarea()
-        self._save_config()
-
-        if apply_geom and not self._is_minimized and not self._is_maximized:
-            self.resize(int(self.config["width"]), int(self.config["height"]))
-            self.move(int(self.config["x"]), int(self.config["y"]))
+            self.date_cell_overrides.update(clean_ov)
+        self._save_overrides()
 
         self.reload_tasks()
         if imported_ok:
             self._show_info_dialog(
                 "匯入完成",
-                f"已成功匯入 {len(b_tasks)} 筆任務、{len(clean_colors)} 筆任務顏色與桌面月曆設定！",
+                f"已成功匯入 {len(b_tasks)} 筆任務、{len(clean_colors)} 筆任務顏色與 {len(clean_ov)} 筆單日覆寫！",
             )
         else:
             self._show_info_dialog(
-                "設定已匯入，但任務匯入出現警告",
+                "覆寫檔已匯入，但任務匯入出現警告",
                 err_detail or "請確認 Taskwarrior (`task`) 狀態。",
                 Gtk.MessageType.WARNING,
             )
 
-    def _load_task_colors(self):
-        if os.path.exists(TASK_COLORS_PATH):
+    def _load_overrides(self, allow_migrate=False):
+        """
+        Load `(task_colors, date_cell_overrides)` from `~/.task/taskwarrior-desktop-overrides.json`.
+        On first run (allow_migrate=True) if the file does not exist yet, seamlessly migrates
+        legacy `~/.config/matepanel-applet-plus/task-colors.json` and `date_cell_overrides` from
+        `taskwarrior-desktop.json` into `~/.task/taskwarrior-desktop-overrides.json`.
+        """
+        colors = {}
+        date_ov = {}
+        if os.path.exists(OVERRIDES_PATH):
             try:
-                with open(TASK_COLORS_PATH, "r", encoding="utf-8") as f:
+                with open(OVERRIDES_PATH, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 if isinstance(data, dict):
-                    return {str(k): str(v) for k, v in data.items() if isinstance(v, str) and v.startswith("#")}
+                    tc = data.get("task_colors")
+                    if isinstance(tc, dict):
+                        colors = {str(k): str(v) for k, v in tc.items() if isinstance(v, str) and v.startswith("#")}
+                    do = data.get("date_cell_overrides")
+                    if isinstance(do, dict):
+                        date_ov = {str(k): dict(v) for k, v in do.items() if isinstance(v, dict)}
+                try:
+                    self._last_saved_overrides_mtime = os.path.getmtime(OVERRIDES_PATH)
+                except Exception:
+                    pass
+                return colors, date_ov
+            except Exception:
+                return colors, date_ov
+
+        if allow_migrate:
+            migrated = False
+            if os.path.exists(LEGACY_TASK_COLORS_PATH):
+                try:
+                    with open(LEGACY_TASK_COLORS_PATH, "r", encoding="utf-8") as f:
+                        old_tc = json.load(f)
+                    if isinstance(old_tc, dict):
+                        colors = {str(k): str(v) for k, v in old_tc.items() if isinstance(v, str) and v.startswith("#")}
+                        if colors:
+                            migrated = True
+                except Exception:
+                    pass
+            if isinstance(self._legacy_date_overrides, dict) and self._legacy_date_overrides:
+                date_ov = {str(k): dict(v) for k, v in self._legacy_date_overrides.items() if isinstance(v, dict)}
+                if date_ov:
+                    migrated = True
+            self.task_colors = colors
+            self.date_cell_overrides = date_ov
+            if migrated:
+                self._save_overrides()
+                self._save_config()  # Strip legacy date_cell_overrides from static taskwarrior-desktop.json
+            return colors, date_ov
+
+        return colors, date_ov
+
+    def _save_overrides(self):
+        try:
+            os.makedirs(TASK_DATA_DIR, exist_ok=True)
+            payload = {
+                "task_colors": dict(self.task_colors or {}),
+                "date_cell_overrides": dict(self.date_cell_overrides or {}),
+            }
+            tmp_path = OVERRIDES_PATH + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, OVERRIDES_PATH)
+            try:
+                self._last_saved_overrides_mtime = os.path.getmtime(OVERRIDES_PATH)
             except Exception:
                 pass
-        return {}
-
-    def _save_task_colors(self):
-        try:
-            os.makedirs(CONFIG_DIR, exist_ok=True)
-            with open(TASK_COLORS_PATH, "w", encoding="utf-8") as f:
-                json.dump(self.task_colors, f, indent=2, ensure_ascii=False)
         except Exception:
             pass
+
+    def _save_task_colors(self):
+        self._save_overrides()
 
     def _load_weather_cache(self):
         if os.path.exists(WEATHER_CACHE_PATH):
@@ -1400,18 +1440,30 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
     # =========================================================================
 
     def _start_file_monitor(self):
-        task_dir = os.path.expanduser("~/.task")
-        if not os.path.isdir(task_dir):
-            return
         try:
-            gfile = Gio.File.new_for_path(task_dir)
-            mon = gfile.monitor_directory(Gio.FileMonitorFlags.NONE, None)
+            os.makedirs(TASK_DATA_DIR, exist_ok=True)
+            gfile = Gio.File.new_for_path(TASK_DATA_DIR)
+            mon = gfile.monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
             mon.connect("changed", self._on_task_dir_changed)
             self._file_monitor = mon
         except Exception:
             self._file_monitor = None
 
-    def _on_task_dir_changed(self, _mon, _f, _other, _ev_type):
+    def _on_task_dir_changed(self, _mon, f, other, _ev_type):
+        # Handle both direct writes and rsync's atomic temp-file rename (f or other)
+        names = set()
+        if f is not None and f.get_basename():
+            names.add(f.get_basename())
+        if other is not None and other.get_basename():
+            names.add(other.get_basename())
+        if "taskwarrior-desktop-overrides.json" in names and len(names) == 1:
+            # Skip redundant reload if we ourselves just wrote this exact mtime
+            try:
+                cur_mt = os.path.getmtime(OVERRIDES_PATH)
+                if abs(cur_mt - self._last_saved_overrides_mtime) < 0.001:
+                    return
+            except Exception:
+                pass
         if self._monitor_debounce_id is not None:
             try:
                 GLib.source_remove(self._monitor_debounce_id)
@@ -1421,6 +1473,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
 
     def _on_debounced_reload(self):
         self._monitor_debounce_id = None
+        self.task_colors, self.date_cell_overrides = self._load_overrides(allow_migrate=False)
         self.reload_tasks()
         return False
 
@@ -1436,7 +1489,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
 
     def _on_config_dir_changed(self, _mon, f, _other, _ev_type):
         bname = f.get_basename() if f is not None else ""
-        if bname not in ("weather-cache.json", "task-colors.json"):
+        if bname != "weather-cache.json":
             return
         if self._config_debounce_id is not None:
             try:
@@ -1448,7 +1501,6 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
     def _on_debounced_config_reload(self):
         self._config_debounce_id = None
         self.weather_data = self._load_weather_cache()
-        self.task_colors = self._load_task_colors()
         self.cal_canvas.queue_draw()
         return False
 
@@ -2901,7 +2953,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
             d_lbl = clicked_date.strftime("%m/%d")
             d_fs_f, d_cols, _has_mfs = self._get_date_cell_settings(d_str)
             d_fs = int(round(d_fs_f))
-            has_ov = isinstance(self.config.get("date_cell_overrides"), dict) and d_str in self.config["date_cell_overrides"]
+            has_ov = isinstance(self.date_cell_overrides, dict) and d_str in self.date_cell_overrides
             n_day_tasks = len(self._by_date_pending.get(d_str, [])) + len(self._by_date_completed.get(d_str, []))
             layout_items = [
                 (
@@ -3331,12 +3383,9 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
                 matched = {k: v for k, v in imp_cfg.items() if k in valid_keys}
                 if not matched:
                     raise ValueError("找不到任何相容的桌面月曆偏好設定欄位")
-                # Preserve existing date_cell_overrides untouched
-                saved_ov = dict(self.config.get("date_cell_overrides") or {})
                 new_cfg = dict(DEFAULT_CONFIG)
                 new_cfg.update(self.config)
                 new_cfg.update(matched)
-                new_cfg["date_cell_overrides"] = saved_ov
                 self.config = new_cfg
                 self._save_config()
                 self._refresh_view()

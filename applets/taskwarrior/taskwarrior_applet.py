@@ -1536,22 +1536,31 @@ class TaskwarriorWidget(Gtk.EventBox):
             return
         try:
             gfile = Gio.File.new_for_path(TASK_DATA_DIR)
-            self.file_monitor = gfile.monitor_directory(Gio.FileMonitorFlags.NONE, None)
+            self.file_monitor = gfile.monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
             self.file_monitor.connect("changed", self._on_task_dir_changed)
         except Exception:
             self.file_monitor = None
 
-    def _on_task_dir_changed(self, _monitor, file_obj, _other_file, event_type):
-        if file_obj is not None:
-            bname = file_obj.get_basename() or ""
-            if not bname.endswith(".data"):
-                return
-        if event_type in (
+    def _on_task_dir_changed(self, _monitor, file_obj, other_file, event_type):
+        names = []
+        if file_obj is not None and file_obj.get_basename():
+            names.append(file_obj.get_basename())
+        if other_file is not None and other_file.get_basename():
+            names.append(other_file.get_basename())
+        if names and not any(n.endswith((".data", ".sqlite3")) for n in names):
+            return
+        watch_events = {
             Gio.FileMonitorEvent.CHANGES_DONE_HINT,
             Gio.FileMonitorEvent.CREATED,
             Gio.FileMonitorEvent.CHANGED,
             Gio.FileMonitorEvent.MOVED,
-        ):
+            Gio.FileMonitorEvent.DELETED,
+        }
+        for attr in ("MOVED_IN", "RENAMED"):
+            ev = getattr(Gio.FileMonitorEvent, attr, None)
+            if ev is not None:
+                watch_events.add(ev)
+        if event_type in watch_events:
             if self.debounce_id is not None:
                 GLib.source_remove(self.debounce_id)
             self.debounce_id = GLib.timeout_add(150, self._on_debounced_reload)
