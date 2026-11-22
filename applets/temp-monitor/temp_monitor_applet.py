@@ -52,6 +52,7 @@ DEFAULT_CONFIG = {
     "interval_sec": 2,
     "display_mode": "badge",            # "badge" (方塊圖示) or "icon_text" (晶片圖示+文字)
     "gpu_badge_layout": "compact",      # "separate" (獨立方塊 [CPU][GPU][UTL][MEM]) or "compact" (GPU方塊內嵌雙進度條)
+    "compact_bar_width": 3,             # 緊湊二合一佈局兩側進度條寬度 (px, 2..12，加寬時自動加寬方塊不縮字)
     "show_panel_gpu_util": True,        # 在面板顯示 Volatile GPU-Util
     "show_panel_gpu_mem": True,         # 在面板顯示 GPU Memory-Usage
     "gpu_mem_panel_unit": "percent",    # "percent" (26%) or "gib" (1.1G)
@@ -768,7 +769,13 @@ class TempMonitorWidget(Gtk.EventBox):
         if mode == "badge":
             n_badges = self._get_badge_count()
             width_factor = 1.28 if layout == "compact" else 1.18
-            badge_w = max(32 if layout == "compact" else 30, int(h * width_factor))
+            base_badge_w = max(32 if layout == "compact" else 30, int(h * width_factor))
+            if layout == "compact":
+                bar_w = max(2, min(12, int(round(float(self.config.get("compact_bar_width", 3))))))
+                extra_bar_w = max(0, bar_w - 3) * 2
+                badge_w = base_badge_w + extra_bar_w
+            else:
+                badge_w = base_badge_w
             gap = 4
             total_w = badge_w * n_badges + gap * (n_badges - 1) + 4
         else:
@@ -926,7 +933,8 @@ class TempMonitorWidget(Gtk.EventBox):
         # Draw vertical side progress bars inside left and right edges (bottom-up fill)
         has_left = bool(side_bars and side_bars.get("left") is not None)
         has_right = bool(side_bars and side_bars.get("right") is not None)
-        bar_w = max(2.4, min(3.4, bw * 0.095))
+        cfg_bar_w = max(2.0, min(12.0, float(self.config.get("compact_bar_width", 3))))
+        bar_w = min(cfg_bar_w, max(2.0, bw * 0.28))
         bar_pad_y = 3.2
         bar_h = max(6.0, bh - bar_pad_y * 2.0)
         bar_y = y + bar_pad_y
@@ -1830,6 +1838,30 @@ class TempMonitorWidget(Gtk.EventBox):
         chk_no_border.set_active(self.config.get("hide_panel_border", False))
         tab_style.pack_start(chk_no_border, False, False, 0)
 
+        bar_w_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        bar_w_box.pack_start(Gtk.Label(label="緊湊二合一進度條寬度 (px)：", xalign=0.0), False, False, 0)
+        spin_bar_w = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(
+                value=float(self.config.get("compact_bar_width", 3)),
+                lower=2.0,
+                upper=12.0,
+                step_increment=1.0,
+                page_increment=2.0,
+                page_size=0.0,
+            ),
+            climb_rate=1.0,
+            digits=0,
+        )
+        bar_w_box.pack_start(spin_bar_w, False, False, 0)
+        bar_w_box.pack_start(
+            Gtk.Label(label="（模式 A 佈局 2 專用；加寬進度條會自動加寬圖示、不縮小溫度數字）", xalign=0.0),
+            False,
+            False,
+            0,
+        )
+        bar_w_box.set_sensitive(rb_badge.get_active() and rb_layout_comp.get_active())
+        tab_style.pack_start(bar_w_box, False, False, 0)
+
         # Section 5: Calculation & Thresholds (Tab 1)
         sec5_lbl = Gtk.Label(xalign=0.0)
         sec5_lbl.set_markup("<b>2. 感測器計算與中度/高溫警戒變色閾值</b>")
@@ -1938,6 +1970,8 @@ class TempMonitorWidget(Gtk.EventBox):
             self.config["text_shadow"] = chk_shadow.get_active()
             self.config["show_hover_tooltip"] = chk_hover_tip.get_active()
             self.config["hide_panel_border"] = chk_no_border.get_active()
+            self.config["compact_bar_width"] = max(2, min(12, int(spin_bar_w.get_value_as_int())))
+            bar_w_box.set_sensitive(rb_badge.get_active() and rb_layout_comp.get_active())
             self.config["cpu_avg_cores_only"] = chk_cores_only.get_active()
             self.config["show_other_sensors"] = chk_other.get_active()
             self.config["warn_temp_c"] = float(spin_warn.get_value())
@@ -1950,6 +1984,7 @@ class TempMonitorWidget(Gtk.EventBox):
             )
             self._save_config()
             self._sync_timer()
+            self._update_canvas_size()
             self.refresh_readings(force_poll=self.config["enabled"])
 
         def on_color_picked(_btn):
@@ -2001,7 +2036,7 @@ class TempMonitorWidget(Gtk.EventBox):
             chk_other,
         ):
             w_ctrl.connect("toggled", apply_changes)
-        for sp_ctrl in (spin_freq, spin_warn, spin_crit, spin_warn_p, spin_crit_p):
+        for sp_ctrl in (spin_freq, spin_warn, spin_crit, spin_warn_p, spin_crit_p, spin_bar_w):
             sp_ctrl.connect("value-changed", apply_changes)
 
         # Bottom buttons

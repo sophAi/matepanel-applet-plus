@@ -3043,8 +3043,156 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
             c.connect("toggled", apply_all)
 
         btm_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_exp_pref = Gtk.Button(label="📤 匯出設定...")
+        btn_exp_pref.set_tooltip_text("僅匯出偏好設定參數（不含任務資料與單日日期框樣式覆寫）")
+        btn_imp_pref = Gtk.Button(label="📥 匯入設定...")
+        btn_imp_pref.set_tooltip_text("僅匯入偏好設定參數（保留現有任務資料與單日日期框樣式覆寫）")
         btn_close = Gtk.Button(label="關閉")
         btn_close.connect("clicked", lambda *_: win.destroy())
+
+        pref_exclude_keys = {"date_cell_overrides"}
+
+        def on_export_prefs(*_):
+            apply_all()
+            today_str = datetime.now().strftime("%Y%m%d")
+            dlg = Gtk.FileChooserDialog(
+                title="匯出桌面月曆偏好設定檔（僅偏好設定）",
+                parent=win,
+                action=Gtk.FileChooserAction.SAVE,
+            )
+            dlg.set_do_overwrite_confirmation(True)
+            dlg.add_buttons(
+                Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                Gtk.STOCK_SAVE, Gtk.ResponseType.OK,
+            )
+            flt = Gtk.FileFilter()
+            flt.set_name("JSON 設定檔 (*.json)")
+            flt.add_pattern("*.json")
+            dlg.add_filter(flt)
+            dlg.set_current_folder(os.path.expanduser("~"))
+            dlg.set_current_name(f"taskwarrior-desktop-prefs-{today_str}.json")
+            resp = dlg.run()
+            out_path = dlg.get_filename() if resp == Gtk.ResponseType.OK else None
+            dlg.destroy()
+            if not out_path:
+                return
+            if not out_path.lower().endswith(".json"):
+                out_path += ".json"
+
+            pref_only = {
+                k: v for k, v in self.config.items()
+                if k in DEFAULT_CONFIG and k not in pref_exclude_keys
+            }
+            bundle = {
+                "format": "matepanel-applet-plus.taskwarrior-desktop.prefs",
+                "version": 1,
+                "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "config": pref_only,
+            }
+            try:
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(bundle, f, indent=2, ensure_ascii=False)
+                md = Gtk.MessageDialog(
+                    transient_for=win,
+                    flags=0,
+                    message_type=Gtk.MessageType.INFO,
+                    buttons=Gtk.ButtonsType.OK,
+                    text="✅ 已成功匯出偏好設定",
+                )
+                md.format_secondary_text(f"已儲存 {len(pref_only)} 項偏好參數至：{out_path}\n（不含任務與單日日期框樣式）")
+                md.run()
+                md.destroy()
+            except Exception as exc:
+                md = Gtk.MessageDialog(
+                    transient_for=win,
+                    flags=0,
+                    message_type=Gtk.MessageType.ERROR,
+                    buttons=Gtk.ButtonsType.OK,
+                    text="❌ 匯出偏好設定失敗",
+                )
+                md.format_secondary_text(str(exc))
+                md.run()
+                md.destroy()
+
+        def on_import_prefs(*_):
+            dlg = Gtk.FileChooserDialog(
+                title="匯入桌面月曆偏好設定檔（僅偏好設定）",
+                parent=win,
+                action=Gtk.FileChooserAction.OPEN,
+            )
+            dlg.add_buttons(
+                Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                Gtk.STOCK_OPEN, Gtk.ResponseType.OK,
+            )
+            flt = Gtk.FileFilter()
+            flt.set_name("JSON 設定檔 (*.json)")
+            flt.add_pattern("*.json")
+            dlg.add_filter(flt)
+            dlg.set_current_folder(os.path.expanduser("~"))
+            resp = dlg.run()
+            in_path = dlg.get_filename() if resp == Gtk.ResponseType.OK else None
+            dlg.destroy()
+            if not in_path:
+                return
+            try:
+                with open(in_path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if not isinstance(raw, dict):
+                    raise ValueError("檔案格式無效（非 JSON 物件）")
+                if raw.get("format") == "matepanel-applet-plus.taskwarrior-desktop.prefs" and isinstance(raw.get("config"), dict):
+                    imp_cfg = raw["config"]
+                elif isinstance(raw.get("desktop_config"), dict):
+                    imp_cfg = raw["desktop_config"]
+                else:
+                    imp_cfg = raw
+                valid_keys = set(DEFAULT_CONFIG.keys()) - pref_exclude_keys
+                matched = {k: v for k, v in imp_cfg.items() if k in valid_keys}
+                if not matched:
+                    raise ValueError("找不到任何相容的桌面月曆偏好設定欄位")
+                # Preserve existing date_cell_overrides untouched
+                saved_ov = dict(self.config.get("date_cell_overrides") or {})
+                new_cfg = dict(DEFAULT_CONFIG)
+                new_cfg.update(self.config)
+                new_cfg.update(matched)
+                new_cfg["date_cell_overrides"] = saved_ov
+                self.config = new_cfg
+                self._save_config()
+                self._refresh_view()
+                for rb in list(self._detail_rebuilders):
+                    try:
+                        rb()
+                    except Exception:
+                        pass
+                win.destroy()
+                self.show_preferences_dialog()
+                md = Gtk.MessageDialog(
+                    transient_for=None,
+                    flags=0,
+                    message_type=Gtk.MessageType.INFO,
+                    buttons=Gtk.ButtonsType.OK,
+                    text="✅ 已成功匯入偏好設定",
+                )
+                md.format_secondary_text(
+                    f"已套用來自「{os.path.basename(in_path)}」的 {len(matched)} 項偏好參數（已保留既有任務與單日日期框樣式）。"
+                )
+                md.run()
+                md.destroy()
+            except Exception as exc:
+                md = Gtk.MessageDialog(
+                    transient_for=win,
+                    flags=0,
+                    message_type=Gtk.MessageType.ERROR,
+                    buttons=Gtk.ButtonsType.OK,
+                    text="❌ 匯入偏好設定失敗",
+                )
+                md.format_secondary_text(str(exc))
+                md.run()
+                md.destroy()
+
+        btn_exp_pref.connect("clicked", on_export_prefs)
+        btn_imp_pref.connect("clicked", on_import_prefs)
+        btm_row.pack_start(btn_exp_pref, False, False, 0)
+        btm_row.pack_start(btn_imp_pref, False, False, 0)
         btm_row.pack_end(btn_close, False, False, 0)
         outer.pack_end(btm_row, False, False, 0)
 
