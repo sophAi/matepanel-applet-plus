@@ -111,6 +111,7 @@ DEFAULT_CONFIG = {
     "dbus_popup_max_dicts": 3,           # 氣泡框最多顯示幾本命中的詞典 (1..5)
     "dbus_popup_timeout_sec": 15,        # 氣泡框停留秒數 (1..60)
     "dbus_popup_font_size": 16,          # 氣泡框字型大小 (pt)
+    "dbus_popup_width": 520,             # 氣泡框最大寬度 (px)
     "dbus_popup_position": "top_right",  # "top_center"(置中上方), "top_left"(左上角), "top_right"(右上角), "bottom_right"(右下角), "bottom_left"(左下角)
     "dbus_popup_x_offset": 0,            # 氣泡框水平偏移 (-500..+500 px)
     "dbus_popup_y_offset": 4,            # 氣泡框垂直偏移 (-300..+500 px)
@@ -180,6 +181,8 @@ DEFAULT_CONFIG = {
     "vocab_epub_layout": "per_word",     # "per_word" (一字一頁，預設) or "az_chapters" (依字母 A-Z 分章)
     "vocab_html_embed_audio": True,      # 匯出 HTML 單字卡時內嵌高品質語音音檔 (Base64 離線通用)
     "result_font_size": 15,              # 結果視窗字型大小 (pt)
+    "result_window_width": 460,          # 無焦點結果視窗寬度 (px)
+    "result_window_height": 420,         # 無焦點結果視窗高度 (px)
     "font_color_mode": "dynamic",        # "dynamic" or "custom"
     "custom_font_color": "#e66100",      # 自訂面板字形顏色
     "badge_bg_style": "light",           # (舊版相容欄位)
@@ -292,7 +295,7 @@ class CustomBubbleWindow(Gtk.Window):
     hover-to-pause auto-dismiss.
     """
 
-    def __init__(self, summary, body_markup, bg_hex, fg_hex, bg_opacity, font_size, on_close_cb=None):
+    def __init__(self, summary, body_markup, bg_hex, fg_hex, bg_opacity, font_size, max_width=520, on_close_cb=None):
         super().__init__(type=Gtk.WindowType.POPUP)
         self.set_decorated(False)
         self.set_accept_focus(False)
@@ -334,9 +337,10 @@ class CustomBubbleWindow(Gtk.Window):
         box.set_margin_end(14)
 
         fs = max(8, min(22, int(font_size)))
+        mw = max(260, min(1200, int(max_width)))
         title_pango_sz = (fs + 1) * 1024
         body_pango_sz = fs * 1024
-        max_chars = max(32, min(52, int(520.0 / max(8.5, fs * 0.9))))
+        max_chars = max(22, min(140, int(float(mw - 28) / max(8.0, fs * 0.9))))
 
         lbl_title = Gtk.Label(xalign=0.0)
         lbl_title.set_line_wrap(True)
@@ -455,6 +459,7 @@ class CustomBubbleManager:
         fg_color="#f0f6ff",
         bg_opacity=92,
         font_size=11,
+        max_width=520,
         timeout_sec=8,
     ):
         self.close_all()
@@ -466,6 +471,9 @@ class CustomBubbleManager:
         mon_h = max(200, mon_bottom - mon_top)
         pad = 12
         stack_gap = 10
+        req_max_w = max(260, min(1200, int(max_width)))
+        avail_w = max(240, mon_w - pad * 2)
+        cap_w = min(req_max_w, avail_w)
 
         created = []
         for summary, body_markup, _icon in items:
@@ -476,11 +484,16 @@ class CustomBubbleManager:
                 fg_hex=fg_color,
                 bg_opacity=bg_opacity,
                 font_size=font_size,
+                max_width=cap_w,
                 on_close_cb=self._on_bubble_closed,
             )
             _, nat = win.get_preferred_size()
-            bw = max(180, min(nat.width, mon_w - pad * 2))
-            bh = max(48, min(nat.height, mon_h - pad * 2))
+            bw = max(220, min(max(nat.width, min(cap_w, 320)), cap_w))
+            try:
+                _, nat_h = win.get_preferred_height_for_width(bw)
+            except Exception:
+                nat_h = nat.height
+            bh = max(48, min(max(nat_h, nat.height), mon_h - pad * 2))
             win.resize(bw, bh)
             created.append((win, bw, bh))
 
@@ -2516,6 +2529,68 @@ class VocabHistoryManager:
             self._save_unlocked()
 
     @staticmethod
+    def parse_word_list(raw_text):
+        """
+        Parse a pasted vocabulary list supporting newline, comma, semicolon, and Tab separators.
+        Strips leading numbering/bullets (e.g. '1. ', '2) ', '- ', '• ') and deduplicates
+        case-insensitively while preserving first-seen order.
+        Returns `(unique_words, dup_count)`.
+        """
+        if not raw_text:
+            return [], 0
+        seen = set()
+        out = []
+        dup_cnt = 0
+        for line in raw_text.replace("\r\n", "\n").replace("\r", "\n").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # Split by comma / Chinese comma / semicolon / Tab (preserving spaces for multi-word phrases)
+            tokens = re.split(r"[,，;；\t]+", line)
+            for tok in tokens:
+                w = re.sub(r"^\s*(?:\d+\s*[.)、:：]\s*|[-*•●▪▫‣⁃–—]\s+)", "", tok)
+                w = w.strip().strip("\"'")
+                if not w or len(w) > 80:
+                    continue
+                k = w.lower()
+                if k in seen:
+                    dup_cnt += 1
+                    continue
+                seen.add(k)
+                out.append(w)
+        return out, dup_cnt
+
+    def add_words_bulk(self, words_list):
+        """
+        Add multiple words to vocabulary history in a single atomic save without
+        overwriting existing words' lookup counts. Returns `(added_count, existing_count)`.
+        """
+        if not words_list:
+            return 0, 0
+        now_iso = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        added = 0
+        existing = 0
+        with self._lock:
+            for raw_w in words_list:
+                w = (raw_w or "").strip()
+                if not w or "\n" in w or len(w) > 80:
+                    continue
+                key = w.lower()
+                if key in self._words:
+                    existing += 1
+                else:
+                    self._words[key] = {
+                        "word": w,
+                        "count": 1,
+                        "first_seen": now_iso,
+                        "last_seen": now_iso,
+                    }
+                    added += 1
+            if added > 0:
+                self._save_unlocked()
+        return added, existing
+
+    @staticmethod
     def export_html(
         filepath,
         cards,
@@ -3452,20 +3527,93 @@ class DictCalcPopupWindow(Gtk.Window):
     def __init__(self, parent_widget):
         super().__init__(title="📖 StarDict 查詢結果")
         self.parent_widget = parent_widget
-        self.set_default_size(430, 400)
+        init_w = max(300, min(1400, int(parent_widget.config.get("result_window_width", 460))))
+        init_h = max(240, min(1000, int(parent_widget.config.get("result_window_height", 420))))
+        self.set_default_size(init_w, init_h)
+        self.set_size_request(300, 240)
+        self.set_resizable(True)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_accept_focus(False)
         self.set_focus_on_map(False)
         self.set_skip_taskbar_hint(True)
         self.set_keep_above(True)
         self.connect("delete-event", self._on_delete_hide)
+        self.connect("configure-event", self._on_configure_save_size)
 
         self._last_calc_result = None
+        self._save_size_tid = None
+        self._resize_drag = None  # (start_root_x, start_root_y, start_w, start_h)
         self._build_ui()
 
     def _on_delete_hide(self, *_args):
         self.hide()
         return True
+
+    def _on_configure_save_size(self, _widget, event):
+        w, h = int(event.width), int(event.height)
+        if w >= 300 and h >= 240:
+            cfg = self.parent_widget.config
+            if cfg.get("result_window_width") != w or cfg.get("result_window_height") != h:
+                cfg["result_window_width"] = w
+                cfg["result_window_height"] = h
+                if self._save_size_tid is not None:
+                    try:
+                        GLib.source_remove(self._save_size_tid)
+                    except Exception:
+                        pass
+                self._save_size_tid = GLib.timeout_add(400, self._flush_saved_size)
+        return False
+
+    def _flush_saved_size(self):
+        self._save_size_tid = None
+        self.parent_widget._save_config()
+        return False
+
+    def _on_grip_enter(self, widget, _event):
+        gdk_w = widget.get_window()
+        if gdk_w is not None:
+            try:
+                cur = Gdk.Cursor.new_for_display(widget.get_display(), Gdk.CursorType.BOTTOM_RIGHT_CORNER)
+                gdk_w.set_cursor(cur)
+            except Exception:
+                pass
+        return False
+
+    def _on_grip_leave(self, widget, _event):
+        if self._resize_drag is None:
+            gdk_w = widget.get_window()
+            if gdk_w is not None:
+                gdk_w.set_cursor(None)
+        return False
+
+    def _on_grip_press(self, _widget, event):
+        if event.button != 1:
+            return False
+        cur_w, cur_h = self.get_size()
+        self._resize_drag = (float(event.x_root), float(event.y_root), int(cur_w), int(cur_h))
+        return True
+
+    def _on_grip_motion(self, _widget, event):
+        if self._resize_drag is None:
+            return False
+        sx, sy, sw, sh = self._resize_drag
+        new_w = max(300, min(1400, int(round(sw + (float(event.x_root) - sx)))))
+        new_h = max(240, min(1000, int(round(sh + (float(event.y_root) - sy)))))
+        self.resize(new_w, new_h)
+        return True
+
+    def _on_grip_release(self, widget, event):
+        if event.button == 1 and self._resize_drag is not None:
+            self._resize_drag = None
+            gdk_w = widget.get_window()
+            if gdk_w is not None:
+                gdk_w.set_cursor(None)
+            w, h = self.get_size()
+            self.parent_widget.config["result_window_width"] = max(300, min(1400, int(w)))
+            self.parent_widget.config["result_window_height"] = max(240, min(1000, int(h)))
+            self.parent_widget._save_config()
+            return True
+        return False
 
     def _build_ui(self):
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -3530,10 +3678,33 @@ class DictCalcPopupWindow(Gtk.Window):
         scroll.add(self.result_view)
         root.pack_start(scroll, True, True, 0)
 
-        # Status Footer
+        # Status Footer + WM-independent bottom-right resize grip (works even with accept_focus=False)
+        footer_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.status_lbl = Gtk.Label(xalign=0.0)
+        self.status_lbl.set_ellipsize(3)  # Pango.EllipsizeMode.END
         self._update_status_footer()
-        root.pack_start(self.status_lbl, False, False, 0)
+        footer_box.pack_start(self.status_lbl, True, True, 0)
+
+        grip_eb = Gtk.EventBox()
+        grip_eb.set_above_child(True)
+        grip_eb.set_tooltip_text("按住拖曳可自由調整視窗寬度與高度")
+        grip_lbl = Gtk.Label(label="◢")
+        grip_lbl.set_opacity(0.65)
+        grip_eb.add(grip_lbl)
+        grip_eb.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+            | Gdk.EventMask.ENTER_NOTIFY_MASK
+            | Gdk.EventMask.LEAVE_NOTIFY_MASK
+        )
+        grip_eb.connect("enter-notify-event", self._on_grip_enter)
+        grip_eb.connect("leave-notify-event", self._on_grip_leave)
+        grip_eb.connect("button-press-event", self._on_grip_press)
+        grip_eb.connect("motion-notify-event", self._on_grip_motion)
+        grip_eb.connect("button-release-event", self._on_grip_release)
+        footer_box.pack_end(grip_eb, False, False, 0)
+        root.pack_start(footer_box, False, False, 0)
 
         self.add(root)
         self.show_all()
@@ -4528,6 +4699,7 @@ class DictCalcWidget(Gtk.EventBox):
             fg_color=self.config.get("dbus_popup_fg_color", "#f0f6ff"),
             bg_opacity=int(self.config.get("dbus_popup_bg_opacity", 92)),
             font_size=int(self.config.get("dbus_popup_font_size", 11)),
+            max_width=int(self.config.get("dbus_popup_width", 520)),
             timeout_sec=t_sec,
         )
 
@@ -5926,6 +6098,30 @@ class DictCalcWidget(Gtk.EventBox):
         dbus_num_box.pack_start(spin_dbus_fs, False, False, 0)
         tab_bubble.pack_start(dbus_num_box, False, False, 0)
 
+        dbus_w_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        dbus_w_box.set_margin_start(12)
+        dbus_w_box.pack_start(Gtk.Label(label="氣泡最大寬度 (px)：", xalign=0.0), False, False, 0)
+        spin_dbus_w = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(
+                value=float(self.config.get("dbus_popup_width", 520)),
+                lower=260.0,
+                upper=1200.0,
+                step_increment=20.0,
+                page_increment=60.0,
+                page_size=0.0,
+            ),
+            climb_rate=1.0,
+            digits=0,
+        )
+        dbus_w_box.pack_start(spin_dbus_w, False, False, 0)
+        dbus_w_box.pack_start(
+            Gtk.Label(label="（範圍 260–1200 px，文字超出時自動換行）", xalign=0.0),
+            False,
+            False,
+            0,
+        )
+        tab_bubble.pack_start(dbus_w_box, False, False, 0)
+
         b_test_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         b_test_box.set_margin_start(12)
         b_test_box.set_margin_top(6)
@@ -6513,11 +6709,12 @@ class DictCalcWidget(Gtk.EventBox):
         v_left.pack_start(v_w_scroll, True, True, 0)
 
         v_w_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        btn_vw_paste = Gtk.Button(label="📋 貼上清單")
         btn_vw_all = Gtk.Button(label="全選")
         btn_vw_none = Gtk.Button(label="取消")
         btn_vw_del = Gtk.Button(label="刪除勾選")
         btn_vw_clr = Gtk.Button(label="清空全部")
-        for b_vw in (btn_vw_all, btn_vw_none, btn_vw_del, btn_vw_clr):
+        for b_vw in (btn_vw_paste, btn_vw_all, btn_vw_none, btn_vw_del, btn_vw_clr):
             v_w_btns.pack_start(b_vw, False, False, 0)
         v_left.pack_start(v_w_btns, False, False, 0)
 
@@ -6742,8 +6939,12 @@ class DictCalcWidget(Gtk.EventBox):
             self.vocab_mgr.clear_all()
             refresh_vocab_words()
 
-        def start_vocab_export(fmt):
-            selected_rows = [(row[1], row[2], row[3]) for row in v_word_store if row[0]]
+        def start_vocab_export(fmt, override_words=None):
+            if override_words is not None:
+                today_iso = datetime.datetime.now().strftime("%Y-%m-%d")
+                selected_rows = [(w, 1, today_iso) for w in override_words]
+            else:
+                selected_rows = [(row[1], row[2], row[3]) for row in v_word_store if row[0]]
             if not selected_rows:
                 v_prog_bar.set_text("⚠️ 請先勾選至少一個要匯出的單字")
                 return
@@ -6778,7 +6979,7 @@ class DictCalcWidget(Gtk.EventBox):
             epub_layout = combo_epub_layout.get_active_id() or "per_word"
             embed_audio = (fmt == "html" and chk_html_embed_audio.get_active())
             cfg_snap = dict(self.config)
-            if sort_mode == "random":
+            if sort_mode == "random" and override_words is None:
                 random.shuffle(selected_rows)
 
             btn_exp_html.set_sensitive(False)
@@ -6852,6 +7053,9 @@ class DictCalcWidget(Gtk.EventBox):
                 except Exception as exc:
                     err_msg = str(exc)
 
+                hit_cnt = sum(1 for c in cards if c.get("entries"))
+                miss_cnt = len(cards) - hit_cnt
+
                 def _exp_done():
                     btn_exp_html.set_sensitive(True)
                     btn_exp_epub.set_sensitive(True)
@@ -6860,21 +7064,152 @@ class DictCalcWidget(Gtk.EventBox):
                         v_prog_bar.set_text(f"❌ 匯出失敗：{err_msg}")
                     else:
                         v_prog_bar.set_fraction(1.0)
+                        detail_parts = []
+                        if miss_cnt > 0:
+                            detail_parts.append(f"命中 {hit_cnt} 字、無釋義 {miss_cnt} 字")
                         if embed_audio:
-                            v_prog_bar.set_text(
-                                f"✅ 已匯出 {len(cards)} 字（含 {len(audio_map)} 筆內嵌語音）至：{os.path.basename(out_path)}"
-                            )
-                        else:
-                            v_prog_bar.set_text(f"✅ 已匯出 {len(cards)} 字至：{os.path.basename(out_path)}")
+                            detail_parts.append(f"含 {len(audio_map)} 筆內嵌語音")
+                        detail_str = f"（{'，'.join(detail_parts)}）" if detail_parts else ""
+                        v_prog_bar.set_text(
+                            f"✅ 已匯出 {len(cards)} 字{detail_str}至：{os.path.basename(out_path)}"
+                        )
                     return False
 
                 GLib.idle_add(_exp_done)
 
             threading.Thread(target=_exp_worker, daemon=True).start()
 
+        def open_paste_words_dialog(*_):
+            p_dlg = Gtk.Dialog(
+                title="📋 貼上自訂單字清單",
+                transient_for=win,
+                modal=True,
+                destroy_with_parent=True,
+            )
+            p_dlg.set_default_size(540, 420)
+            p_box = p_dlg.get_content_area()
+            p_box.set_spacing(8)
+            p_box.set_border_width(12)
+
+            lbl_hint = Gtk.Label(xalign=0.0)
+            lbl_hint.set_line_wrap(True)
+            lbl_hint.set_markup(
+                "<small>支援<b>每行一字</b>、<b>逗號 / 分號 / Tab</b> 分隔（片語可整行輸入），"
+                "將自動移除編號（如 <code>1. </code> / <code>- </code> / <code>• </code>）並去除重複單字。</small>"
+            )
+            p_box.pack_start(lbl_hint, False, False, 0)
+
+            top_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            btn_load_txt = Gtk.Button(label="📂 載入 .txt 檔")
+            btn_paste_cb = Gtk.Button(label="📋 從剪貼簿貼上")
+            btn_clr_txt = Gtk.Button(label="🗑 清空")
+            lbl_parsed = Gtk.Label(xalign=1.0)
+            lbl_parsed.set_markup("<small>已解析 <b>0</b> 個不重複單字</small>")
+            top_bar.pack_start(btn_load_txt, False, False, 0)
+            top_bar.pack_start(btn_paste_cb, False, False, 0)
+            top_bar.pack_start(btn_clr_txt, False, False, 0)
+            top_bar.pack_end(lbl_parsed, True, True, 0)
+            p_box.pack_start(top_bar, False, False, 0)
+
+            p_tv = Gtk.TextView()
+            p_tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+            p_tv.set_left_margin(6)
+            p_tv.set_right_margin(6)
+            p_tv.set_top_margin(6)
+            p_tv.set_bottom_margin(6)
+            p_buf = p_tv.get_buffer()
+            p_scroll = Gtk.ScrolledWindow()
+            p_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+            p_scroll.set_vexpand(True)
+            p_scroll.set_shadow_type(Gtk.ShadowType.IN)
+            p_scroll.add(p_tv)
+            p_box.pack_start(p_scroll, True, True, 0)
+
+            act_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            btn_add_lib = Gtk.Button(label="➕ 加入單字庫並勾選")
+            btn_dir_html = Gtk.Button(label="📄 僅用此清單匯出 HTML")
+            btn_dir_epub = Gtk.Button(label="📚 僅用此清單匯出 EPUB")
+            btn_close_p = Gtk.Button(label="關閉")
+            act_bar.pack_start(btn_add_lib, False, False, 0)
+            act_bar.pack_start(btn_dir_html, False, False, 0)
+            act_bar.pack_start(btn_dir_epub, False, False, 0)
+            act_bar.pack_end(btn_close_p, False, False, 0)
+            p_box.pack_start(act_bar, False, False, 0)
+
+            def _get_parsed():
+                txt = p_buf.get_text(p_buf.get_start_iter(), p_buf.get_end_iter(), True)
+                return VocabHistoryManager.parse_word_list(txt)
+
+            def _update_parsed_lbl(*_):
+                words, dups = _get_parsed()
+                dup_s = f"（已略過 {dups} 筆重複）" if dups else ""
+                lbl_parsed.set_markup(f"<small>已解析 <b>{len(words)}</b> 個不重複單字{dup_s}</small>")
+                has_w = len(words) > 0
+                btn_add_lib.set_sensitive(has_w)
+                btn_dir_html.set_sensitive(has_w)
+                btn_dir_epub.set_sensitive(has_w)
+
+            def _on_load_txt(*_):
+                fdlg = Gtk.FileChooserDialog(
+                    title="選擇單字清單文字檔 (.txt / .csv)",
+                    parent=p_dlg,
+                    action=Gtk.FileChooserAction.OPEN,
+                )
+                fdlg.add_buttons(
+                    Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                    Gtk.STOCK_OPEN, Gtk.ResponseType.OK,
+                )
+                fdlg.set_current_folder(os.path.expanduser("~"))
+                resp = fdlg.run()
+                fpath = fdlg.get_filename() if resp == Gtk.ResponseType.OK else None
+                fdlg.destroy()
+                if fpath and os.path.isfile(fpath):
+                    try:
+                        with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                            p_buf.set_text(f.read())
+                    except Exception:
+                        pass
+
+            def _on_paste_cb(*_):
+                cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+                txt = cb.wait_for_text()
+                if txt:
+                    p_buf.set_text(txt)
+
+            def _on_add_lib(*_):
+                words, _dups = _get_parsed()
+                if not words:
+                    return
+                added, existing = self.vocab_mgr.add_words_bulk(words)
+                p_dlg.destroy()
+                refresh_vocab_words()
+                ex_s = f"，{existing} 字已存在" if existing else ""
+                v_prog_bar.set_text(f"✅ 已加入 {added} 個新單字至單字庫{ex_s}")
+
+            def _on_direct_export(fmt):
+                words, _dups = _get_parsed()
+                if not words:
+                    return
+                p_dlg.destroy()
+                start_vocab_export(fmt, override_words=words)
+
+            p_buf.connect("changed", _update_parsed_lbl)
+            btn_load_txt.connect("clicked", _on_load_txt)
+            btn_paste_cb.connect("clicked", _on_paste_cb)
+            btn_clr_txt.connect("clicked", lambda *_: p_buf.set_text(""))
+            btn_add_lib.connect("clicked", _on_add_lib)
+            btn_dir_html.connect("clicked", lambda *_: _on_direct_export("html"))
+            btn_dir_epub.connect("clicked", lambda *_: _on_direct_export("epub"))
+            btn_close_p.connect("clicked", lambda *_: p_dlg.destroy())
+
+            _update_parsed_lbl()
+            p_dlg.show_all()
+            p_tv.grab_focus()
+
         btn_v_refresh.connect("clicked", refresh_vocab_words)
         combo_v_filter.connect("changed", refresh_vocab_words)
         combo_v_sort.connect("changed", refresh_vocab_words)
+        btn_vw_paste.connect("clicked", open_paste_words_dialog)
         btn_vw_all.connect("clicked", lambda *_: set_all_v_words(True))
         btn_vw_none.connect("clicked", lambda *_: set_all_v_words(False))
         btn_vw_del.connect("clicked", delete_selected_v_words)
@@ -6941,6 +7276,7 @@ class DictCalcWidget(Gtk.EventBox):
             self.config["dbus_popup_max_dicts"] = int(spin_dbus_max.get_value_as_int())
             self.config["dbus_popup_timeout_sec"] = int(spin_dbus_sec.get_value_as_int())
             self.config["dbus_popup_font_size"] = int(spin_dbus_fs.get_value_as_int())
+            self.config["dbus_popup_width"] = max(260, min(1200, int(spin_dbus_w.get_value_as_int())))
             self.config["dbus_popup_position"] = combo_bubble_pos.get_active_id() or "top_center"
             self.config["dbus_popup_x_offset"] = int(spin_dbus_xoff.get_value_as_int())
             self.config["dbus_popup_y_offset"] = int(spin_dbus_yoff.get_value_as_int())
@@ -7207,6 +7543,7 @@ class DictCalcWidget(Gtk.EventBox):
             spin_dbus_max,
             spin_dbus_sec,
             spin_dbus_fs,
+            spin_dbus_w,
             spin_dbus_xoff,
             spin_dbus_yoff,
             spin_entry_w,
