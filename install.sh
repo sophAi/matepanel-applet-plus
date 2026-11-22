@@ -53,6 +53,7 @@ usage() {
   save-panel-layout                     儲存目前 MATE Panel 佈局快照，並啟用開機延遲自動還原 (防止重開機跑位，免 sudo)
   restore-panel-layout                  立即從已儲存快照還原 MATE Panel 佈局 (免 sudo)
   disable-panel-layout                  停用開機自動還原 MATE Panel 佈局 (免 sudo)
+  check-deps [all|temp|task|dict|clock] 檢查並提示缺少的必要／建議系統與語音套件 (免 sudo)
 EOF
 }
 
@@ -65,6 +66,68 @@ reload_one() {
         echo "🔄 已重載 [${title}] (${script_name})"
     else
         echo "ℹ️  [${title}] (${script_name}) 目前未執行"
+    fi
+}
+
+check_dependencies() {
+    local scope="${1:-all}"
+    local missing_apt=()
+    local missing_opt=()
+    local missing_edge_tts=0
+
+    # Core MATE Panel / GTK3 bindings
+    if ! /usr/bin/python3 -c 'import gi; gi.require_version("Gtk","3.0"); gi.require_version("MatePanelApplet","4.0"); import cairo' 2>/dev/null; then
+        missing_apt+=("python3-gi" "python3-gi-cairo" "gir1.2-matepanelapplet-4.0")
+    fi
+
+    if [[ "${scope}" == "all" || "${scope}" == "task" || "${scope}" == "desktop" ]]; then
+        if ! command -v task >/dev/null 2>&1; then
+            missing_apt+=("taskwarrior")
+        fi
+        if ! command -v paplay >/dev/null 2>&1 && ! command -v pw-play >/dev/null 2>&1; then
+            missing_apt+=("pulseaudio-utils")
+        fi
+    fi
+
+    if [[ "${scope}" == "all" || "${scope}" == "dict" ]]; then
+        command -v sdcv >/dev/null 2>&1 || missing_apt+=("sdcv")
+        command -v aspell >/dev/null 2>&1 || missing_apt+=("aspell" "aspell-en")
+        if ! /usr/bin/python3 -c 'import gi; gi.require_version("Keybinder","3.0")' 2>/dev/null; then
+            missing_apt+=("gir1.2-keybinder-3.0")
+        fi
+        if ! command -v mpv >/dev/null 2>&1; then
+            missing_apt+=("mpv")
+        fi
+        if ! command -v espeak-ng >/dev/null 2>&1 && ! command -v espeak >/dev/null 2>&1; then
+            missing_opt+=("espeak-ng")
+        fi
+        if ! command -v edge-tts >/dev/null 2>&1 \
+           && [[ ! -x "${HOME}/.local/bin/edge-tts" ]] \
+           && [[ ! -x "/usr/local/bin/edge-tts" ]] \
+           && [[ ! -x "/opt/anaconda3/bin/edge-tts" ]]; then
+            missing_edge_tts=1
+        fi
+    fi
+
+    if [[ ${#missing_apt[@]} -eq 0 && ${#missing_opt[@]} -eq 0 && ${missing_edge_tts} -eq 0 ]]; then
+        echo "✅ 套件依賴檢查通過（所有必要與建議語音套件皆已安裝）！"
+        return 0
+    fi
+
+    echo ""
+    echo "⚠️  偵測到以下缺少的必要／建議套件："
+    if [[ ${#missing_apt[@]} -gt 0 ]]; then
+        echo "   • 必要系統套件：${missing_apt[*]}"
+        echo "     建議安裝指令：sudo apt install -y ${missing_apt[*]}"
+    fi
+    if [[ ${#missing_opt[@]} -gt 0 ]]; then
+        echo "   • 離線語音備援套件：${missing_opt[*]}"
+        echo "     建議安裝指令：sudo apt install -y ${missing_opt[*]}"
+    fi
+    if [[ ${missing_edge_tts} -eq 1 ]]; then
+        echo "   • Edge Neural TTS 語音引擎（單字與算式自然男/女聲，免 API Key）：edge-tts"
+        echo "     建議安裝指令：/usr/bin/python3 -m pip install --user --break-system-packages edge-tts"
+        echo "     （未安裝時仍會自動降級使用本機真人庫 / Google TTS / espeak-ng）"
     fi
 }
 
@@ -124,6 +187,7 @@ case "${ACTION}" in
         echo "   • Taskwarrior 任務管理 Plus"
         echo "   • StarDict 離線詞典與計算機 Plus"
         echo "   • 月曆、時鐘與天氣預報 Plus"
+        check_dependencies "${TARGET}"
         ;;
     uninstall)
         if [[ "${TARGET}" == "all" || "${TARGET}" == "temp" ]]; then
@@ -194,6 +258,7 @@ EOF
         pkill -f "taskwarrior_desktop_widget.py" 2>/dev/null || true
         nohup /usr/bin/python3 "${TASK_DESKTOP_EXEC}" >/dev/null 2>&1 &
         echo "✅ 已安裝開機自啟並啟動「Taskwarrior 桌面嵌入式月曆」(${TASK_DESKTOP_AUTOSTART})"
+        check_dependencies "desktop"
         ;;
     uninstall-desktop)
         rm -f "${TASK_DESKTOP_AUTOSTART}"
@@ -232,6 +297,9 @@ EOF
     disable-panel-layout)
         rm -f "${PANEL_LAYOUT_AUTOSTART}"
         echo "✅ 已停用開機自動還原 MATE Panel 佈局"
+        ;;
+    check-deps)
+        check_dependencies "${TARGET}"
         ;;
     *)
         usage

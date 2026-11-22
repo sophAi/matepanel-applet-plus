@@ -62,6 +62,12 @@ Custom MATE Panel Applets collection and development repository for Linux deskto
   - **純面板乾淨輸入框**：點擊或按全域快捷鍵（如 `XF86Calculator`）即透過 `applet.request_focus()` 取得輸入焦點，聚焦時自動將框線些微加粗至 `2px` 提示焦點狀態（零位移跳動），查詢結果不搶游標；可於偏好設定自訂輸入框寬度 (`60～320 px`)、背景顏色、不透明度 (`0%～100%`) 與字色。
   - **氣泡框設定分頁**：精準鎖定目前螢幕邊界（多螢幕不跨螢幕溢出），支援 **置中上方 / 左上角 / 右上角 / 右下角 / 左下角**、水平／垂直偏移微調、自訂背景色／字色／不透明度、字型大小、停留秒數、獨立多泡泡／粗體分隔線合併模式，滑鼠移入暫停消失、單擊或按 `Esc` 立即關閉。
   - **精簡右鍵選單**：提供 **📌 顯示上次查詢結果 (不自動關閉)**、一鍵切換氣泡框／無焦點視窗、立即查詢反白文字、開關自動劃詞與偏好設定。
+- **單字與算式語音發聲（獨立「🔊 語音發聲」分頁）**：
+  - **雙引擎順位與開關管理**（比照詞典管理，自由勾選啟用與 `▲ 上移`／`▼ 下移` 調整順位，失敗自動降級至下一順位）：
+    - **📖 單字發聲**：`本機真人語音庫 (WyabdcRealPeopleTTS)` → `Microsoft Edge Neural TTS` → `Google Translate TTS` → `espeak-ng`
+    - **🧮 算式中文語音**：`Microsoft Edge Neural TTS (台灣中文)` → `Google Translate TTS (台灣中文)`（逐位念出數字，如 `1024` →「一零二四」，不含萬千百十）
+  - **語音性質自訂與雙聲道上混**：支援 Edge 男／女／溫柔女聲（曉臻 / 雲哲 / 曉雨、Jenny / Guy / Aria）、**語速 (`0.60x～1.80x`)**、**音調 (`-6～+6`)**、**音量 (`0%～100%`)**、本地快取（上限 300 筆）與 `mpv` 強制左右雙聲道上混（解決 PipeWire 單聲道偏左問題）。
+  - **右鍵選單整合**：提供 **🔊 單字／結果重複發聲**、**🔊 查詢單字命中時自動發聲** 與 **🧮 自動發聲計算結果** 即時開關。
 - **單字紀錄與單字卡匯出（HTML / EPUB 3.0）**：
   - 僅自動紀錄傳統 StarDict 詞典命中的單字與查詢次數（存於 `~/.config/matepanel-applet-plus/vocab-history.json`）。
   - 偏好設定「🗂 單字卡」支援時間／次數篩選、**隨機洗牌排序**、自由勾選來源詞典，免外部套件直接匯出 **互動翻卡 HTML** 與 **標準 EPUB 3.0 電子書**（預設「一字一頁」，亦支援「A–Z 字母分章」）。
@@ -87,8 +93,10 @@ Custom MATE Panel Applets collection and development repository for Linux deskto
 
 - MATE Desktop (`gir1.2-matepanelapplet-4.0`, `python3-gi`, `python3-gi-cairo`)
 - 系統 Python 3 (`/usr/bin/python3`)
-- `DictCalcApplet` 建議套件：`sdcv`、`aspell`、`aspell-en`、`gir1.2-keybinder-3.0`
-- `TaskwarriorApplet` 需求：`task` (Taskwarrior)
+- `DictCalcApplet` 建議套件：`sdcv`、`aspell`、`aspell-en`、`gir1.2-keybinder-3.0`、`mpv`（雙聲道上混與語速／音調濾鏡）、`espeak-ng`（離線語音備援）
+  - Edge Neural TTS 自然男／女聲（免費免 Key）：`/usr/bin/python3 -m pip install --user --break-system-packages edge-tts`（未安裝時自動降級至本機真人庫 / Google TTS）
+  - 可選離線英文真人發音庫：`/usr/share/WyabdcRealPeopleTTS`
+- `TaskwarriorApplet` 需求：`task` (Taskwarrior)、`pulseaudio-utils`（`paplay`，用於番茄鐘提示音效）
 - `TempMonitorApplet` GPU 監控需求：NVIDIA 驅動 (`libnvidia-ml.so.1`)
 
 ---
@@ -126,6 +134,9 @@ Custom MATE Panel Applets collection and development repository for Linux deskto
 ./install.sh restore-panel-layout  # 立即從已儲存快照還原面板佈局
 ./install.sh disable-panel-layout  # 停用開機自動還原面板佈局
 
-# 6. 從系統 MATE Panel 移除註冊
+# 6. 檢查缺少的必要／建議套件（含 edge-tts / mpv / sdcv / task 等）
+./install.sh check-deps
+
+# 7. 從系統 MATE Panel 移除註冊
 ./install.sh uninstall
 ```

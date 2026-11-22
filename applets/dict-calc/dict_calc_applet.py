@@ -30,6 +30,7 @@ from collections import OrderedDict
 import datetime
 import difflib
 import glob
+import hashlib
 import html
 import json
 import math
@@ -37,6 +38,7 @@ import operator
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -119,6 +121,24 @@ DEFAULT_CONFIG = {
     "google_translate_enabled": True,    # 句子/段落自動使用線上/本機翻譯 (雙向翻譯)
     "google_translate_fallback": True,   # 離線詞典查無短片語時自動 Fallback 至翻譯引擎
     "translate_auto_copy": True,         # 翻譯引擎結果自動複製至系統剪貼簿 (可直接 Ctrl+V)
+    "tts_enabled": True,                 # 啟用單字與算式語音發聲
+    "tts_auto_speak": True,              # 查詢單字命中時自動發聲
+    "calc_auto_speak": True,             # 算式計算完成時自動以中文語音通報結果
+    "word_tts_engines": [
+        {"id": "real_people", "enabled": True},
+        {"id": "edge", "enabled": True},
+        {"id": "google", "enabled": True},
+        {"id": "espeak", "enabled": True},
+    ],
+    "calc_tts_engines": [
+        {"id": "edge", "enabled": True},
+        {"id": "google", "enabled": True},
+    ],
+    "tts_voice_gender": "female",        # "female" (女聲), "male" (男聲), "female_soft" (溫柔女聲)
+    "tts_speed": 1.0,                    # 語速倍率 (0.6..1.8)
+    "tts_pitch": 0,                      # 音調偏移 (-6..+6 半音)
+    "tts_real_people_dir": "/usr/share/WyabdcRealPeopleTTS",  # StarDict 真人語音庫目錄
+    "tts_volume": 80,                    # 單字與算式發聲音量 (0..100%)
     "google_translate_target": "zh-TW",  # 外文翻譯目標語言 ("zh-TW", "zh-CN", "ja", "en")
     "google_translate_reverse": "en",    # 中文反向翻譯目標語言 ("en", "ja")
     "translate_engine": "gemini",        # "google", "gemini", "openai_compat", "deepl"
@@ -1430,6 +1450,465 @@ def format_spelling_diff_markup(orig_word, suggestion, diff_color="#047857"):
     return "".join(parts)
 
 
+def number_to_zh_speech(res_str):
+    """
+    Convert a calculator result string (int, float, negative, scientific notation, hex, bin)
+    into digit-by-digit Mandarin spoken text (no 萬/千/百/十 place-value words).
+    """
+    s = (res_str or "").strip().replace(",", "")
+    if not s:
+        return ""
+
+    digits = "零一二三四五六七八九"
+
+    def _digits_to_zh(num_str):
+        neg = False
+        if num_str.startswith("-"):
+            neg = True
+            num_str = num_str[1:]
+        elif num_str.startswith("+"):
+            num_str = num_str[1:]
+        if "." in num_str:
+            ip, fp = num_str.split(".", 1)
+            if len(fp) > 4:
+                try:
+                    rounded = f"{float(num_str):.4f}"
+                    ip, fp = rounded.split(".", 1)
+                except Exception:
+                    fp = fp[:4]
+            fp = fp.rstrip("0")
+        else:
+            ip, fp = num_str, ""
+        ip_clean = ip.lstrip("0") or "0"
+        zh = "".join(digits[int(c)] for c in ip_clean if c.isdigit())
+        if fp:
+            zh += "點" + "".join(digits[int(c)] for c in fp if c.isdigit())
+        return ("負" + zh) if neg else zh
+
+    low = s.lower()
+    if low.startswith("0x") or low.startswith("-0x"):
+        neg_p = "負" if low.startswith("-") else ""
+        body = s.lstrip("-")[2:].upper()
+        return f"{neg_p}十六進位 " + " ".join(list(body))
+    if low.startswith("0b") or low.startswith("-0b"):
+        neg_p = "負" if low.startswith("-") else ""
+        body = s.lstrip("-")[2:]
+        return f"{neg_p}二進位 " + "".join(digits[int(c)] if c in "01" else c for c in body)
+
+    if "e" in low:
+        parts = low.split("e", 1)
+        try:
+            mant_zh = _digits_to_zh(parts[0])
+            exp_val = int(parts[1])
+            exp_zh = _digits_to_zh(str(exp_val))
+            return f"{mant_zh}乘以十的{exp_zh}次方"
+        except Exception:
+            pass
+
+    try:
+        float(s)
+        return _digits_to_zh(s)
+    except Exception:
+        return s
+
+
+class SpeechManager:
+    """
+    Zero-idle-RAM 3-tier hybrid word pronunciation engine:
+      1. Local StarDict RealPeopleTTS (.wav) -> O(1) os.path.isfile lookup + paplay
+      2. Google Translate TTS (.mp3) with local disk cache (~/.cache/matepanel-applet-plus/tts, max 300 files)
+      3. Offline espeak-ng / espeak fallback
+    """
+
+    CACHE_DIR = os.path.expanduser("~/.cache/matepanel-applet-plus/tts")
+    MAX_CACHE_FILES = 300
+
+    WORD_ENGINE_META = [
+        ("real_people", "本機真人語音庫 (WyabdcRealPeopleTTS)", "離線 · 英文 2.1 萬真人 .wav"),
+        ("edge", "Microsoft Edge Neural TTS", "線上 · 自然男/女聲 + 本地快取"),
+        ("google", "Google Translate TTS", "線上 · 免費多語 + 本地快取"),
+        ("espeak", "espeak-ng 離線合成", "離線 · 最後備援"),
+    ]
+    CALC_ENGINE_META = [
+        ("edge", "Microsoft Edge Neural TTS (台灣中文)", "線上 · 曉臻/雲哲/曉雨 + 快取"),
+        ("google", "Google Translate TTS (台灣中文)", "線上 · 免費女聲 + 快取"),
+    ]
+
+    @classmethod
+    def normalize_engine_list(cls, raw_list, kind="word"):
+        meta = cls.CALC_ENGINE_META if kind == "calc" else cls.WORD_ENGINE_META
+        valid_ids = [m[0] for m in meta]
+        seen = set()
+        out = []
+        if isinstance(raw_list, list):
+            for item in raw_list:
+                if isinstance(item, dict):
+                    eid = str(item.get("id") or "")
+                    en = bool(item.get("enabled", True))
+                elif isinstance(item, str):
+                    eid = item
+                    en = True
+                else:
+                    continue
+                if eid in valid_ids and eid not in seen:
+                    seen.add(eid)
+                    out.append({"id": eid, "enabled": en})
+        for eid in valid_ids:
+            if eid not in seen:
+                out.append({"id": eid, "enabled": True})
+        return out
+
+    @classmethod
+    def resolve_engine_chain(cls, config, kind="word"):
+        key = "calc_tts_engines" if kind == "calc" else "word_tts_engines"
+        norm = cls.normalize_engine_list(config.get(key), kind=kind)
+        return [it["id"] for it in norm if it.get("enabled", True)]
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._active_proc = None
+
+    def stop(self):
+        with self._lock:
+            proc = self._active_proc
+            self._active_proc = None
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=0.3)
+                    except Exception:
+                        proc.kill()
+            except Exception:
+                pass
+
+    def _run_player(self, cmd):
+        self.stop()
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            with self._lock:
+                self._active_proc = proc
+            proc.wait()
+            with self._lock:
+                if self._active_proc is proc:
+                    self._active_proc = None
+            return proc.returncode == 0
+        except Exception:
+            return False
+
+    @classmethod
+    def find_real_people_wav(cls, word, tts_dir):
+        if not word or not tts_dir or not os.path.isdir(tts_dir):
+            return None
+        clean = word.strip().lower().strip(".,!?;:\"'()[]{}")
+        if not clean:
+            return None
+        candidates = [clean]
+        if " " in clean:
+            candidates.append(clean.replace(" ", "_"))
+        for cand in candidates:
+            ch = cand[0]
+            if not ("a" <= ch <= "z"):
+                continue
+            p = os.path.join(tts_dir, ch, f"{cand}.wav")
+            if os.path.isfile(p):
+                return p
+            p_flat = os.path.join(tts_dir, f"{cand}.wav")
+            if os.path.isfile(p_flat):
+                return p_flat
+        return None
+
+    @staticmethod
+    def _detect_lang(text):
+        for ch in text:
+            o = ord(ch)
+            if 0x3040 <= o <= 0x30FF:
+                return "ja"
+        for ch in text:
+            o = ord(ch)
+            if 0x4E00 <= o <= 0x9FFF:
+                return "zh-TW"
+        return "en"
+
+    @staticmethod
+    def find_edge_tts_bin():
+        for cand in (
+            shutil.which("edge-tts"),
+            os.path.expanduser("~/.local/bin/edge-tts"),
+            "/usr/local/bin/edge-tts",
+            "/opt/anaconda3/bin/edge-tts",
+        ):
+            if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+                return cand
+        return None
+
+    @staticmethod
+    def _edge_voice_for(lang, gender):
+        g = gender or "female"
+        if lang == "zh-TW":
+            if g == "male":
+                return "zh-TW-YunJheNeural"
+            if g == "female_soft":
+                return "zh-TW-HsiaoYuNeural"
+            return "zh-TW-HsiaoChenNeural"
+        if lang == "ja":
+            return "ja-JP-KeitaNeural" if g == "male" else "ja-JP-NanamiNeural"
+        if g == "male":
+            return "en-US-GuyNeural"
+        if g == "female_soft":
+            return "en-US-AriaNeural"
+        return "en-US-JennyNeural"
+
+    @staticmethod
+    def _build_mpv_cmd(media_arg, vol_pct, speed=1.0, pitch=0, apply_sp=True):
+        af_parts = ["lavfi=[pan=stereo|c0=c0|c1=c0]"]
+        cmd = [
+            "mpv",
+            "--no-video",
+            "--really-quiet",
+            "--audio-channels=stereo",
+            f"--volume={vol_pct}",
+        ]
+        if apply_sp:
+            sp = max(0.6, min(1.8, float(speed)))
+            if abs(sp - 1.0) >= 0.02:
+                cmd.append(f"--speed={sp:.2f}")
+            pi = max(-6, min(6, int(round(float(pitch)))))
+            if pi != 0:
+                pscale = 2.0 ** (pi / 12.0)
+                af_parts.append(f"rubberband=pitch-scale={pscale:.4f}")
+        cmd.append("--af=" + ",".join(af_parts))
+        cmd.append(media_arg)
+        return cmd
+
+    def _play_wav(self, wav_path, vol_pct, speed=1.0, pitch=0):
+        # Force true stereo (L+R) upmix + optional speed/pitch via mpv
+        if shutil.which("mpv"):
+            return self._run_player(self._build_mpv_cmd(wav_path, vol_pct, speed=speed, pitch=pitch, apply_sp=True))
+        if shutil.which("paplay"):
+            pa_vol = int(round(65536 * (vol_pct / 100.0)))
+            return self._run_player(["paplay", "--channel-map=mono", f"--volume={pa_vol}", wav_path])
+        if shutil.which("pw-play"):
+            return self._run_player(["pw-play", "--volume", f"{vol_pct / 100.0:.2f}", wav_path])
+        if shutil.which("aplay"):
+            return self._run_player(["aplay", "-q", wav_path])
+        return False
+
+    def _play_mp3(self, mp3_path, vol_pct, speed=1.0, pitch=0, apply_sp=True):
+        # Force true stereo (L+R) upmix + optional speed/pitch via mpv
+        if shutil.which("mpv"):
+            return self._run_player(self._build_mpv_cmd(mp3_path, vol_pct, speed=speed, pitch=pitch, apply_sp=apply_sp))
+        if shutil.which("mpg123"):
+            scale = max(0, min(32768, int(round(32768 * (vol_pct / 100.0)))))
+            return self._run_player(["mpg123", "-q", "--stereo", "--scale", str(scale), mp3_path])
+        if shutil.which("ffplay"):
+            return self._run_player(
+                [
+                    "ffplay",
+                    "-nodisp",
+                    "-autoexit",
+                    "-loglevel",
+                    "quiet",
+                    "-af",
+                    "pan=stereo|c0=c0|c1=c0",
+                    mp3_path,
+                ]
+            )
+        return False
+
+    def _play_espeak(self, text, lang, vol_pct, speed=1.0, pitch=0):
+        exe = shutil.which("espeak-ng") or shutil.which("espeak")
+        if not exe:
+            return False
+        v_map = {"en": "en-us", "ja": "ja", "zh-TW": "cmn"}
+        voice = v_map.get(lang, "en-us")
+        if shutil.which("mpv"):
+            self.stop()
+            try:
+                p_gen = subprocess.Popen(
+                    [exe, "-v", voice, "--stdout", text],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                p_play = subprocess.Popen(
+                    self._build_mpv_cmd("-", vol_pct, speed=speed, pitch=pitch, apply_sp=True),
+                    stdin=p_gen.stdout,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if p_gen.stdout is not None:
+                    p_gen.stdout.close()
+                with self._lock:
+                    self._active_proc = p_play
+                p_play.wait()
+                try:
+                    p_gen.wait(timeout=1.0)
+                except Exception:
+                    p_gen.kill()
+                with self._lock:
+                    if self._active_proc is p_play:
+                        self._active_proc = None
+                return p_play.returncode == 0
+            except Exception:
+                return False
+        amp = max(1, min(200, int(round(200 * (vol_pct / 100.0)))))
+        return self._run_player([exe, "-a", str(amp), "-v", voice, text])
+
+    @classmethod
+    def _prune_cache(cls):
+        try:
+            files = glob.glob(os.path.join(cls.CACHE_DIR, "*.mp3"))
+            if len(files) <= cls.MAX_CACHE_FILES:
+                return
+            files.sort(key=lambda p: os.path.getmtime(p))
+            for old_f in files[: len(files) - cls.MAX_CACHE_FILES]:
+                try:
+                    os.remove(old_f)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    @classmethod
+    def _fetch_edge_tts_mp3(cls, text, lang, gender="female", speed=1.0, pitch=0):
+        edge_bin = cls.find_edge_tts_bin()
+        if not edge_bin:
+            return None
+        try:
+            os.makedirs(cls.CACHE_DIR, exist_ok=True)
+            voice = cls._edge_voice_for(lang, gender)
+            rate_pct = max(-40, min(80, int(round((float(speed) - 1.0) * 100))))
+            rate_s = f"+{rate_pct}%" if rate_pct >= 0 else f"{rate_pct}%"
+            pitch_hz = max(-30, min(30, int(round(float(pitch) * 5))))
+            pitch_s = f"+{pitch_hz}Hz" if pitch_hz >= 0 else f"{pitch_hz}Hz"
+            key = hashlib.sha1(
+                f"edge:{voice}:{rate_s}:{pitch_s}:{text.lower()}".encode("utf-8")
+            ).hexdigest()[:20]
+            cache_path = os.path.join(cls.CACHE_DIR, f"edge_{key}.mp3")
+            if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 256:
+                try:
+                    os.utime(cache_path, None)
+                except Exception:
+                    pass
+                return cache_path
+
+            tmp = cache_path + ".tmp"
+            proc = subprocess.run(
+                [
+                    edge_bin,
+                    "--voice",
+                    voice,
+                    f"--rate={rate_s}",
+                    f"--pitch={pitch_s}",
+                    "--text",
+                    text,
+                    "--write-media",
+                    tmp,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=8.0,
+                check=False,
+            )
+            if proc.returncode != 0 or not os.path.isfile(tmp) or os.path.getsize(tmp) < 256:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+                return None
+            os.replace(tmp, cache_path)
+            cls._prune_cache()
+            return cache_path
+        except Exception:
+            return None
+
+    @classmethod
+    def _fetch_google_tts_mp3(cls, text, lang):
+        try:
+            os.makedirs(cls.CACHE_DIR, exist_ok=True)
+            key = hashlib.sha1(f"{lang}:{text.lower()}".encode("utf-8")).hexdigest()[:20]
+            cache_path = os.path.join(cls.CACHE_DIR, f"{key}.mp3")
+            if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 256:
+                try:
+                    os.utime(cache_path, None)
+                except Exception:
+                    pass
+                return cache_path
+
+            q_enc = urllib.parse.quote(text)
+            url = f"https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl={urllib.parse.quote(lang)}&q={q_enc}"
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+            )
+            with urllib.request.urlopen(req, timeout=4.0) as resp:
+                data = resp.read()
+            if not data or len(data) < 256:
+                return None
+            tmp = cache_path + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, cache_path)
+            cls._prune_cache()
+            return cache_path
+        except Exception:
+            return None
+
+    def speak_async(self, text, config, kind="word", force_lang=None):
+        word = (text or "").strip()
+        if not word:
+            return
+        if len(word) > 120:
+            word = word[:120].strip()
+        try:
+            vol = max(0, min(100, int(round(float(config.get("tts_volume", 80))))))
+        except (TypeError, ValueError):
+            vol = 80
+        if vol <= 0:
+            return
+        try:
+            speed = max(0.6, min(1.8, float(config.get("tts_speed", 1.0))))
+        except (TypeError, ValueError):
+            speed = 1.0
+        try:
+            pitch = max(-6, min(6, int(round(float(config.get("tts_pitch", 0))))))
+        except (TypeError, ValueError):
+            pitch = 0
+        gender = str(config.get("tts_voice_gender", "female") or "female")
+        chain = self.resolve_engine_chain(config, kind=kind)
+        if not chain:
+            return
+        tts_dir = str(config.get("tts_real_people_dir", "/usr/share/WyabdcRealPeopleTTS") or "").strip()
+
+        def _worker():
+            lang = force_lang or self._detect_lang(word)
+            for eng in chain:
+                if eng == "real_people":
+                    if lang == "en" and tts_dir:
+                        wav = self.find_real_people_wav(word, tts_dir)
+                        if wav and self._play_wav(wav, vol, speed=speed, pitch=pitch):
+                            return
+                elif eng == "edge":
+                    mp3 = self._fetch_edge_tts_mp3(word, lang, gender=gender, speed=speed, pitch=pitch)
+                    if mp3 and self._play_mp3(mp3, vol, speed=1.0, pitch=0, apply_sp=False):
+                        return
+                elif eng == "google":
+                    mp3 = self._fetch_google_tts_mp3(word, lang)
+                    if mp3 and self._play_mp3(mp3, vol, speed=speed, pitch=pitch, apply_sp=True):
+                        return
+                elif eng == "espeak":
+                    if self._play_espeak(word, lang, vol, speed=speed, pitch=pitch):
+                        return
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+
 class VocabHistoryManager:
     """
     Lightweight vocabulary history store for traditional StarDict dictionary lookups,
@@ -2291,6 +2770,9 @@ class DictCalcWidget(Gtk.EventBox):
         self.dbus_notifier = DBusNotifier()
         self.bubble_mgr = CustomBubbleManager()
         self.translator = GoogleTranslator()
+        self.speech = SpeechManager()
+        self._last_spoken_word = ""
+        self._last_spoken_kind = "word"  # "word" or "calc"
 
         self.panel_size = 28
         self.popup_win = None
@@ -2772,6 +3254,53 @@ class DictCalcWidget(Gtk.EventBox):
         cur = self.config.get("result_output_mode", "window")
         self.set_result_output_mode("window" if cur == "dbus_popup" else "dbus_popup")
 
+    def speak_word(self, word):
+        w = (word or "").strip()
+        if not w:
+            return
+        self._last_spoken_word = w
+        self._last_spoken_kind = "word"
+        if self.config.get("tts_enabled", True):
+            self.speech.speak_async(w, self.config, kind="word")
+
+    def speak_calc_result(self, res_str):
+        rs = (res_str or "").strip()
+        if not rs:
+            return
+        self._last_spoken_word = rs
+        self._last_spoken_kind = "calc"
+        if self.config.get("tts_enabled", True):
+            zh_txt = number_to_zh_speech(rs)
+            self.speech.speak_async(zh_txt, self.config, kind="calc", force_lang="zh-TW")
+
+    def speak_last_word(self, *_args):
+        target = (self._last_spoken_word or "").strip()
+        kind = getattr(self, "_last_spoken_kind", "word")
+        if not target:
+            target = self.panel_entry.get_text().strip()
+            kind = "word"
+        if not target:
+            return
+        if kind == "calc":
+            zh_txt = number_to_zh_speech(target)
+            self.speech.speak_async(zh_txt, self.config, kind="calc", force_lang="zh-TW")
+        else:
+            self.speech.speak_async(target, self.config, kind="word")
+
+    def set_tts_auto_speak(self, enabled):
+        self.config["tts_auto_speak"] = bool(enabled)
+        self._save_config()
+
+    def toggle_tts_auto_speak(self, *_args):
+        self.set_tts_auto_speak(not bool(self.config.get("tts_auto_speak", True)))
+
+    def set_calc_auto_speak(self, enabled):
+        self.config["calc_auto_speak"] = bool(enabled)
+        self._save_config()
+
+    def toggle_calc_auto_speak(self, *_args):
+        self.set_calc_auto_speak(not bool(self.config.get("calc_auto_speak", True)))
+
     def _on_panel_entry_populate_popup(self, _entry, menu):
         """Replace default Gtk.Entry context menu items (Cut/Copy/Paste/Delete/Emoji) with clean Applet controls."""
         for child in list(menu.get_children()):
@@ -2780,6 +3309,28 @@ class DictCalcWidget(Gtk.EventBox):
         mi_last = Gtk.MenuItem(label="📌 顯示上次查詢結果 (不自動關閉)")
         mi_last.connect("activate", lambda *_: self.show_last_query_result())
         menu.append(mi_last)
+
+        last_w = (self._last_spoken_word or self.panel_entry.get_text().strip())
+        if len(last_w) > 20:
+            last_w = last_w[:19] + "…"
+        speak_lbl = f"🔊 單字／結果重複發聲（{last_w}）" if last_w else "🔊 單字／結果重複發聲"
+        mi_speak = Gtk.MenuItem(label=speak_lbl)
+        mi_speak.connect("activate", lambda *_: self.speak_last_word())
+        menu.append(mi_speak)
+
+        auto_spk = bool(self.config.get("tts_auto_speak", True))
+        mi_auto_spk = Gtk.CheckMenuItem(label="🔊 查詢單字命中時自動發聲")
+        mi_auto_spk.set_active(auto_spk)
+        mi_auto_spk.connect("toggled", lambda w: self.set_tts_auto_speak(w.get_active()))
+        menu.append(mi_auto_spk)
+
+        calc_spk = bool(self.config.get("calc_auto_speak", True))
+        mi_calc_spk = Gtk.CheckMenuItem(label="🧮 自動發聲計算結果")
+        mi_calc_spk.set_active(calc_spk)
+        mi_calc_spk.connect("toggled", lambda w: self.set_calc_auto_speak(w.get_active()))
+        menu.append(mi_calc_spk)
+
+        menu.append(Gtk.SeparatorMenuItem())
 
         is_bubble = self.config.get("result_output_mode", "window") == "dbus_popup"
         mi_mode = Gtk.MenuItem(
@@ -2910,6 +3461,11 @@ class DictCalcWidget(Gtk.EventBox):
             auto_copy = bool(self.config.get("calc_auto_copy", True))
             if res_str is not None and auto_copy:
                 self.copy_to_clipboard(res_str)
+            if res_str is not None and err is None:
+                self._last_spoken_word = res_str
+                self._last_spoken_kind = "calc"
+                if self.config.get("tts_enabled", True) and self.config.get("calc_auto_speak", True):
+                    self.speak_calc_result(res_str)
 
             use_dbus = out_mode == "dbus_popup"
             if use_dbus:
@@ -3336,6 +3892,16 @@ class DictCalcWidget(Gtk.EventBox):
             )
             return False
 
+        # Record & auto-speak when dictionary lookup hits a word / short phrase
+        if results and query_word and "\n" not in query_word and len(query_word) <= 45:
+            speak_target = query_word.strip()
+            if spelling_info and spelling_info[2]:
+                speak_target = str(spelling_info[2]).strip() or speak_target
+            self._last_spoken_word = speak_target
+            self._last_spoken_kind = "word"
+            if self.config.get("tts_enabled", True) and self.config.get("tts_auto_speak", True):
+                self.speech.speak_async(speak_target, self.config)
+
         if use_dbus_dict:
             timeout_sec = int(self.config.get("dbus_popup_timeout_sec", 8))
             dbus_style = self.config.get("dbus_popup_style", "separate")
@@ -3722,6 +4288,196 @@ class DictCalcWidget(Gtk.EventBox):
         tab1_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         tab1_scroll.add(tab1)
         notebook.append_page(tab1_scroll, Gtk.Label(label="⚙️ 一般與快捷鍵"))
+
+        # ---------------- Tab 1.2: Dedicated Speech / TTS Page ----------------
+        tab_tts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=9)
+        tab_tts.set_margin_top(12)
+        tab_tts.set_margin_bottom(12)
+        tab_tts.set_margin_start(14)
+        tab_tts.set_margin_end(14)
+
+        sec_tts = Gtk.Label(xalign=0.0)
+        sec_tts.set_markup("<b>🔊 單字與算式語音發聲設定</b>")
+        tab_tts.pack_start(sec_tts, False, False, 0)
+
+        chk_tts_en = Gtk.CheckButton(label="啟用語音發聲功能（單字與算式共用音量、語速、音調與防重疊播放）")
+        chk_tts_en.set_active(self.config.get("tts_enabled", True))
+        tab_tts.pack_start(chk_tts_en, False, False, 0)
+
+        auto_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        auto_row.set_margin_start(14)
+        chk_tts_auto = Gtk.CheckButton(label="📖 查詢單字命中時自動發聲")
+        chk_tts_auto.set_active(self.config.get("tts_auto_speak", True))
+        chk_calc_speak = Gtk.CheckButton(label="🧮 算式計算完成時自動中文通報")
+        chk_calc_speak.set_active(self.config.get("calc_auto_speak", True))
+        auto_row.pack_start(chk_tts_auto, False, False, 0)
+        auto_row.pack_start(chk_calc_speak, False, False, 0)
+        tab_tts.pack_start(auto_row, False, False, 0)
+
+        tts_voice_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        tts_voice_row.set_margin_start(14)
+        tts_voice_row.pack_start(Gtk.Label(label="Edge 聲線性別：", xalign=0.0), False, False, 0)
+        combo_tts_gender = Gtk.ComboBoxText()
+        for g_id, g_lbl in (
+            ("female", "女聲（台灣曉臻 / 美式 Jenny / 日文 Nanami）"),
+            ("male", "男聲（台灣雲哲 / 美式 Guy / 日文 Keita）"),
+            ("female_soft", "溫柔女聲（台灣曉雨 / 美式 Aria）"),
+        ):
+            combo_tts_gender.append(g_id, g_lbl)
+        combo_tts_gender.set_active_id(self.config.get("tts_voice_gender", "female"))
+        tts_voice_row.pack_start(combo_tts_gender, True, True, 0)
+        tab_tts.pack_start(tts_voice_row, False, False, 0)
+
+        tts_sp_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        tts_sp_row.set_margin_start(14)
+        tts_sp_row.pack_start(Gtk.Label(label="語速：", xalign=0.0), False, False, 0)
+        scale_tts_speed = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.6, 1.8, 0.05)
+        scale_tts_speed.set_digits(2)
+        scale_tts_speed.set_draw_value(False)
+        scale_tts_speed.set_size_request(110, -1)
+        sp_init = max(0.6, min(1.8, float(self.config.get("tts_speed", 1.0))))
+        scale_tts_speed.set_value(sp_init)
+        lbl_tts_speed = Gtk.Label(label=f"{sp_init:.2f}x")
+        lbl_tts_speed.set_width_chars(5)
+        tts_sp_row.pack_start(scale_tts_speed, True, True, 0)
+        tts_sp_row.pack_start(lbl_tts_speed, False, False, 0)
+
+        tts_sp_row.pack_start(Gtk.Label(label="音調：", xalign=0.0), False, False, 4)
+        scale_tts_pitch = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, -6.0, 6.0, 1.0)
+        scale_tts_pitch.set_digits(0)
+        scale_tts_pitch.set_draw_value(False)
+        scale_tts_pitch.set_size_request(110, -1)
+        pi_init = max(-6, min(6, int(round(float(self.config.get("tts_pitch", 0))))))
+        scale_tts_pitch.set_value(float(pi_init))
+        lbl_tts_pitch = Gtk.Label(label=f"{pi_init:+d}" if pi_init != 0 else "0")
+        lbl_tts_pitch.set_width_chars(3)
+        tts_sp_row.pack_start(scale_tts_pitch, True, True, 0)
+        tts_sp_row.pack_start(lbl_tts_pitch, False, False, 0)
+        tab_tts.pack_start(tts_sp_row, False, False, 0)
+
+        tts_vol_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        tts_vol_row.set_margin_start(14)
+        tts_vol_row.pack_start(Gtk.Label(label="發聲音量：", xalign=0.0), False, False, 0)
+        scale_tts_vol = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 100.0, 5.0)
+        scale_tts_vol.set_digits(0)
+        scale_tts_vol.set_draw_value(False)
+        scale_tts_vol.set_size_request(120, -1)
+        tts_vol_init = max(0, min(100, int(self.config.get("tts_volume", 80))))
+        scale_tts_vol.set_value(float(tts_vol_init))
+        lbl_tts_vol = Gtk.Label(label=f"{tts_vol_init}%")
+        lbl_tts_vol.set_width_chars(4)
+        btn_tts_test = Gtk.Button(label="🔊 試聽單字 (hello)")
+        btn_calc_tts_test = Gtk.Button(label="🧮 試聽算式 (1024)")
+        tts_vol_row.pack_start(scale_tts_vol, True, True, 0)
+        tts_vol_row.pack_start(lbl_tts_vol, False, False, 0)
+        tts_vol_row.pack_start(btn_tts_test, False, False, 0)
+        tts_vol_row.pack_start(btn_calc_tts_test, False, False, 0)
+        tab_tts.pack_start(tts_vol_row, False, False, 0)
+
+        tts_dir_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        tts_dir_row.set_margin_start(14)
+        tts_dir_row.pack_start(Gtk.Label(label="真人語音庫路徑：", xalign=0.0), False, False, 0)
+        entry_tts_dir = Gtk.Entry()
+        entry_tts_dir.set_text(str(self.config.get("tts_real_people_dir", "/usr/share/WyabdcRealPeopleTTS")))
+        tts_dir_row.pack_start(entry_tts_dir, True, True, 0)
+        tab_tts.pack_start(tts_dir_row, False, False, 0)
+
+        edge_ok = SpeechManager.find_edge_tts_bin() is not None
+        lbl_edge_st = Gtk.Label(xalign=0.0)
+        lbl_edge_st.set_margin_start(14)
+        if edge_ok:
+            lbl_edge_st.set_markup("<small><span foreground='#10b981'>✔ Edge Neural TTS 已就緒</span>（依下方清單順序由上而下自動備援）</small>")
+        else:
+            lbl_edge_st.set_markup("<small><span foreground='#f59e0b'>ℹ 尚未偵測到 edge-tts（將自動跳至下一順位引擎）；安裝指令：pip install --user edge-tts</span></small>")
+        tab_tts.pack_start(lbl_edge_st, False, False, 0)
+
+        tab_tts.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+
+        def _build_tts_engine_pane(title_markup, cfg_key, kind, meta_list):
+            meta_map = {m[0]: (m[1], m[2]) for m in meta_list}
+            frame = Gtk.Frame()
+            frame.set_shadow_type(Gtk.ShadowType.ETCHED_IN)
+            fbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            fbox.set_margin_top(8)
+            fbox.set_margin_bottom(8)
+            fbox.set_margin_start(10)
+            fbox.set_margin_end(10)
+
+            hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            hlbl = Gtk.Label(xalign=0.0)
+            hlbl.set_markup(title_markup)
+            btn_up = Gtk.Button(label="▲ 上移")
+            btn_dn = Gtk.Button(label="▼ 下移")
+            hdr.pack_start(hlbl, True, True, 0)
+            hdr.pack_end(btn_dn, False, False, 0)
+            hdr.pack_end(btn_up, False, False, 0)
+            fbox.pack_start(hdr, False, False, 0)
+
+            # Columns: enabled, engine_id, display_name, desc
+            store = Gtk.ListStore(bool, str, str, str)
+            norm = SpeechManager.normalize_engine_list(self.config.get(cfg_key), kind=kind)
+            for it in norm:
+                eid = it["id"]
+                nm, ds = meta_map.get(eid, (eid, ""))
+                store.append([bool(it.get("enabled", True)), eid, nm, ds])
+
+            tree = Gtk.TreeView(model=store)
+            tree.set_headers_visible(True)
+            rend_tog = Gtk.CellRendererToggle()
+            tree.append_column(Gtk.TreeViewColumn("啟用", rend_tog, active=0))
+            col_nm = Gtk.TreeViewColumn("語音引擎（由上而下依序嘗試）", Gtk.CellRendererText(), text=2)
+            col_nm.set_expand(True)
+            tree.append_column(col_nm)
+            tree.append_column(Gtk.TreeViewColumn("說明", Gtk.CellRendererText(), text=3))
+
+            def _save_chain():
+                self.config[cfg_key] = [{"id": row[1], "enabled": bool(row[0])} for row in store]
+                self._save_config()
+
+            def _on_tog(_cell, path_str):
+                store[path_str][0] = not store[path_str][0]
+                _save_chain()
+
+            def _move_sel(delta):
+                sel = tree.get_selection()
+                model, it = sel.get_selected()
+                if it is None:
+                    return
+                idx = model.get_path(it).get_indices()[0]
+                nxt = idx + delta
+                if 0 <= nxt < len(model):
+                    target_it = model.get_iter(Gtk.TreePath.new_from_indices([nxt]))
+                    model.swap(it, target_it)
+                    sel.select_iter(it)
+                    _save_chain()
+
+            rend_tog.connect("toggled", _on_tog)
+            btn_up.connect("clicked", lambda *_: _move_sel(-1))
+            btn_dn.connect("clicked", lambda *_: _move_sel(+1))
+
+            fbox.pack_start(tree, False, False, 0)
+            frame.add(fbox)
+            return frame
+
+        word_eng_pane = _build_tts_engine_pane(
+            "<b>📖 單字發聲引擎順位與開關</b>",
+            "word_tts_engines",
+            "word",
+            SpeechManager.WORD_ENGINE_META,
+        )
+        calc_eng_pane = _build_tts_engine_pane(
+            "<b>🧮 算式中文語音引擎順位與開關</b>",
+            "calc_tts_engines",
+            "calc",
+            SpeechManager.CALC_ENGINE_META,
+        )
+        tab_tts.pack_start(word_eng_pane, False, False, 0)
+        tab_tts.pack_start(calc_eng_pane, False, False, 0)
+
+        tab_tts_scroll = Gtk.ScrolledWindow()
+        tab_tts_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        tab_tts_scroll.add(tab_tts)
+        notebook.append_page(tab_tts_scroll, Gtk.Label(label="🔊 語音發聲"))
 
         # ---------------- Tab 1.5: Dedicated Panel Appearance Page ----------------
         tab_appear = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
@@ -4845,6 +5601,23 @@ class DictCalcWidget(Gtk.EventBox):
             self.config["scan_selection_enabled"] = chk_scan_en.get_active()
             self.config["scan_modifier"] = combo_mod.get_active_id() or "ctrl"
             self.config["calc_auto_copy"] = chk_auto_copy.get_active()
+            self.config["tts_enabled"] = chk_tts_en.get_active()
+            self.config["tts_auto_speak"] = chk_tts_auto.get_active()
+            self.config["calc_auto_speak"] = chk_calc_speak.get_active()
+            self.config["tts_voice_gender"] = combo_tts_gender.get_active_id() or "female"
+            sp_val = round(max(0.6, min(1.8, float(scale_tts_speed.get_value()))), 2)
+            pi_val = max(-6, min(6, int(round(scale_tts_pitch.get_value()))))
+            self.config["tts_speed"] = sp_val
+            self.config["tts_pitch"] = pi_val
+            lbl_tts_speed.set_text(f"{sp_val:.2f}x")
+            lbl_tts_pitch.set_text(f"{pi_val:+d}" if pi_val != 0 else "0")
+            self.config["tts_real_people_dir"] = entry_tts_dir.get_text().strip() or "/usr/share/WyabdcRealPeopleTTS"
+            t_vol = max(0, min(100, int(round(scale_tts_vol.get_value()))))
+            self.config["tts_volume"] = t_vol
+            lbl_tts_vol.set_text(f"{t_vol}%")
+            tts_on = chk_tts_en.get_active()
+            for tw in (auto_row, tts_voice_row, tts_sp_row, tts_dir_row, tts_vol_row, word_eng_pane, calc_eng_pane):
+                tw.set_sensitive(tts_on)
             self.config["google_translate_enabled"] = chk_gt_en.get_active()
             self.config["google_translate_fallback"] = chk_gt_fb.get_active()
             self.config["translate_auto_copy"] = chk_tr_auto_copy.get_active()
@@ -5041,6 +5814,28 @@ class DictCalcWidget(Gtk.EventBox):
 
         btn_apply_hk.connect("clicked", apply_tab1)
         combo_mod.connect("changed", apply_tab1)
+        combo_tts_gender.connect("changed", apply_tab1)
+        scale_tts_speed.connect("value-changed", apply_tab1)
+        scale_tts_pitch.connect("value-changed", apply_tab1)
+        scale_tts_vol.connect("value-changed", apply_tab1)
+        entry_tts_dir.connect("changed", apply_tab1)
+        btn_tts_test.connect("clicked", lambda *_: (apply_tab1(), self.speech.speak_async("hello", self.config, kind="word")))
+        btn_calc_tts_test.connect(
+            "clicked",
+            lambda *_: (
+                apply_tab1(),
+                self.speech.speak_async(
+                    number_to_zh_speech("1024"),
+                    self.config,
+                    kind="calc",
+                    force_lang="zh-TW",
+                ),
+            ),
+        )
+        for tw_c in (chk_tts_en, chk_tts_auto, chk_calc_speak):
+            tw_c.connect("toggled", apply_tab1)
+        for tw in (auto_row, tts_voice_row, tts_sp_row, tts_dir_row, tts_vol_row, word_eng_pane, calc_eng_pane):
+            tw.set_sensitive(chk_tts_en.get_active())
         combo_gt_tl.connect("changed", apply_tab1)
         combo_gt_rev.connect("changed", apply_tab1)
         combo_tr_engine.connect("changed", apply_tab1)
@@ -5165,6 +5960,8 @@ class DictCalcWidget(Gtk.EventBox):
         if self.prefs_win is not None:
             self.prefs_win.destroy()
             self.prefs_win = None
+        if hasattr(self, "speech") and self.speech is not None:
+            self.speech.stop()
 
 
 def setup_applet_context_menu(applet, widget):
@@ -5178,6 +5975,30 @@ def setup_applet_context_menu(applet, widget):
                 None,
                 "重新顯示最近一次的查詢或翻譯結果，且不會自動倒數關閉",
                 widget.show_last_query_result,
+            ),
+            (
+                "SpeakLastWordAction",
+                None,
+                "單字／結果重複發聲 (_Speak Again)",
+                None,
+                "重複播放最近一次查詢單字或算式結果的語音發聲",
+                widget.speak_last_word,
+            ),
+            (
+                "ToggleAutoSpeakAction",
+                None,
+                "開關查詢單字自動發聲 (_Toggle Auto Speak)",
+                None,
+                "切換查詢單字命中時是否自動發聲",
+                widget.toggle_tts_auto_speak,
+            ),
+            (
+                "ToggleCalcAutoSpeakAction",
+                None,
+                "開關自動發聲計算結果 (_Toggle Calc Speak)",
+                None,
+                "切換算式計算完成時是否自動以中文語音通報結果",
+                widget.toggle_calc_auto_speak,
             ),
             (
                 "ToggleOutputModeAction",
@@ -5222,8 +6043,21 @@ def setup_applet_context_menu(applet, widget):
         ]
     )
 
+    act_spk = action_group.get_action("SpeakLastWordAction")
+    if act_spk is not None:
+        act_spk.set_icon_name("audio-volume-high")
+    act_auto_spk = action_group.get_action("ToggleAutoSpeakAction")
+    if act_auto_spk is not None:
+        act_auto_spk.set_icon_name("audio-volume-medium")
+    act_calc_spk = action_group.get_action("ToggleCalcAutoSpeakAction")
+    if act_calc_spk is not None:
+        act_calc_spk.set_icon_name("accessories-calculator")
+
     menu_xml = (
         '<menuitem name="ShowLastResult" action="ShowLastResultAction"/>'
+        '<menuitem name="SpeakLastWord" action="SpeakLastWordAction"/>'
+        '<menuitem name="ToggleAutoSpeak" action="ToggleAutoSpeakAction"/>'
+        '<menuitem name="ToggleCalcAutoSpeak" action="ToggleCalcAutoSpeakAction"/>'
         '<menuitem name="ToggleOutputMode" action="ToggleOutputModeAction"/>'
         '<menuitem name="ScanNow" action="ScanNowAction"/>'
         '<menuitem name="ToggleScan" action="ToggleScanAction"/>'
