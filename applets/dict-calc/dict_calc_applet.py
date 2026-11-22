@@ -33,6 +33,7 @@ import difflib
 import glob
 import hashlib
 import html
+from html.parser import HTMLParser
 import json
 import math
 import operator
@@ -1204,6 +1205,336 @@ class SafeMathCalculator:
 # 2. StarDict Dictionary Discovery & SDCV Native JSON Query Engine
 # =============================================================================
 
+class DictHtmlFormatter:
+    """
+    Lightweight, zero-dependency HTML formatter for HTML-based StarDict dictionaries
+    (e.g. CALD4 `sametypesequence=h`, Oxford, Collins, Longman).
+    - Converts dictionary HTML safely into flat, line-by-line Pango Markup for
+      Gtk.Label (bubble popups) and Gtk.TextBuffer.insert_markup (result window),
+      with automatic foreground contrast adaptation for dark/light backgrounds.
+    - Sanitizes dictionary HTML for standalone HTML flashcard export.
+    """
+
+    _HTML_TAG_RE = re.compile(
+        r"(?i)<(?:b|i|u|br|p|div|span|font|sub|sup|a|img|table|tr|td|ul|ol|li|hr|strong|em|small)\b[^>]*>"
+    )
+    _NAMED_COLORS = {
+        "black": "#000000", "white": "#ffffff", "gray": "#808080", "grey": "#808080",
+        "darkgray": "#a9a9a9", "darkgrey": "#a9a9a9", "dimgray": "#696969", "silver": "#c0c0c0",
+        "red": "#dc2626", "darkred": "#8b0000", "crimson": "#dc143c", "firebrick": "#b22222",
+        "maroon": "#800000", "brown": "#a52a2a", "sienna": "#a0522d", "chocolate": "#d2691e",
+        "orange": "#ea580c", "darkorange": "#ff8c00", "gold": "#d97706", "yellow": "#ca8a04",
+        "olive": "#808000", "green": "#008000", "darkgreen": "#006400", "forestgreen": "#228b22",
+        "limegreen": "#32cd32", "seagreen": "#2e8b57", "teal": "#008080", "darkcyan": "#008b8b",
+        "cyan": "#0891b2", "steelblue": "#4682b4", "dodgerblue": "#1e90ff", "royalblue": "#4169e1",
+        "blue": "#0000ff", "mediumblue": "#0000cd", "darkblue": "#00008b", "navy": "#000080",
+        "indigo": "#4b0082", "purple": "#800080", "darkviolet": "#9400d3", "blueviolet": "#8a2be2",
+        "magenta": "#c026d3", "mediumvioletred": "#c71585", "deeppink": "#ff1493",
+        "darkmagenta": "#8b008b", "slateblue": "#6a5acd", "darkslategray": "#2f4f4f",
+    }
+
+    @classmethod
+    def has_html(cls, raw_def):
+        return bool(raw_def and "<" in raw_def and ">" in raw_def and cls._HTML_TAG_RE.search(raw_def))
+
+    @classmethod
+    def parse_color_hex(cls, val):
+        if not val:
+            return None
+        s = val.strip().lower().strip("'\"")
+        if s in cls._NAMED_COLORS:
+            return cls._NAMED_COLORS[s]
+        if s.startswith("#"):
+            h = s[1:]
+            if len(h) == 3 and all(c in "0123456789abcdef" for c in h):
+                return f"#{h[0]*2}{h[1]*2}{h[2]*2}"
+            if len(h) == 6 and all(c in "0123456789abcdef" for c in h):
+                return f"#{h}"
+            return None
+        m = re.match(r"rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)", s)
+        if m:
+            r, g, b = (max(0, min(255, int(x))) for x in m.groups())
+            return f"#{r:02x}{g:02x}{b:02x}"
+        return None
+
+    @staticmethod
+    def adapt_fg_for_bg(hex_col, dark_bg=False):
+        """Gently lift dark colors on dark backgrounds (and darken pale colors on light backgrounds)."""
+        if not hex_col or len(hex_col) != 7 or not hex_col.startswith("#"):
+            return hex_col
+        r = int(hex_col[1:3], 16) / 255.0
+        g = int(hex_col[3:5], 16) / 255.0
+        b = int(hex_col[5:7], 16) / 255.0
+        lum = 0.299 * r + 0.587 * g + 0.114 * b
+        if dark_bg and lum < 0.42:
+            # Blend toward bright pastel tint while keeping hue distinguishable
+            factor = 0.58 if lum < 0.18 else 0.42
+            r = r + (1.0 - r) * factor
+            g = g + (1.0 - g) * factor
+            b = b + (1.0 - b) * factor
+            return f"#{int(round(r*255)):02x}{int(round(g*255)):02x}{int(round(b*255)):02x}"
+        if (not dark_bg) and lum > 0.78:
+            factor = 0.55
+            r *= factor
+            g *= factor
+            b *= factor
+            return f"#{int(round(r*255)):02x}{int(round(g*255)):02x}{int(round(b*255)):02x}"
+        return hex_col
+
+    @staticmethod
+    def _parse_inline_style(style_str):
+        out = {}
+        if not style_str:
+            return out
+        for part in style_str.split(";"):
+            if ":" not in part:
+                continue
+            k, v = part.split(":", 1)
+            k = k.strip().lower()
+            v = v.strip()
+            if k and v:
+                out[k] = v
+        return out
+
+    @classmethod
+    def html_to_pango_lines(cls, raw_html, dark_bg=False):
+        """
+        Parse dictionary HTML into a list of `(plain_line, pango_markup_line)` tuples.
+        Each line is guaranteed to be self-contained valid Pango markup so callers can
+        safely truncate by line count or character budget without breaking XML tags.
+        """
+        if not raw_html:
+            return []
+
+        lines = []  # list of (plain_parts, pango_parts)
+        cur_plain = []
+        cur_pango = []
+        stack = []  # list of (tag_name, style_dict, meta_dict)
+        skip_depth = 0
+        pending_indent = ""
+
+        def flush_line():
+            nonlocal cur_plain, cur_pango
+            p_txt = "".join(cur_plain)
+            if p_txt.strip():
+                lines.append((p_txt.rstrip(), "".join(cur_pango).rstrip()))
+            cur_plain = []
+            cur_pango = []
+
+        def merged_style():
+            st = {
+                "fg": None, "bg": None, "bold": False, "italic": False,
+                "underline": False, "sub": False, "sup": False, "size": None,
+            }
+            for _t, sd, _m in stack:
+                for k, v in sd.items():
+                    if v is not None and v is not False:
+                        st[k] = v
+            return st
+
+        class _Parser(HTMLParser):
+            def handle_starttag(self, tag, attrs):
+                nonlocal skip_depth, pending_indent
+                t = tag.lower()
+                if skip_depth > 0:
+                    if t not in ("br", "img", "hr", "input"):
+                        skip_depth += 1
+                    return
+
+                attr_map = {k.lower(): (v or "") for k, v in attrs}
+                if t in ("script", "style"):
+                    skip_depth = 1
+                    return
+                if t == "img":
+                    return
+                if t == "a":
+                    href = attr_map.get("href", "").strip().lower()
+                    if href.startswith("sound://"):
+                        skip_depth = 1
+                        return
+                if t == "br":
+                    flush_line()
+                    return
+                if t == "hr":
+                    flush_line()
+                    return
+
+                css = cls._parse_inline_style(attr_map.get("style", ""))
+                is_float_left = "left" in css.get("float", "").lower()
+                is_block = (
+                    t in ("div", "p", "li", "tr", "h1", "h2", "h3", "h4")
+                    or "block" in css.get("display", "").lower()
+                )
+                has_margin_left = False
+                ml = css.get("margin-left", "")
+                if ml:
+                    m_px = re.search(r"(\d+)", ml)
+                    if m_px and int(m_px.group(1)) >= 12:
+                        has_margin_left = True
+
+                # Block / float handling: float:left starts a new sense line and keeps the following block inline
+                if is_float_left:
+                    flush_line()
+                    pending_indent = ""
+                elif is_block:
+                    # If the previous item on this line was a float:left sense number (e.g. "1 "), stay inline!
+                    if cur_plain and not (len(cur_plain) <= 3 and "".join(cur_plain).strip() in ("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "Ⅰ", "Ⅱ", "Ⅲ", "Ⅳ", "Ⅴ", "Ⅵ", "Ⅶ", "Ⅷ", "Ⅸ", "Ⅹ")):
+                        flush_line()
+                    if not cur_plain and has_margin_left:
+                        pending_indent = "  "
+
+                sd = {}
+                if t in ("b", "strong"):
+                    sd["bold"] = True
+                elif t in ("i", "em"):
+                    sd["italic"] = True
+                elif t == "u":
+                    sd["underline"] = True
+                elif t == "sub":
+                    sd["sub"] = True
+                elif t == "sup":
+                    sd["sup"] = True
+                elif t == "small":
+                    sd["size"] = "small"
+                elif t == "a":
+                    sd["fg"] = "#0284c7" if not dark_bg else "#38bdf8"
+                    sd["underline"] = True
+
+                if "color" in attr_map:
+                    c_hex = cls.parse_color_hex(attr_map["color"])
+                    if c_hex:
+                        sd["fg"] = c_hex
+                if "color" in css:
+                    c_hex = cls.parse_color_hex(css["color"])
+                    if c_hex:
+                        sd["fg"] = c_hex
+                if "background-color" in css:
+                    bg_hex = cls.parse_color_hex(css["background-color"])
+                    if bg_hex:
+                        sd["bg"] = bg_hex
+                fw = css.get("font-weight", "").lower()
+                if fw in ("bold", "700", "800", "900"):
+                    sd["bold"] = True
+                if css.get("font-style", "").lower() == "italic":
+                    sd["italic"] = True
+                if "underline" in css.get("text-decoration", "").lower():
+                    sd["underline"] = True
+
+                stack.append((t, sd, {"float_left": is_float_left, "block": is_block}))
+
+            def handle_endtag(self, tag):
+                nonlocal skip_depth, pending_indent
+                t = tag.lower()
+                if skip_depth > 0:
+                    if t not in ("br", "img", "hr", "input"):
+                        skip_depth -= 1
+                    return
+                # Pop matching tag (tolerant to malformed/stray closing tags like CALD4's extra </font>)
+                for idx in range(len(stack) - 1, -1, -1):
+                    if stack[idx][0] == t:
+                        _tn, _sd, meta = stack.pop(idx)
+                        if meta.get("float_left"):
+                            if cur_plain and not cur_plain[-1].endswith(" "):
+                                cur_plain.append(" ")
+                                cur_pango.append(" ")
+                        elif meta.get("block"):
+                            flush_line()
+                            pending_indent = ""
+                        break
+
+            def handle_data(self, data):
+                nonlocal pending_indent
+                if skip_depth > 0 or not data:
+                    return
+                txt = data.replace("\r\n", "\n").replace("\r", "\n")
+                # Collapse raw HTML source newlines into spaces (HTML semantics)
+                txt = re.sub(r"[ \t]*\n[ \t]*", " ", txt)
+                if not txt.strip():
+                    if cur_plain and not cur_plain[-1].endswith(" "):
+                        cur_plain.append(" ")
+                        cur_pango.append(" ")
+                    return
+                if not cur_plain:
+                    txt = txt.lstrip()
+                    if pending_indent:
+                        cur_plain.append(pending_indent)
+                        cur_pango.append(pending_indent)
+                        pending_indent = ""
+                st = merged_style()
+                esc = html.escape(txt)
+                span_attrs = []
+                fg = st["fg"]
+                bg = st["bg"]
+                if bg:
+                    span_attrs.append(f"background='{bg}'")
+                    if fg:
+                        span_attrs.append(f"foreground='{fg}'")
+                    esc = f" {esc} "
+                elif fg:
+                    adj_fg = cls.adapt_fg_for_bg(fg, dark_bg=dark_bg)
+                    span_attrs.append(f"foreground='{adj_fg}'")
+                if st["bold"]:
+                    span_attrs.append("weight='bold'")
+                if st["italic"]:
+                    span_attrs.append("style='italic'")
+                if st["underline"]:
+                    span_attrs.append("underline='single'")
+                if st["sub"] or st["sup"] or st["size"] == "small":
+                    span_attrs.append("size='smaller'")
+                if st["sub"]:
+                    span_attrs.append("rise='-2500'")
+                elif st["sup"]:
+                    span_attrs.append("rise='3500'")
+
+                pango_chunk = f"<span {' '.join(span_attrs)}>{esc}</span>" if span_attrs else esc
+                cur_plain.append(txt)
+                cur_pango.append(pango_chunk)
+
+        try:
+            parser = _Parser(convert_charrefs=True)
+            parser.feed(raw_html)
+            parser.close()
+        except Exception:
+            pass
+        flush_line()
+        return lines
+
+    @classmethod
+    def html_to_pango(cls, raw_html, dark_bg=False):
+        lines = cls.html_to_pango_lines(raw_html, dark_bg=dark_bg)
+        return "\n".join(p for _plain, p in lines)
+
+    @classmethod
+    def html_to_plain(cls, raw_html):
+        lines = cls.html_to_pango_lines(raw_html, dark_bg=False)
+        return "\n".join(plain for plain, _p in lines)
+
+    @classmethod
+    def clean_html_for_flashcard(cls, raw_html):
+        """
+        Sanitize StarDict HTML for safe, native browser rendering inside exported HTML flashcards.
+        Removes scripts/event handlers, broken local sound/img links, and converts `bword://` links.
+        """
+        if not raw_html:
+            return ""
+        s = raw_html.replace("\r\n", "\n").replace("\r", "\n")
+        # Remove scripts/styles/iframes
+        s = re.sub(r"(?is)<(?:script|style|iframe|object|embed)\b[^>]*>.*?</(?:script|style|iframe|object|embed)>", "", s)
+        # Remove sound:// links (which wrap missing snd_uk.png / snd_us.png)
+        s = re.sub(r"(?is)<a\b[^>]*href\s*=\s*['\"]sound://[^'\"]*['\"][^>]*>.*?</a>", "", s)
+        # Remove local relative <img> tags that won't exist in standalone HTML
+        s = re.sub(r"(?is)<img\b[^>]*>(?:\s*</img>)?", "", s)
+        # Convert bword:// links into styled spans
+        s = re.sub(
+            r"(?is)<a\b[^>]*href\s*=\s*['\"]bword://[^'\"]*['\"][^>]*>(.*?)</a>",
+            r'<span class="bword">\1</span>',
+            s,
+        )
+        # Strip inline JS event handlers (onclick=, onerror=, etc.)
+        s = re.sub(r"(?i)\s+on[a-z]+\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)", "", s)
+        return s.strip()
+
+
 class StarDictManager:
     """Discovers StarDict .ifo dictionaries and queries them asynchronously via `/usr/bin/sdcv -n -j`."""
 
@@ -1299,9 +1630,13 @@ class StarDictManager:
 
     @classmethod
     def clean_definition(cls, raw_def):
-        """Clean up HTML/XML tags occasionally present in Babylon/PowerWord StarDict entries."""
+        """Clean up HTML/XML tags present in HTML/Babylon/PowerWord StarDict entries."""
         if not raw_def:
             return ""
+        if DictHtmlFormatter.has_html(raw_def):
+            plain = DictHtmlFormatter.html_to_plain(raw_def)
+            if plain:
+                return plain
         text = raw_def.replace("\r\n", "\n").replace("\r", "\n")
         # Convert <br> / <p> to newlines, strip other HTML tags cleanly
         if "<" in text and ">" in text:
@@ -1354,9 +1689,13 @@ class StarDictManager:
             for it in items:
                 d_name = it.get("dict", "Unknown")
                 w_res = it.get("word", target_word)
-                defn = self.clean_definition(it.get("definition", ""))
+                raw_def = it.get("definition", "")
+                defn = self.clean_definition(raw_def)
                 if defn:
-                    results.append({"dict": d_name, "word": w_res, "definition": defn})
+                    entry = {"dict": d_name, "word": w_res, "definition": defn}
+                    if DictHtmlFormatter.has_html(raw_def):
+                        entry["raw_html"] = raw_def
+                    results.append(entry)
             if dict_names:
                 order_map = {name: i for i, name in enumerate(dict_names)}
                 results.sort(key=lambda r: order_map.get(r["dict"], 999999))
@@ -2144,11 +2483,16 @@ class VocabHistoryManager:
             for e in c.get("entries", []):
                 d_esc = html.escape(e["dict"])
                 ew_esc = html.escape(e["word"])
-                def_esc = html.escape(e["definition"]).replace("\n", "<br>")
+                if e.get("raw_html"):
+                    def_html = DictHtmlFormatter.clean_html_for_flashcard(e["raw_html"])
+                    def_cls = "dict-def dict-html"
+                else:
+                    def_html = html.escape(e["definition"]).replace("\n", "<br>")
+                    def_cls = "dict-def"
                 entries_parts.append(
                     f'<div class="dict-block">'
                     f'<div class="dict-name">📖 {d_esc} <span class="headword">【{ew_esc}】</span></div>'
-                    f'<div class="dict-def">{def_esc}</div>'
+                    f'<div class="{def_cls}">{def_html}</div>'
                     f'</div>'
                 )
             if not entries_parts:
@@ -2249,6 +2593,13 @@ body.flip-mode .card:not(.revealed)::after {{
 .dict-name {{ font-weight: 700; font-size: 0.92rem; color: var(--accent); margin-bottom: 3px; }}
 .headword {{ color: var(--muted); font-weight: 500; }}
 .dict-def {{ font-size: 0.96rem; white-space: normal; word-break: break-word; }}
+.dict-def.dict-html {{ line-height: 1.55; }}
+.dict-def.dict-html .bword {{ color: var(--accent); text-decoration: underline dotted; }}
+body.dark .dict-def.dict-html font[color="blue"], body.dark .dict-def.dict-html font[color="mediumblue"], body.dark .dict-def.dict-html font[color="navy"] {{ color: #7dd3fc !important; }}
+body.dark .dict-def.dict-html font[color="indigo"] {{ color: #c4b5fd !important; }}
+body.dark .dict-def.dict-html font[color="darkred"], body.dark .dict-def.dict-html font[color="crimson"] {{ color: #fca5a5 !important; }}
+body.dark .dict-def.dict-html font[color="green"], body.dark .dict-def.dict-html font[color="olive"] {{ color: #86efac !important; }}
+body.dark .dict-def.dict-html font[color="gray"] {{ color: #cbd5e1 !important; }}
 .dict-empty {{ color: var(--muted); font-style: italic; }}
 .set-card h2 {{ margin: 0 0 10px; font-size: 1.05rem; color: var(--accent); }}
 .set-row {{ display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 10px; }}
@@ -3265,6 +3616,17 @@ class DictCalcPopupWindow(Gtk.Window):
             self.position_and_show(near_pointer=near_pointer)
             return
 
+        # Detect whether result_view background is dark for HTML-to-Pango color contrast adaptation
+        tv_dark = True
+        try:
+            ctx = self.result_view.get_style_context()
+            ok_bg, rgba_bg = ctx.lookup_color("theme_base_color")
+            if ok_bg:
+                tv_lum = 0.299 * rgba_bg.red + 0.587 * rgba_bg.green + 0.114 * rgba_bg.blue
+                tv_dark = tv_lum < 0.5
+        except Exception:
+            tv_dark = True
+
         for idx, item in enumerate(results):
             if idx > 0:
                 buf.insert_with_tags(buf.get_end_iter(), "\n" + ("─" * 38) + "\n", self.tag_muted)
@@ -3274,9 +3636,26 @@ class DictCalcPopupWindow(Gtk.Window):
             buf.insert_with_tags(
                 buf.get_end_iter(), f"【{item['word']}】\n", self.tag_word
             )
-            buf.insert_with_tags(
-                buf.get_end_iter(), f"{item['definition']}\n", self.tag_body
-            )
+            raw_html = item.get("raw_html")
+            inserted_markup = False
+            if raw_html and hasattr(buf, "insert_markup"):
+                pango_str = DictHtmlFormatter.html_to_pango(raw_html, dark_bg=tv_dark)
+                if pango_str:
+                    try:
+                        start_off = buf.get_char_count()
+                        buf.insert_markup(buf.get_end_iter(), pango_str + "\n", -1)
+                        buf.apply_tag(
+                            self.tag_body,
+                            buf.get_iter_at_offset(start_off),
+                            buf.get_end_iter(),
+                        )
+                        inserted_markup = True
+                    except Exception:
+                        inserted_markup = False
+            if not inserted_markup:
+                buf.insert_with_tags(
+                    buf.get_end_iter(), f"{item['definition']}\n", self.tag_body
+                )
 
         self.result_view.scroll_to_iter(buf.get_start_iter(), 0.0, False, 0.0, 0.0)
         self._update_status_footer(f"查詢「{query_word}」：共找到 {len(results)} 筆詞典釋義")
@@ -4553,6 +4932,8 @@ class DictCalcWidget(Gtk.EventBox):
                     )
             elif dbus_style == "separate":
                 # Mode 1: Each dictionary gets its own crisp independent bubble
+                bg_rgb = hex_to_rgb(self.config.get("dbus_popup_bg_color", "#fffbe6"), default=(1.0, 0.98, 0.90))
+                bg_dark = (0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2]) < 0.5
                 batch = []
                 shown = results[:max_dicts]
                 for idx, item in enumerate(shown):
@@ -4560,13 +4941,28 @@ class DictCalcWidget(Gtk.EventBox):
                     d_name = item["dict"]
                     w_str = item["word"]
                     summary = f"{b_emo} {w_str} — {d_name}"
-                    raw_lines = [ln.strip() for ln in item["definition"].splitlines() if ln.strip()]
-                    raw_body = "\n".join(raw_lines[:8])
-                    if len(raw_lines) > 8:
-                        raw_body += "\n…"
-                    if len(raw_body) > 460:
-                        raw_body = raw_body[:457] + "…"
-                    esc_body = html.escape(raw_body)
+                    if item.get("raw_html"):
+                        plines = DictHtmlFormatter.html_to_pango_lines(item["raw_html"], dark_bg=bg_dark)
+                        kept_p = []
+                        char_cnt = 0
+                        truncated = False
+                        for p_plain, p_mk in plines[:8]:
+                            if char_cnt + len(p_plain) > 460 and kept_p:
+                                truncated = True
+                                break
+                            kept_p.append(p_mk)
+                            char_cnt += len(p_plain)
+                        if len(plines) > 8 or truncated:
+                            kept_p.append("…")
+                        esc_body = "\n".join(kept_p)
+                    else:
+                        raw_lines = [ln.strip() for ln in item["definition"].splitlines() if ln.strip()]
+                        raw_body = "\n".join(raw_lines[:8])
+                        if len(raw_lines) > 8:
+                            raw_body += "\n…"
+                        if len(raw_body) > 460:
+                            raw_body = raw_body[:457] + "…"
+                        esc_body = html.escape(raw_body)
                     if idx == 0 and sp_banner:
                         esc_body = f"{sp_banner}\n<span alpha='45%'>────────────────────</span>\n{esc_body}"
                     body = self._wrap_dbus_font(esc_body)
@@ -4574,6 +4970,8 @@ class DictCalcWidget(Gtk.EventBox):
                 self._notify_dbus_batch(batch, timeout_sec=timeout_sec)
             else:
                 # Mode 2: Single merged bubble with clear bold divider banners and indented definitions
+                bg_rgb = hex_to_rgb(self.config.get("dbus_popup_bg_color", "#fffbe6"), default=(1.0, 0.98, 0.90))
+                bg_dark = (0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2]) < 0.5
                 blocks = []
                 if sp_banner:
                     blocks.append(sp_banner)
@@ -4584,14 +4982,25 @@ class DictCalcWidget(Gtk.EventBox):
                     d_esc = html.escape(item["dict"])
                     w_esc = html.escape(item["word"])
                     hdr = f"<b>━━━ {b_emo} {d_esc} ({w_esc}) ━━━</b>"
-                    raw_lines = [ln.strip() for ln in item["definition"].splitlines() if ln.strip()]
                     kept_lines = []
-                    for ln in raw_lines[:6]:
-                        if total_chars + len(ln) > 760 and kept_lines:
+                    if item.get("raw_html"):
+                        plines = DictHtmlFormatter.html_to_pango_lines(item["raw_html"], dark_bg=bg_dark)
+                        for p_plain, p_mk in plines[:6]:
+                            if total_chars + len(p_plain) > 760 and kept_lines:
+                                kept_lines.append("  …")
+                                break
+                            kept_lines.append(f"  {p_mk}")
+                            total_chars += len(p_plain)
+                        if len(plines) > 6 and (not kept_lines or kept_lines[-1] != "  …"):
                             kept_lines.append("  …")
-                            break
-                        kept_lines.append(f"  {html.escape(ln)}")
-                        total_chars += len(ln)
+                    else:
+                        raw_lines = [ln.strip() for ln in item["definition"].splitlines() if ln.strip()]
+                        for ln in raw_lines[:6]:
+                            if total_chars + len(ln) > 760 and kept_lines:
+                                kept_lines.append("  …")
+                                break
+                            kept_lines.append(f"  {html.escape(ln)}")
+                            total_chars += len(ln)
                     blocks.append("\n".join([hdr] + kept_lines))
                     if total_chars >= 760:
                         break

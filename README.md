@@ -48,8 +48,9 @@ Custom MATE Panel Applets collection and development repository for Linux deskto
 結合離線多詞典查詢、AI 多引擎翻譯、拼字建議、單字卡匯出與安全科學計算機的全能 MATE 面板小程式：
 
 ### 核心功能
-- **極速離線 StarDict 查詢 (`sdcv -n -j -e`)**：
+- **極速離線 StarDict 查詢 (`sdcv -n -j -e`) 與 HTML 詞典樣式渲染**：
   - 支援自訂 StarDict 詞典根目錄（預設 `/usr/share/stardict/dic`）與一鍵重新掃描，單次查詢 1～8 套詞典僅 ~7 ms、零常駐索引記憶體。
+  - **HTML 詞典樣式解析（`sametypesequence=h`，如 `CALD4` 劍橋詞典）**：內建零依賴 `DictHtmlFormatter`，自動將字色、詞性色塊（如 `NOUN` 底色標籤）、粗／斜／底線、上下標、義項編號與例句縮排轉譯為 Pango Markup，並依深淺背景自動調整字色對比，於 **氣泡框** 與 **無焦點結果視窗** 原生彩色呈現；匯出 **HTML 單字卡** 時則直接保留清理後的原始 HTML 排版。
   - **三情境獨立詞典管理**：在偏好設定「📚 詞典管理」中，分別針對 **🪟 無焦點查詢視窗**、**💬 氣泡框**、**✂ Scan Selection 劃詞** 獨立設定啟用詞典、拖曳／按鈕順位排序，並可將 **4 套線上翻譯引擎作為虛擬詞典** 混搭排入順位（離線詞典先即時顯示、線上翻譯並行漸進回填）。
 - **離線 `aspell` 單字拼寫建議與字元差異上色 (~2.4 ms)**：
   - 輸入拼錯的單一英文單字時，使用 `sdcv -e` 精確比對並自動呼叫 `/usr/bin/aspell` 提示可能正確拼法，同時**停用線上翻譯引擎**避免覆蓋，並自動將第 1 順位建議單字填入面板輸入框（按 `Enter` 即可查詢）。
