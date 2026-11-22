@@ -26,6 +26,7 @@ Features:
 """
 
 import ast
+import base64
 from collections import OrderedDict
 import datetime
 import difflib
@@ -176,6 +177,7 @@ DEFAULT_CONFIG = {
     "vocab_card_dicts": ["DrEye4in1詞典"],
     "vocab_sort_mode": "random",         # "recent", "freq", "alpha", "random"
     "vocab_epub_layout": "per_word",     # "per_word" (一字一頁，預設) or "az_chapters" (依字母 A-Z 分章)
+    "vocab_html_embed_audio": True,      # 匯出 HTML 單字卡時內嵌高品質語音音檔 (Base64 離線通用)
     "result_font_size": 15,              # 結果視窗字型大小 (pt)
     "font_color_mode": "dynamic",        # "dynamic" or "custom"
     "custom_font_color": "#e66100",      # 自訂面板字形顏色
@@ -1860,6 +1862,51 @@ class SpeechManager:
         except Exception:
             return None
 
+    @classmethod
+    def get_audio_data_uri(cls, word, config):
+        """
+        Resolve a word's audio file following `word_tts_engines` priority order
+        (edge / real_people / google; skips espeak) and return a Base64 Data URI
+        (`data:audio/mpeg;base64,...` or `data:audio/wav;base64,...`), or None.
+        """
+        w = (word or "").strip()
+        if not w:
+            return None
+        if len(w) > 120:
+            w = w[:120].strip()
+        lang = cls._detect_lang(w)
+        tts_dir = config.get("tts_real_people_dir") or "/usr/share/WyabdcRealPeopleTTS"
+        gender = config.get("tts_voice_gender", "female")
+        try:
+            pitch = max(-6, min(6, int(round(float(config.get("tts_pitch", 0))))))
+        except (TypeError, ValueError):
+            pitch = 0
+        # Embed at 1.0x speed so the HTML player's playbackRate control scales accurately
+        engines = cls.resolve_engine_chain(config, kind="word")
+        for eng in engines:
+            path = None
+            mime = None
+            if eng == "real_people":
+                if lang == "en":
+                    path = cls.find_real_people_wav(w, tts_dir)
+                    mime = "audio/wav"
+            elif eng == "edge":
+                path = cls._fetch_edge_tts_mp3(w, lang, gender=gender, speed=1.0, pitch=pitch)
+                mime = "audio/mpeg"
+            elif eng == "google":
+                path = cls._fetch_google_tts_mp3(w, lang)
+                mime = "audio/mpeg"
+            if path and os.path.isfile(path):
+                try:
+                    with open(path, "rb") as f:
+                        raw = f.read()
+                    if raw and len(raw) >= 256:
+                        b64 = base64.b64encode(raw).decode("ascii")
+                        return f"data:{mime};base64,{b64}"
+                except Exception:
+                    continue
+        return None
+
     def speak_async(self, text, config, kind="word", force_lang=None):
         word = (text or "").strip()
         if not word:
@@ -2006,15 +2053,92 @@ class VocabHistoryManager:
             self._save_unlocked()
 
     @staticmethod
-    def export_html(filepath, cards, title="StarDict 單字卡"):
+    def export_html(
+        filepath,
+        cards,
+        title="StarDict 單字卡",
+        audio_map=None,
+        default_speed=1.0,
+        tts_defaults=None,
+    ):
         """
         Export cards = [{'word': str, 'count': int, 'last_seen': str, 'entries': [{'dict': str, 'word': str, 'definition': str}]}]
-        into a single self-contained interactive HTML flashcard file (flip mode + list mode + live shuffle + search).
+        into a single self-contained interactive HTML flashcard file (flip mode + list mode + live shuffle + search + audio
+        + dedicated Voice Settings page with localStorage persistence).
         """
         gen_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        audio_map_norm = {}
+        if audio_map:
+            for k, v in audio_map.items():
+                if k and v:
+                    audio_map_norm[str(k).strip().lower()] = str(v)
+
+        td = dict(tts_defaults or {})
+        try:
+            init_vol = max(0, min(100, int(round(float(td.get("volume", 85))))))
+        except (TypeError, ValueError):
+            init_vol = 85
+        try:
+            init_speed = round(max(0.6, min(1.8, float(td.get("speed", default_speed)))), 2)
+        except (TypeError, ValueError):
+            init_speed = 1.0
+        try:
+            init_pitch = max(-6, min(6, int(round(float(td.get("pitch", 0))))))
+        except (TypeError, ValueError):
+            init_pitch = 0
+        init_engine = td.get("engine_mode") or ("embedded" if audio_map_norm else "browser")
+        if init_engine not in ("embedded", "browser"):
+            init_engine = "embedded" if audio_map_norm else "browser"
+        init_auto = bool(td.get("auto_speak", False))
+        try:
+            init_repeat = max(1, min(3, int(td.get("repeat", 1))))
+        except (TypeError, ValueError):
+            init_repeat = 1
+
+        eng_label_map = {
+            "edge": "Edge Neural TTS",
+            "real_people": "StarDict 真人語音庫",
+            "google": "Google TTS",
+            "espeak": "espeak-ng",
+        }
+        emb_chain = [
+            eng_label_map.get(e, e)
+            for e in (td.get("embedded_engines") or ["edge", "real_people", "google"])
+            if e != "espeak"
+        ]
+        emb_chain_str = " → ".join(emb_chain) if emb_chain else "Edge / 真人庫 / Google"
+
+        if audio_map_norm:
+            audio_meta = (
+                f" · 🔊 內嵌語音 {len(audio_map_norm)}/{len(cards)} 字（離線可用，其餘自動由瀏覽器朗讀）"
+            )
+            emb_status_html = (
+                f"已內嵌 <b>{len(audio_map_norm)} / {len(cards)}</b> 字"
+                f"（匯出順位：{html.escape(emb_chain_str)}）"
+            )
+        else:
+            audio_meta = " · 🔊 瀏覽器內建語音朗讀"
+            emb_status_html = "此份單字卡未內嵌音檔，將自動使用瀏覽器內建語音朗讀。"
+
+        sample_word = (cards[0]["word"] if cards else "hello") or "hello"
+        sample_word_esc = html.escape(sample_word, quote=True)
+
+        default_settings_obj = {
+            "engineMode": init_engine,
+            "volume": init_vol,
+            "speed": init_speed,
+            "pitch": init_pitch,
+            "autoSpeak": init_auto,
+            "repeat": init_repeat,
+            "voiceEn": "",
+            "voiceJa": "",
+            "voiceZh": "",
+        }
+        default_settings_json = json.dumps(default_settings_obj, ensure_ascii=False).replace("</", "<\\/")
+
         card_html_parts = []
         for idx, c in enumerate(cards, start=1):
-            w_esc = html.escape(c["word"])
+            w_esc = html.escape(c["word"], quote=True)
             cnt = int(c.get("count", 1))
             entries_parts = []
             for e in c.get("entries", []):
@@ -2030,15 +2154,19 @@ class VocabHistoryManager:
             if not entries_parts:
                 entries_parts.append('<div class="dict-empty">（所選詞典無此詞條釋義）</div>')
             card_html_parts.append(
-                f'<article class="card" data-word="{w_esc.lower()}" onclick="this.classList.toggle(\'revealed\')">'
+                f'<article class="card" data-word="{w_esc.lower()}" data-raw="{w_esc}" onclick="onCardClick(this)">'
                 f'<div class="card-head">'
                 f'<span class="idx">#{idx}</span>'
                 f'<span class="word">{w_esc}</span>'
+                f'<button type="button" class="btn-speak" title="播放單字發音 (快捷鍵 S)" '
+                f'onclick="event.stopPropagation(); speakWord(this.closest(\'.card\').dataset.raw, this)">🔊</button>'
                 f'<span class="badge">查詢 {cnt} 次</span>'
                 f'</div>'
                 f'<div class="card-body">{"".join(entries_parts)}</div>'
                 f'</article>'
             )
+
+        audio_json = json.dumps(audio_map_norm, ensure_ascii=False).replace("</", "<\\/")
 
         doc = f"""<!DOCTYPE html>
 <html lang="zh-Hant">
@@ -2065,27 +2193,46 @@ header {{
   max-width: 860px; margin: 0 auto 18px; padding: 14px 18px;
   background: var(--card); border: 1px solid var(--border); border-radius: 12px;
 }}
-header h1 {{ margin: 0 0 6px; font-size: 1.3rem; }}
+.header-top {{ display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }}
+header h1 {{ margin: 0; font-size: 1.3rem; }}
+.nav-tabs {{ display: flex; gap: 6px; align-items: center; }}
+.nav-tab {{
+  padding: 6px 13px; border-radius: 999px; border: 1px solid var(--border);
+  background: var(--bg); color: var(--text); cursor: pointer; font-size: 0.9rem; font-weight: 500;
+}}
+.nav-tab:hover {{ border-color: var(--accent); color: var(--accent); }}
+.nav-tab.active {{ border-color: var(--accent); background: var(--badge-bg); color: var(--badge-fg); font-weight: 700; }}
 .meta {{ color: var(--muted); font-size: 0.88rem; margin-bottom: 10px; }}
 .toolbar {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
 .toolbar input {{
   flex: 1; min-width: 180px; padding: 7px 11px; border-radius: 8px;
   border: 1px solid var(--border); background: var(--bg); color: var(--text);
 }}
-.toolbar button {{
+.toolbar button, .toolbar select, .btn {{
   padding: 7px 12px; border-radius: 8px; border: 1px solid var(--border);
   background: var(--bg); color: var(--text); cursor: pointer; font-size: 0.9rem;
 }}
-.toolbar button:hover {{ border-color: var(--accent); color: var(--accent); }}
-main {{ max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }}
-.card {{
+.toolbar button:hover, .toolbar select:hover, .btn:hover {{ border-color: var(--accent); color: var(--accent); }}
+.toolbar button.active, .btn.primary {{ border-color: var(--accent); background: var(--badge-bg); color: var(--badge-fg); font-weight: 600; }}
+main, .settings-page {{ max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }}
+.card, .set-card {{
   background: var(--card); border: 1px solid var(--border); border-radius: 12px;
-  padding: 14px 18px; cursor: pointer; transition: border-color 0.15s;
+  padding: 14px 18px; transition: border-color 0.15s;
 }}
+.card {{ cursor: pointer; }}
 .card:hover {{ border-color: var(--accent); }}
-.card-head {{ display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }}
+.card-head {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }}
 .idx {{ color: var(--muted); font-size: 0.85rem; }}
 .word {{ font-size: 1.35rem; font-weight: 700; color: var(--accent); }}
+.btn-speak {{
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 3px 9px; border-radius: 999px; border: 1px solid var(--border);
+  background: var(--bg); color: var(--text); cursor: pointer; font-size: 0.95rem;
+  line-height: 1.2; transition: border-color 0.15s, background 0.15s, transform 0.1s;
+}}
+.btn-speak:hover {{ border-color: var(--accent); color: var(--accent); }}
+.btn-speak:active {{ transform: scale(0.95); }}
+.btn-speak.playing {{ border-color: var(--accent); background: var(--badge-bg); color: var(--badge-fg); }}
 .badge {{
   margin-left: auto; font-size: 0.78rem; padding: 2px 8px; border-radius: 999px;
   background: var(--badge-bg); color: var(--badge-fg);
@@ -2094,7 +2241,7 @@ main {{ max-width: 860px; margin: 0 auto; display: flex; flex-direction: column;
 body.flip-mode .card .card-body {{ display: none; }}
 body.flip-mode .card.revealed .card-body {{ display: block; }}
 body.flip-mode .card:not(.revealed)::after {{
-  content: "（點擊卡片顯示釋義）"; display: block; margin-top: 6px;
+  content: "（點擊卡片顯示釋義 · 點擊 🔊 或按 S 鍵發音）"; display: block; margin-top: 6px;
   color: var(--muted); font-size: 0.84rem;
 }}
 .dict-block {{ margin-bottom: 10px; }}
@@ -2103,33 +2250,470 @@ body.flip-mode .card:not(.revealed)::after {{
 .headword {{ color: var(--muted); font-weight: 500; }}
 .dict-def {{ font-size: 0.96rem; white-space: normal; word-break: break-word; }}
 .dict-empty {{ color: var(--muted); font-style: italic; }}
+.set-card h2 {{ margin: 0 0 10px; font-size: 1.05rem; color: var(--accent); }}
+.set-row {{ display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 10px; }}
+.set-row:last-child {{ margin-bottom: 0; }}
+.set-row label.lbl {{ min-width: 115px; font-weight: 600; font-size: 0.93rem; }}
+.set-row input[type="range"] {{ flex: 1; min-width: 160px; accent-color: var(--accent); }}
+.set-row select, .set-row input[type="text"] {{
+  flex: 1; min-width: 180px; padding: 7px 10px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 0.92rem;
+}}
+.val-pill {{
+  min-width: 56px; text-align: center; font-weight: 700; font-size: 0.88rem;
+  padding: 2px 8px; border-radius: 999px; background: var(--badge-bg); color: var(--badge-fg);
+}}
+.radio-opt {{
+  display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--bg);
+  cursor: pointer; width: 100%;
+}}
+.radio-opt:hover {{ border-color: var(--accent); }}
+.radio-opt input {{ margin-top: 4px; accent-color: var(--accent); }}
+.hint {{ color: var(--muted); font-size: 0.84rem; }}
+.save-status {{ color: var(--muted); font-size: 0.84rem; margin-left: auto; }}
 </style>
 </head>
 <body class="flip-mode">
 <header>
-  <h1>🗂 {html.escape(title)}</h1>
-  <div class="meta">共 {len(cards)} 個單字 · 產生時間：{gen_time}</div>
-  <div class="toolbar">
+  <div class="header-top">
+    <h1>🗂 {html.escape(title)}</h1>
+    <div class="nav-tabs">
+      <button type="button" id="tabBtnCards" class="nav-tab active" onclick="switchView('cards')">🗂 單字卡</button>
+      <button type="button" id="tabBtnSettings" class="nav-tab" onclick="switchView('settings')">⚙️ 語音設定</button>
+      <button type="button" class="nav-tab" onclick="document.body.classList.toggle('dark')" title="切換深色/淺色主題">🌙</button>
+    </div>
+  </div>
+  <div class="meta">共 {len(cards)} 個單字 · 產生時間：{gen_time}{audio_meta}</div>
+  <div class="toolbar" id="cardToolbar">
     <input id="q" type="search" placeholder="🔎 篩選單字..." oninput="filterCards()">
     <button onclick="toggleFlip()" id="btnFlip">📖 切換為全部展開</button>
+    <button onclick="toggleAutoSpeak()" id="btnAutoSpeak" title="翻卡展開釋義時自動朗讀單字">🔊 翻卡自動發聲：關</button>
+    <select id="selRate" onchange="onToolbarRateChange(this.value)" title="快速切換語音速度">
+      <option value="0.7">語速 0.7x</option>
+      <option value="0.85">語速 0.85x</option>
+      <option value="1">語速 1.0x</option>
+      <option value="1.2">語速 1.2x</option>
+    </select>
     <button onclick="shuffleCards()">🎲 隨機洗牌</button>
-    <button onclick="document.body.classList.toggle('dark')">🌙 深色/淺色</button>
   </div>
 </header>
+
 <main id="deck">
 {"".join(card_html_parts)}
 </main>
+
+<section id="settingsPage" class="settings-page" style="display:none;">
+  <div class="set-card">
+    <h2>🔊 發聲引擎模式</h2>
+    <div class="set-row">
+      <label class="radio-opt">
+        <input type="radio" name="engineMode" value="embedded" onchange="onSettingsChanged()">
+        <div>
+          <div><b>🎧 內嵌高品質音檔優先（推薦，離線可用）</b></div>
+          <div class="hint">{emb_status_html}；若個別單字無內嵌音檔將自動降級為瀏覽器語音。</div>
+        </div>
+      </label>
+    </div>
+    <div class="set-row">
+      <label class="radio-opt">
+        <input type="radio" name="engineMode" value="browser" onchange="onSettingsChanged()">
+        <div>
+          <div><b>🌐 僅使用瀏覽器內建語音（Web Speech API）</b></div>
+          <div class="hint">可即時切換下方裝置內建的各國人聲角色，並支援即時調整音調（Pitch）。</div>
+        </div>
+      </label>
+    </div>
+  </div>
+
+  <div class="set-card">
+    <h2>🎛️ 發聲參數調整</h2>
+    <div class="set-row">
+      <label class="lbl" for="setVol">發聲音量</label>
+      <input type="range" id="setVol" min="0" max="100" step="1" oninput="onSettingsChanged()">
+      <span class="val-pill" id="lblSetVol">85%</span>
+    </div>
+    <div class="set-row">
+      <label class="lbl" for="setSpeed">播放語速</label>
+      <input type="range" id="setSpeed" min="0.6" max="1.8" step="0.05" oninput="onSettingsChanged()">
+      <span class="val-pill" id="lblSetSpeed">1.00x</span>
+    </div>
+    <div class="set-row">
+      <label class="lbl" for="setPitch">音調偏移</label>
+      <input type="range" id="setPitch" min="-6" max="6" step="1" oninput="onSettingsChanged()">
+      <span class="val-pill" id="lblSetPitch">0</span>
+    </div>
+    <div class="hint">※ 音量與語速同時套用於內嵌音檔與瀏覽器語音；音調偏移即時套用於瀏覽器語音（內嵌音檔已於匯出時套用 Applet 音調設定）。</div>
+  </div>
+
+  <div class="set-card">
+    <h2>🗣️ 瀏覽器內建語音角色（Web Speech API）</h2>
+    <div class="set-row">
+      <label class="lbl" for="selVoiceEn">英文語音 (en)</label>
+      <select id="selVoiceEn" onchange="onSettingsChanged()"></select>
+    </div>
+    <div class="set-row">
+      <label class="lbl" for="selVoiceJa">日文語音 (ja)</label>
+      <select id="selVoiceJa" onchange="onSettingsChanged()"></select>
+    </div>
+    <div class="set-row">
+      <label class="lbl" for="selVoiceZh">中文語音 (zh)</label>
+      <select id="selVoiceZh" onchange="onSettingsChanged()"></select>
+    </div>
+    <div class="hint" id="lblVoiceHint">偵測瀏覽器可用語音清單中...</div>
+  </div>
+
+  <div class="set-card">
+    <h2>📚 複習發聲行為</h2>
+    <div class="set-row">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+        <input type="checkbox" id="setAutoSpeak" onchange="onSettingsChanged()" style="accent-color:var(--accent);">
+        <span>翻卡展開釋義時自動朗讀單字</span>
+      </label>
+    </div>
+    <div class="set-row">
+      <label class="lbl" for="setRepeat">重複朗讀次數</label>
+      <select id="setRepeat" onchange="onSettingsChanged()">
+        <option value="1">1 次（預設）</option>
+        <option value="2">2 次（連讀加深記憶）</option>
+        <option value="3">3 次（聽力強化）</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="set-card">
+    <h2>🧪 試聽與設定管理</h2>
+    <div class="set-row">
+      <input type="text" id="setTestWord" value="{sample_word_esc}" placeholder="輸入要試聽的單字...">
+      <button type="button" class="btn primary" onclick="testSpeakSettings()">🔊 試聽目前設定</button>
+      <button type="button" class="btn" onclick="stopSpeech()">⏹ 停止</button>
+    </div>
+    <div class="set-row">
+      <button type="button" class="btn" onclick="resetSettings()">↺ 恢復匯出預設值</button>
+      <button type="button" class="btn" onclick="switchView('cards')">← 返回單字卡</button>
+      <span class="save-status" id="lblSaveStatus"></span>
+    </div>
+  </div>
+</section>
+
 <script>
+const AUDIO_MAP = {audio_json};
+const DEFAULT_SETTINGS = {default_settings_json};
+const STORAGE_KEY = 'stardict_fc_tts_v1';
+
+let settings = Object.assign({{}}, DEFAULT_SETTINGS);
+let lastWord = '';
+let activeAudio = null;
+let activeBtn = null;
+let speakSeq = 0;
+let repeatTimer = null;
+
+function loadSettings() {{
+  try {{
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) {{
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {{
+        settings = Object.assign({{}}, DEFAULT_SETTINGS, parsed);
+      }}
+    }}
+  }} catch (_) {{}}
+  if (Object.keys(AUDIO_MAP).length === 0 && settings.engineMode === 'embedded') {{
+    settings.engineMode = 'browser';
+  }}
+}}
+
+function saveSettings(showNotice) {{
+  try {{
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+    if (showNotice) {{
+      const el = document.getElementById('lblSaveStatus');
+      if (el) el.textContent = '💾 設定已自動儲存於本瀏覽器';
+    }}
+  }} catch (_) {{}}
+}}
+
+function switchView(view) {{
+  const isSet = (view === 'settings');
+  document.getElementById('deck').style.display = isSet ? 'none' : '';
+  document.getElementById('cardToolbar').style.display = isSet ? 'none' : '';
+  document.getElementById('settingsPage').style.display = isSet ? '' : 'none';
+  document.getElementById('tabBtnCards').classList.toggle('active', !isSet);
+  document.getElementById('tabBtnSettings').classList.toggle('active', isSet);
+  if (isSet) populateVoices();
+}}
+
+function syncToolbarFromSettings() {{
+  const btn = document.getElementById('btnAutoSpeak');
+  if (btn) {{
+    btn.textContent = settings.autoSpeak ? '🔊 翻卡自動發聲：開' : '🔊 翻卡自動發聲：關';
+    btn.classList.toggle('active', !!settings.autoSpeak);
+  }}
+  const sel = document.getElementById('selRate');
+  if (sel) {{
+    const spStr = String(parseFloat(settings.speed.toFixed(2)));
+    let found = false;
+    Array.from(sel.options).forEach(opt => {{
+      if (Math.abs(parseFloat(opt.value) - settings.speed) < 0.01) {{
+        sel.value = opt.value;
+        found = true;
+      }}
+    }});
+    if (!found) {{
+      let customOpt = sel.querySelector('option[data-custom="1"]');
+      if (!customOpt) {{
+        customOpt = document.createElement('option');
+        customOpt.dataset.custom = '1';
+        sel.appendChild(customOpt);
+      }}
+      customOpt.value = spStr;
+      customOpt.textContent = '語速 ' + spStr + 'x';
+      sel.value = spStr;
+    }}
+  }}
+}}
+
+function syncSettingsUI() {{
+  document.querySelectorAll('input[name="engineMode"]').forEach(r => {{
+    r.checked = (r.value === settings.engineMode);
+  }});
+  document.getElementById('setVol').value = settings.volume;
+  document.getElementById('lblSetVol').textContent = settings.volume + '%';
+  document.getElementById('setSpeed').value = settings.speed;
+  document.getElementById('lblSetSpeed').textContent = Number(settings.speed).toFixed(2) + 'x';
+  document.getElementById('setPitch').value = settings.pitch;
+  document.getElementById('lblSetPitch').textContent = settings.pitch > 0 ? ('+' + settings.pitch) : String(settings.pitch);
+  document.getElementById('setAutoSpeak').checked = !!settings.autoSpeak;
+  document.getElementById('setRepeat').value = String(settings.repeat || 1);
+  if (document.getElementById('selVoiceEn').options.length > 0) {{
+    document.getElementById('selVoiceEn').value = settings.voiceEn || '';
+    document.getElementById('selVoiceJa').value = settings.voiceJa || '';
+    document.getElementById('selVoiceZh').value = settings.voiceZh || '';
+  }}
+  syncToolbarFromSettings();
+}}
+
+function onSettingsChanged() {{
+  const checkedRadio = document.querySelector('input[name="engineMode"]:checked');
+  if (checkedRadio) settings.engineMode = checkedRadio.value;
+  settings.volume = Math.max(0, Math.min(100, parseInt(document.getElementById('setVol').value, 10) || 0));
+  settings.speed = Math.max(0.6, Math.min(1.8, parseFloat(document.getElementById('setSpeed').value) || 1.0));
+  settings.pitch = Math.max(-6, Math.min(6, parseInt(document.getElementById('setPitch').value, 10) || 0));
+  settings.autoSpeak = document.getElementById('setAutoSpeak').checked;
+  settings.repeat = Math.max(1, Math.min(3, parseInt(document.getElementById('setRepeat').value, 10) || 1));
+  settings.voiceEn = document.getElementById('selVoiceEn').value || '';
+  settings.voiceJa = document.getElementById('selVoiceJa').value || '';
+  settings.voiceZh = document.getElementById('selVoiceZh').value || '';
+  syncSettingsUI();
+  saveSettings(true);
+}}
+
+function resetSettings() {{
+  settings = Object.assign({{}}, DEFAULT_SETTINGS);
+  try {{ localStorage.removeItem(STORAGE_KEY); }} catch (_) {{}}
+  syncSettingsUI();
+  const el = document.getElementById('lblSaveStatus');
+  if (el) el.textContent = '↺ 已恢復為匯出時的預設設定';
+}}
+
+function populateVoices() {{
+  const hint = document.getElementById('lblVoiceHint');
+  if (!window.speechSynthesis) {{
+    if (hint) hint.textContent = '⚠️ 此瀏覽器不支援 Web Speech API。';
+    return;
+  }}
+  const voices = window.speechSynthesis.getVoices() || [];
+  const fill = (selId, prefix, savedVal) => {{
+    const sel = document.getElementById(selId);
+    if (!sel) return;
+    sel.innerHTML = '';
+    const defOpt = document.createElement('option');
+    defOpt.value = '';
+    defOpt.textContent = '（系統自動選擇）';
+    sel.appendChild(defOpt);
+    voices.filter(v => (v.lang || '').toLowerCase().startsWith(prefix)).forEach(v => {{
+      const opt = document.createElement('option');
+      opt.value = v.name;
+      opt.textContent = v.name + ' (' + v.lang + ')';
+      sel.appendChild(opt);
+    }});
+    sel.value = savedVal || '';
+    if (sel.value !== (savedVal || '')) sel.value = '';
+  }};
+  fill('selVoiceEn', 'en', settings.voiceEn);
+  fill('selVoiceJa', 'ja', settings.voiceJa);
+  fill('selVoiceZh', 'zh', settings.voiceZh);
+  if (hint) {{
+    hint.textContent = voices.length > 0
+      ? ('✔ 已偵測到 ' + voices.length + ' 個瀏覽器內建語音角色。')
+      : 'ℹ️ 尚未偵測到瀏覽器語音角色（部分瀏覽器需先點擊發音或安裝系統語音包）。';
+  }}
+}}
+
+function detectLang(word) {{
+  if (/[\u3040-\u30FF]/.test(word)) return 'ja-JP';
+  if (/[\u4E00-\u9FFF]/.test(word)) return 'zh-TW';
+  return 'en-US';
+}}
+
+function pickBrowserVoice(lang) {{
+  if (!window.speechSynthesis) return null;
+  const voices = window.speechSynthesis.getVoices() || [];
+  let wantName = '';
+  if (lang.startsWith('ja')) wantName = settings.voiceJa;
+  else if (lang.startsWith('zh')) wantName = settings.voiceZh;
+  else wantName = settings.voiceEn;
+  if (wantName) {{
+    const match = voices.find(v => v.name === wantName);
+    if (match) return match;
+  }}
+  return null;
+}}
+
+function clearPlayingState() {{
+  if (activeBtn) {{
+    activeBtn.classList.remove('playing');
+    activeBtn = null;
+  }}
+}}
+
+function stopSpeech() {{
+  speakSeq++;
+  if (repeatTimer) {{
+    clearTimeout(repeatTimer);
+    repeatTimer = null;
+  }}
+  if (activeAudio) {{
+    try {{ activeAudio.pause(); activeAudio.currentTime = 0; }} catch (_) {{}}
+    activeAudio = null;
+  }}
+  if (window.speechSynthesis) {{
+    try {{ window.speechSynthesis.cancel(); }} catch (_) {{}}
+  }}
+  clearPlayingState();
+}}
+
+function playOnceWebSpeech(word, seq, onDone) {{
+  if (seq !== speakSeq || !window.speechSynthesis) {{
+    onDone();
+    return;
+  }}
+  try {{
+    const u = new SpeechSynthesisUtterance(word);
+    const lang = detectLang(word);
+    u.lang = lang;
+    const v = pickBrowserVoice(lang);
+    if (v) u.voice = v;
+    u.volume = Math.max(0, Math.min(1, settings.volume / 100));
+    u.rate = Math.max(0.5, Math.min(2.0, settings.speed));
+    u.pitch = Math.max(0.5, Math.min(1.5, 1.0 + (settings.pitch || 0) * 0.08));
+    u.onend = onDone;
+    u.onerror = onDone;
+    window.speechSynthesis.speak(u);
+  }} catch (_) {{
+    onDone();
+  }}
+}}
+
+function playOnce(word, seq, onDone) {{
+  if (seq !== speakSeq) return;
+  const useEmbedded = (settings.engineMode === 'embedded');
+  const uri = useEmbedded ? AUDIO_MAP[word.toLowerCase()] : null;
+  if (uri) {{
+    try {{
+      const a = new Audio(uri);
+      a.volume = Math.max(0, Math.min(1, settings.volume / 100));
+      a.playbackRate = Math.max(0.5, Math.min(2.0, settings.speed));
+      activeAudio = a;
+      a.onended = () => {{
+        if (activeAudio === a) activeAudio = null;
+        onDone();
+      }};
+      a.onerror = () => {{
+        if (activeAudio === a) activeAudio = null;
+        playOnceWebSpeech(word, seq, onDone);
+      }};
+      const p = a.play();
+      if (p && typeof p.catch === 'function') {{
+        p.catch(() => {{
+          if (activeAudio === a) activeAudio = null;
+          playOnceWebSpeech(word, seq, onDone);
+        }});
+      }}
+      return;
+    }} catch (_) {{}}
+  }}
+  playOnceWebSpeech(word, seq, onDone);
+}}
+
+function speakWord(word, btnEl) {{
+  const w = (word || '').trim();
+  if (!w) return;
+  stopSpeech();
+  lastWord = w;
+  const seq = speakSeq;
+  const totalTimes = Math.max(1, Math.min(3, parseInt(settings.repeat, 10) || 1));
+  if (btnEl) {{
+    btnEl.classList.add('playing');
+    activeBtn = btnEl;
+  }}
+  let remaining = totalTimes;
+  const next = () => {{
+    if (seq !== speakSeq) return;
+    remaining--;
+    if (remaining <= 0) {{
+      clearPlayingState();
+      return;
+    }}
+    repeatTimer = setTimeout(() => {{
+      repeatTimer = null;
+      if (seq === speakSeq) playOnce(w, seq, next);
+    }}, 350);
+  }};
+  playOnce(w, seq, next);
+}}
+
+function testSpeakSettings() {{
+  const w = (document.getElementById('setTestWord').value || '').trim() || 'hello';
+  speakWord(w, null);
+}}
+
+function onCardClick(el) {{
+  const revealed = el.classList.toggle('revealed');
+  const w = el.dataset.raw || '';
+  if (w) lastWord = w;
+  if (settings.autoSpeak && revealed && w) {{
+    speakWord(w, el.querySelector('.btn-speak'));
+  }}
+}}
+
+function toggleAutoSpeak() {{
+  settings.autoSpeak = !settings.autoSpeak;
+  syncSettingsUI();
+  saveSettings(false);
+}}
+
+function onToolbarRateChange(v) {{
+  const n = parseFloat(v);
+  if (!isNaN(n) && n >= 0.6 && n <= 1.8) {{
+    settings.speed = n;
+    syncSettingsUI();
+    saveSettings(false);
+  }}
+}}
+
 function toggleFlip() {{
   const isFlip = document.body.classList.toggle('flip-mode');
   document.getElementById('btnFlip').textContent = isFlip ? '📖 切換為全部展開' : '🃏 切換為翻卡測驗';
 }}
+
 function filterCards() {{
   const q = document.getElementById('q').value.trim().toLowerCase();
   document.querySelectorAll('.card').forEach(el => {{
     el.style.display = (!q || el.dataset.word.includes(q)) ? '' : 'none';
   }});
 }}
+
 function shuffleCards() {{
   const deck = document.getElementById('deck');
   const arr = Array.from(deck.children);
@@ -2142,6 +2726,27 @@ function shuffleCards() {{
     const idxEl = el.querySelector('.idx');
     if (idxEl) idxEl.textContent = '#' + (idx + 1);
     deck.appendChild(el);
+  }});
+}}
+
+document.addEventListener('keydown', (e) => {{
+  const tag = (document.activeElement && document.activeElement.tagName) || '';
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+  if (!e.ctrlKey && !e.metaKey && !e.altKey && (e.key === 's' || e.key === 'S')) {{
+    if (lastWord) {{
+      e.preventDefault();
+      speakWord(lastWord, null);
+    }}
+  }}
+}});
+
+loadSettings();
+populateVoices();
+syncSettingsUI();
+if (window.speechSynthesis && typeof window.speechSynthesis.addEventListener === 'function') {{
+  window.speechSynthesis.addEventListener('voiceschanged', () => {{
+    populateVoices();
+    syncSettingsUI();
   }});
 }}
 </script>
@@ -5426,7 +6031,13 @@ class DictCalcWidget(Gtk.EventBox):
         v_paned.set_position(330)
         tab_vocab.pack_start(v_paned, True, True, 0)
 
-        # Bottom Export Bar (EPUB layout + HTML / EPUB buttons + Progress)
+        # Bottom Export Bar (HTML audio embed toggle + EPUB layout + HTML / EPUB buttons + Progress)
+        chk_html_embed_audio = Gtk.CheckButton(
+            label="🔊 匯出 HTML 時內嵌語音音檔（依語音順位：Edge / 真人庫 / Google，100% 離線通用）"
+        )
+        chk_html_embed_audio.set_active(bool(self.config.get("vocab_html_embed_audio", True)))
+        tab_vocab.pack_start(chk_html_embed_audio, False, False, 0)
+
         v_exp_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         v_exp_box.pack_start(Gtk.Label(label="EPUB 排版：", xalign=0.0), False, False, 0)
         combo_epub_layout = Gtk.ComboBoxText()
@@ -5518,6 +6129,8 @@ class DictCalcWidget(Gtk.EventBox):
 
             sort_mode = combo_v_sort.get_active_id() or "recent"
             epub_layout = combo_epub_layout.get_active_id() or "per_word"
+            embed_audio = (fmt == "html" and chk_html_embed_audio.get_active())
+            cfg_snap = dict(self.config)
             if sort_mode == "random":
                 random.shuffle(selected_rows)
 
@@ -5529,6 +6142,7 @@ class DictCalcWidget(Gtk.EventBox):
             def _exp_worker():
                 cards = []
                 total = len(selected_rows)
+                dict_weight = 0.5 if embed_audio else 1.0
                 for idx, (w_str, cnt_val, last_s) in enumerate(selected_rows, start=1):
                     hits = self.dict_mgr.query_sync(w_str, dict_names=dict_names, exact=True)
                     cards.append(
@@ -5539,7 +6153,7 @@ class DictCalcWidget(Gtk.EventBox):
                             "entries": hits,
                         }
                     )
-                    frac = idx / float(max(1, total))
+                    frac = (idx / float(max(1, total))) * dict_weight
                     GLib.idle_add(
                         lambda f=frac, i=idx, t=total: (
                             v_prog_bar.set_fraction(f),
@@ -5547,11 +6161,45 @@ class DictCalcWidget(Gtk.EventBox):
                             False,
                         )[-1]
                     )
+
+                audio_map = {}
+                if embed_audio:
+                    for idx, c in enumerate(cards, start=1):
+                        w_str = c["word"]
+                        uri = SpeechManager.get_audio_data_uri(w_str, cfg_snap)
+                        if uri:
+                            audio_map[w_str.strip().lower()] = uri
+                        frac = 0.5 + (idx / float(max(1, total))) * 0.48
+                        n_ok = len(audio_map)
+                        GLib.idle_add(
+                            lambda f=frac, i=idx, t=total, ok=n_ok: (
+                                v_prog_bar.set_fraction(f),
+                                v_prog_bar.set_text(f"🔊 內嵌語音進度：{i} / {t}（已取得 {ok} 字）"),
+                                False,
+                            )[-1]
+                        )
+
                 err_msg = None
                 try:
                     book_title = f"StarDict 單字卡 ({today_str})"
                     if fmt == "html":
-                        VocabHistoryManager.export_html(out_path, cards, title=book_title)
+                        tts_defaults = {
+                            "volume": cfg_snap.get("tts_volume", 85),
+                            "speed": cfg_snap.get("tts_speed", 1.0),
+                            "pitch": cfg_snap.get("tts_pitch", 0),
+                            "engine_mode": "embedded" if (embed_audio and audio_map) else "browser",
+                            "embedded_engines": SpeechManager.resolve_engine_chain(cfg_snap, kind="word"),
+                            "auto_speak": False,
+                            "repeat": 1,
+                        }
+                        VocabHistoryManager.export_html(
+                            out_path,
+                            cards,
+                            title=book_title,
+                            audio_map=audio_map if embed_audio else None,
+                            default_speed=cfg_snap.get("tts_speed", 1.0),
+                            tts_defaults=tts_defaults,
+                        )
                     else:
                         VocabHistoryManager.export_epub(out_path, cards, layout=epub_layout, title=book_title)
                 except Exception as exc:
@@ -5565,7 +6213,12 @@ class DictCalcWidget(Gtk.EventBox):
                         v_prog_bar.set_text(f"❌ 匯出失敗：{err_msg}")
                     else:
                         v_prog_bar.set_fraction(1.0)
-                        v_prog_bar.set_text(f"✅ 已匯出 {len(cards)} 字至：{os.path.basename(out_path)}")
+                        if embed_audio:
+                            v_prog_bar.set_text(
+                                f"✅ 已匯出 {len(cards)} 字（含 {len(audio_map)} 筆內嵌語音）至：{os.path.basename(out_path)}"
+                            )
+                        else:
+                            v_prog_bar.set_text(f"✅ 已匯出 {len(cards)} 字至：{os.path.basename(out_path)}")
                     return False
 
                 GLib.idle_add(_exp_done)
@@ -5664,6 +6317,7 @@ class DictCalcWidget(Gtk.EventBox):
             self.config["hide_panel_border"] = chk_no_border.get_active()
             self.config["vocab_record_enabled"] = chk_vocab_rec.get_active()
             self.config["vocab_epub_layout"] = combo_epub_layout.get_active_id() or "per_word"
+            self.config["vocab_html_embed_audio"] = chk_html_embed_audio.get_active()
             self._save_config()
             self._sync_scan_poll_timer()
             if (
@@ -5843,6 +6497,7 @@ class DictCalcWidget(Gtk.EventBox):
         combo_dbus_style.connect("changed", apply_tab1)
         combo_bubble_pos.connect("changed", apply_tab1)
         combo_epub_layout.connect("changed", apply_tab1)
+        chk_html_embed_audio.connect("toggled", apply_tab1)
         col_btn.connect("color-set", lambda *_: (rb_col_cus.set_active(True), apply_tab1()))
         bg_col_btn.connect("color-set", apply_tab1)
         bd_col_btn.connect("color-set", apply_tab1)
