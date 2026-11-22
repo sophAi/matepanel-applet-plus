@@ -772,7 +772,7 @@ class TaskCalendarWindow(Gtk.Window):
             for t in day_pending[:2]:
                 if line_y + 3.0 > cy + ch:
                     break
-                desc = t.get("description", "").strip()
+                desc = t.get("description", "").replace("\u200b", "").strip()
                 if len(desc) > max_chars:
                     desc = desc[: max_chars - 1] + "…"
                 if t.get("priority") == "H" or t.get("_due_level") == "crit":
@@ -782,18 +782,18 @@ class TaskCalendarWindow(Gtk.Window):
                 else:
                     ctx.set_source_rgba(0.65, 0.88, 0.98, 1.0)
                 ctx.move_to(cx + 4.5, line_y)
-                ctx.show_text(f"• {desc}")
+                ctx.show_text(f"• {desc}" if desc else "•")
                 line_y += line_step
                 shown_lines += 1
 
             if shown_lines < 2 and day_comp and (line_y + 3.0 <= cy + ch):
                 ct = day_comp[0]
-                cdesc = ct.get("description", "").strip()
+                cdesc = ct.get("description", "").replace("\u200b", "").strip()
                 if len(cdesc) > max_chars:
                     cdesc = cdesc[: max_chars - 1] + "…"
                 ctx.set_source_rgba(0.45, 0.82, 0.64, 0.85)
                 ctx.move_to(cx + 4.5, line_y)
-                ctx.show_text(f"✓ {cdesc}")
+                ctx.show_text(f"✓ {cdesc}" if cdesc else "✓")
 
         return False
 
@@ -858,7 +858,7 @@ class TaskCalendarWindow(Gtk.Window):
         lbl.set_line_wrap(True)
         lbl.set_max_width_chars(38)
 
-        desc = html.escape(t.get("description", ""))
+        desc = html.escape(t.get("description", "").replace("\u200b", "").strip())
         proj = t.get("project", "")
         tags = t.get("tags", [])
         pri = t.get("priority", "")
@@ -1634,7 +1634,7 @@ class TaskwarriorWidget(Gtk.EventBox):
         if not self.filtered_pending:
             return "無待辦事項"
         top = self.filtered_pending[0]
-        desc = top.get("description", "").strip()
+        desc = top.get("description", "").replace("\u200b", "").strip()
         if len(desc) > max_c:
             desc = desc[: max_c - 1] + "…"
         pri = top.get("priority", "")
@@ -1716,7 +1716,7 @@ class TaskwarriorWidget(Gtk.EventBox):
         for t in self.filtered_pending[:5]:
             tid = t.get("id", "?")
             pri = f"[{t['priority']}] " if t.get("priority") else ""
-            desc = html.escape(t.get("description", ""))
+            desc = html.escape(t.get("description", "").replace("\u200b", "").strip())
             proj = f" ({html.escape(t['project'])})" if t.get("project") else ""
             due_r = f" — <b>{html.escape(t['_due_rel'])}</b>" if t.get("_due_rel") else ""
             act = " ▶️[計時中]" if t.get("_is_active") else ""
@@ -2412,7 +2412,7 @@ class TaskwarriorWidget(Gtk.EventBox):
     def _build_single_task_menu_item(self, t):
         tid = t.get("id", "?")
         uuid_str = t.get("uuid", "")
-        desc = html.escape(t.get("description", ""))
+        desc = html.escape(t.get("description", "").replace("\u200b", "").strip())
         pri = t.get("priority", "")
         proj = t.get("project", "")
         tags = t.get("tags", [])

@@ -1962,6 +1962,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
                 px = cx + 3.5 + col_i * (col_pw + col_gap)
                 py = start_y + row_i * (c_pill_h + c_pill_gap)
                 pw = col_pw
+                raw_desc = str(t.get("description", "")).replace("\u200b", "").strip()
                 custom_hex = self.task_colors.get(t.get("uuid", ""))
                 txt_rgb = (1.0, 1.0, 1.0)
                 if custom_hex:
@@ -1970,14 +1971,14 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
                     if rgb_luminance((cr, cg, cb)) > 0.62:
                         txt_rgb = (0.06, 0.08, 0.12)
                     if is_comp:
-                        label_txt = "✓ " + str(t.get("description", ""))
+                        label_txt = ("✓ " + raw_desc) if raw_desc else "✓"
                     else:
                         pri = t.get("priority", "")
                         pri_pfx = f"[{pri}] " if pri else ""
-                        label_txt = pri_pfx + str(t.get("description", ""))
+                        label_txt = (pri_pfx + raw_desc).strip()
                 elif is_comp:
                     p_bg = (0.06, 0.44, 0.32, 0.72)
-                    label_txt = "✓ " + str(t.get("description", ""))
+                    label_txt = ("✓ " + raw_desc) if raw_desc else "✓"
                 else:
                     due_lvl = t.get("_due_level", "normal")
                     pri = t.get("priority", "")
@@ -1988,18 +1989,20 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
                     else:
                         p_bg = (0.09, 0.45, 0.72, 0.86)
                     pri_pfx = f"[{pri}] " if pri else ""
-                    label_txt = pri_pfx + str(t.get("description", ""))
+                    label_txt = (pri_pfx + raw_desc).strip()
 
                 draw_rounded_rect(ctx, px, py, pw, c_pill_h, min(3.5, c_pill_h / 3.0))
                 ctx.set_source_rgba(*p_bg)
                 ctx.fill()
 
-                disp = self._truncate_text(ctx, label_txt, max(10.0, pw - 6.0))
-                ext = ctx.text_extents(disp)
-                ty = py + (c_pill_h - ext.height) / 2.0 - ext.y_bearing
-                ctx.set_source_rgba(txt_rgb[0], txt_rgb[1], txt_rgb[2], 0.80 if is_comp else 0.98)
-                ctx.move_to(px + 3.0 - ext.x_bearing, ty)
-                ctx.show_text(disp)
+                if label_txt:
+                    disp = self._truncate_text(ctx, label_txt, max(10.0, pw - 6.0))
+                    if disp:
+                        ext = ctx.text_extents(disp)
+                        ty = py + (c_pill_h - ext.height) / 2.0 - ext.y_bearing
+                        ctx.set_source_rgba(txt_rgb[0], txt_rgb[1], txt_rgb[2], 0.80 if is_comp else 0.98)
+                        ctx.move_to(px + 3.0 - ext.x_bearing, ty)
+                        ctx.show_text(disp)
 
                 self._task_hit_rects.append((px, py, pw, c_pill_h, t, is_comp))
                 drawn_count += 1
@@ -2143,7 +2146,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
     def _make_popover_task_row(self, task, is_comp, pop):
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         uuid_str = task.get("uuid", "")
-        desc = html.escape(str(task.get("description", "")))
+        desc = html.escape(str(task.get("description", "")).replace("\u200b", "").strip())
 
         btn_done = Gtk.Button(label="↩" if is_comp else "✓")
         btn_done.set_relief(Gtk.ReliefStyle.NONE)
@@ -2569,7 +2572,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
 
                 # Main text body
                 vcol = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-                desc_esc = html.escape(str(task.get("description", "")))
+                desc_esc = html.escape(str(task.get("description", "")).replace("\u200b", "").strip())
                 pri = str(task.get("priority") or "")
                 pri_badge = f"<span foreground='{accent}'><b>[{html.escape(pri)}]</b></span> " if pri else ""
                 status_txt = "已完成" if is_comp else ("逾期" if task.get("_due_level") == "crit" else "待辦")
