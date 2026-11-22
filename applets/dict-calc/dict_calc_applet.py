@@ -106,12 +106,12 @@ VIRTUAL_DICT_ENGINE_MAP = {d["bookname"]: d["engine"] for d in VIRTUAL_TRANSLATE
 
 DEFAULT_CONFIG = {
     "display_mode": "panel_entry",       # "panel_entry" (純面板查詢輸入框，預設) or "badge" (精簡方塊圖示)
-    "result_output_mode": "dbus_popup",  # "window" (無焦點精簡結果視窗) or "dbus_popup" (氣泡框彈出模式)
+    "result_output_mode": "window",      # "window" (無焦點精簡結果視窗) or "dbus_popup" (氣泡框彈出模式)
     "dbus_popup_style": "merged",        # "separate" (每本詞典獨立泡泡，最多 N 個) or "merged" (單一泡泡以粗體分隔線區隔)
     "dbus_popup_max_dicts": 3,           # 氣泡框最多顯示幾本命中的詞典 (1..5)
     "dbus_popup_timeout_sec": 15,        # 氣泡框停留秒數 (1..60)
-    "dbus_popup_font_size": 16,          # 氣泡框字型大小 (pt)
-    "dbus_popup_width": 520,             # 氣泡框最大寬度 (px)
+    "dbus_popup_font_size": 17,          # 氣泡框字型大小 (pt)
+    "dbus_popup_width": 1000,            # 氣泡框最大寬度 (px)
     "dbus_popup_position": "top_right",  # "top_center"(置中上方), "top_left"(左上角), "top_right"(右上角), "bottom_right"(右下角), "bottom_left"(左下角)
     "dbus_popup_x_offset": 0,            # 氣泡框水平偏移 (-500..+500 px)
     "dbus_popup_y_offset": 4,            # 氣泡框垂直偏移 (-300..+500 px)
@@ -158,6 +158,7 @@ DEFAULT_CONFIG = {
     "active_dict_group": "custom",       # "custom" (已勾選常用), "en_zh", "ja_zh", "sci_en", "all"
     "dict_root_dir": "/usr/share/stardict/dic",  # StarDict 詞典根目錄路徑 (留空則掃描系統預設路徑)
     "enabled_dicts": [
+        "劍橋雙向字典",
         "DrEye4in1詞典",
         "English Thesaurus",
         "Collins Cobuild English Dictionary",
@@ -168,6 +169,7 @@ DEFAULT_CONFIG = {
         "The CMU Pronouncing Dictionary",
     ],
     "enabled_dicts_dbus": [
+        "Cambridge Advanced Learner's Dictionary 4th Edition",
         "DrEye4in1詞典",
         "Collins Cobuild English Dictionary",
     ],
@@ -176,13 +178,17 @@ DEFAULT_CONFIG = {
         "🌐 Gemini AI 翻譯",
     ],
     "vocab_record_enabled": True,        # 自動紀錄傳統 StarDict 詞典查詢命中的單字
-    "vocab_card_dicts": ["DrEye4in1詞典"],
+    "vocab_card_dicts": [
+        "劍橋雙向字典",
+        "DrEye4in1詞典",
+        "Cambridge Advanced Learner's Dictionary 4th Edition",
+    ],
     "vocab_sort_mode": "random",         # "recent", "freq", "alpha", "random"
     "vocab_epub_layout": "per_word",     # "per_word" (一字一頁，預設) or "az_chapters" (依字母 A-Z 分章)
     "vocab_html_embed_audio": True,      # 匯出 HTML 單字卡時內嵌高品質語音音檔 (Base64 離線通用)
-    "result_font_size": 15,              # 結果視窗字型大小 (pt)
-    "result_window_width": 460,          # 無焦點結果視窗寬度 (px)
-    "result_window_height": 420,         # 無焦點結果視窗高度 (px)
+    "result_font_size": 17,              # 無焦點結果視窗字型大小 (pt)
+    "result_window_width": 1000,         # 無焦點結果視窗寬度 (px，獨立設定)
+    "result_window_height": 681,         # 無焦點結果視窗高度 (px)
     "font_color_mode": "dynamic",        # "dynamic" or "custom"
     "custom_font_color": "#e66100",      # 自訂面板字形顏色
     "badge_bg_style": "light",           # (舊版相容欄位)
@@ -3527,7 +3533,8 @@ class DictCalcPopupWindow(Gtk.Window):
     def __init__(self, parent_widget):
         super().__init__(title="📖 StarDict 查詢結果")
         self.parent_widget = parent_widget
-        init_w = max(300, min(1400, int(parent_widget.config.get("result_window_width", 460))))
+        default_w = parent_widget.config.get("dbus_popup_width", 520)
+        init_w = max(300, min(1400, int(parent_widget.config.get("result_window_width", default_w))))
         init_h = max(240, min(1000, int(parent_widget.config.get("result_window_height", 420))))
         self.set_default_size(init_w, init_h)
         self.set_size_request(300, 240)
@@ -3569,11 +3576,16 @@ class DictCalcPopupWindow(Gtk.Window):
         self.parent_widget._save_config()
         return False
 
-    def _on_grip_enter(self, widget, _event):
+    def _on_grip_enter(self, widget, _event, edge="se"):
         gdk_w = widget.get_window()
         if gdk_w is not None:
             try:
-                cur = Gdk.Cursor.new_for_display(widget.get_display(), Gdk.CursorType.BOTTOM_RIGHT_CORNER)
+                ctype = (
+                    Gdk.CursorType.BOTTOM_LEFT_CORNER
+                    if edge == "sw"
+                    else Gdk.CursorType.BOTTOM_RIGHT_CORNER
+                )
+                cur = Gdk.Cursor.new_for_display(widget.get_display(), ctype)
                 gdk_w.set_cursor(cur)
             except Exception:
                 pass
@@ -3586,20 +3598,38 @@ class DictCalcPopupWindow(Gtk.Window):
                 gdk_w.set_cursor(None)
         return False
 
-    def _on_grip_press(self, _widget, event):
+    def _on_grip_press(self, _widget, event, edge="se"):
         if event.button != 1:
             return False
+        cur_x, cur_y = self.get_position()
         cur_w, cur_h = self.get_size()
-        self._resize_drag = (float(event.x_root), float(event.y_root), int(cur_w), int(cur_h))
+        self._resize_drag = (
+            edge,
+            float(event.x_root),
+            float(event.y_root),
+            int(cur_x),
+            int(cur_y),
+            int(cur_w),
+            int(cur_h),
+        )
         return True
 
     def _on_grip_motion(self, _widget, event):
         if self._resize_drag is None:
             return False
-        sx, sy, sw, sh = self._resize_drag
-        new_w = max(300, min(1400, int(round(sw + (float(event.x_root) - sx)))))
-        new_h = max(240, min(1000, int(round(sh + (float(event.y_root) - sy)))))
-        self.resize(new_w, new_h)
+        edge, sx, sy, wx, wy, sw, sh = self._resize_drag
+        dx = float(event.x_root) - sx
+        dy = float(event.y_root) - sy
+        new_h = max(240, min(1000, int(round(sh + dy))))
+        if edge == "sw":
+            # Dragging bottom-left corner: moving left increases width & shifts window x left
+            new_w = max(300, min(1400, int(round(sw - dx))))
+            new_x = wx + (sw - new_w)
+            self.move(int(new_x), int(wy))
+            self.resize(new_w, new_h)
+        else:
+            new_w = max(300, min(1400, int(round(sw + dx))))
+            self.resize(new_w, new_h)
         return True
 
     def _on_grip_release(self, widget, event):
@@ -3678,32 +3708,43 @@ class DictCalcPopupWindow(Gtk.Window):
         scroll.add(self.result_view)
         root.pack_start(scroll, True, True, 0)
 
-        # Status Footer + WM-independent bottom-right resize grip (works even with accept_focus=False)
+        # Status Footer + WM-independent bottom-left (◣) & bottom-right (◢) resize grips
         footer_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+        def _make_grip(symbol, edge, tip):
+            eb = Gtk.EventBox()
+            eb.set_above_child(True)
+            eb.set_tooltip_text(tip)
+            lbl = Gtk.Label(label=symbol)
+            lbl.set_opacity(0.65)
+            lbl.set_margin_start(2)
+            lbl.set_margin_end(2)
+            eb.add(lbl)
+            eb.add_events(
+                Gdk.EventMask.BUTTON_PRESS_MASK
+                | Gdk.EventMask.BUTTON_RELEASE_MASK
+                | Gdk.EventMask.POINTER_MOTION_MASK
+                | Gdk.EventMask.BUTTON1_MOTION_MASK
+                | Gdk.EventMask.ENTER_NOTIFY_MASK
+                | Gdk.EventMask.LEAVE_NOTIFY_MASK
+            )
+            eb.connect("enter-notify-event", self._on_grip_enter, edge)
+            eb.connect("leave-notify-event", self._on_grip_leave)
+            eb.connect("button-press-event", self._on_grip_press, edge)
+            eb.connect("motion-notify-event", self._on_grip_motion)
+            eb.connect("button-release-event", self._on_grip_release)
+            return eb
+
+        grip_sw = _make_grip("◣", "sw", "按住左下角拖曳可自由調整視窗寬度與高度（視窗貼靠螢幕右緣時特別好用）")
+        footer_box.pack_start(grip_sw, False, False, 0)
+
         self.status_lbl = Gtk.Label(xalign=0.0)
         self.status_lbl.set_ellipsize(3)  # Pango.EllipsizeMode.END
         self._update_status_footer()
         footer_box.pack_start(self.status_lbl, True, True, 0)
 
-        grip_eb = Gtk.EventBox()
-        grip_eb.set_above_child(True)
-        grip_eb.set_tooltip_text("按住拖曳可自由調整視窗寬度與高度")
-        grip_lbl = Gtk.Label(label="◢")
-        grip_lbl.set_opacity(0.65)
-        grip_eb.add(grip_lbl)
-        grip_eb.add_events(
-            Gdk.EventMask.BUTTON_PRESS_MASK
-            | Gdk.EventMask.BUTTON_RELEASE_MASK
-            | Gdk.EventMask.POINTER_MOTION_MASK
-            | Gdk.EventMask.ENTER_NOTIFY_MASK
-            | Gdk.EventMask.LEAVE_NOTIFY_MASK
-        )
-        grip_eb.connect("enter-notify-event", self._on_grip_enter)
-        grip_eb.connect("leave-notify-event", self._on_grip_leave)
-        grip_eb.connect("button-press-event", self._on_grip_press)
-        grip_eb.connect("motion-notify-event", self._on_grip_motion)
-        grip_eb.connect("button-release-event", self._on_grip_release)
-        footer_box.pack_end(grip_eb, False, False, 0)
+        grip_se = _make_grip("◢", "se", "按住右下角拖曳可自由調整視窗寬度與高度")
+        footer_box.pack_end(grip_se, False, False, 0)
         root.pack_start(footer_box, False, False, 0)
 
         self.add(root)
@@ -3783,17 +3824,21 @@ class DictCalcPopupWindow(Gtk.Window):
                     _, px, py = seat.get_pointer().get_position()
                     self.move(max(10, px - 100), max(36, py + 18))
         else:
-            # Position cleanly near the MATE Panel search box if realized
+            # Position cleanly near the MATE Panel search box and clamp inside active monitor bounds
             gdk_win = self.parent_widget.get_window()
             if gdk_win is not None:
                 _, ox, oy = gdk_win.get_origin()
                 alloc = self.parent_widget.get_allocation()
-                screen_h = Gdk.Screen.get_default().get_height() if Gdk.Screen.get_default() else 1080
-                win_h = self.get_size()[1] or 400
-                if oy + alloc.height + win_h + 10 < screen_h:
-                    self.move(max(10, ox), oy + alloc.height + 4)
+                win_w, win_h = self.get_size()
+                win_w = win_w or int(self.parent_widget.config.get("result_window_width", 520))
+                win_h = win_h or int(self.parent_widget.config.get("result_window_height", 420))
+                mon_l, mon_t, mon_r, mon_b = self.parent_widget._get_active_monitor_bounds()
+                px = max(mon_l + 8, min(ox, mon_r - win_w - 8))
+                if oy + alloc.height + win_h + 10 < mon_b:
+                    py = oy + alloc.height + 4
                 else:
-                    self.move(max(10, ox), max(10, oy - win_h - 4))
+                    py = max(mon_t + 8, oy - win_h - 4)
+                self.move(int(px), int(py))
             else:
                 self.set_position(Gtk.WindowPosition.CENTER)
 
@@ -5595,7 +5640,7 @@ class DictCalcWidget(Gtk.EventBox):
         combo_out = Gtk.ComboBoxText()
         for o_id, o_lbl in (
             ("window", "無焦點精簡結果視窗 (可捲動看完整詞典，不搶面板游標)"),
-            ("dbus_popup", "氣泡框彈出模式 (可於「氣泡框設定」自訂位置、底色、字色與透明度)"),
+            ("dbus_popup", "氣泡框彈出模式 (可於「結果視窗設定」自訂位置、底色、字色與透明度)"),
         ):
             combo_out.append(o_id, o_lbl)
         combo_out.set_active_id(self.config.get("result_output_mode", "window"))
@@ -5836,22 +5881,8 @@ class DictCalcWidget(Gtk.EventBox):
             climb_rate=1.0,
             digits=0,
         )
-        spin_res_fs = Gtk.SpinButton(
-            adjustment=Gtk.Adjustment(
-                value=float(self.config.get("result_font_size", 11)),
-                lower=8.0,
-                upper=22.0,
-                step_increment=1.0,
-                page_increment=2.0,
-                page_size=0.0,
-            ),
-            climb_rate=1.0,
-            digits=0,
-        )
         size_grid.attach(Gtk.Label(label="面板內嵌輸入框寬度 (px)：", xalign=0.0), 0, 0, 1, 1)
         size_grid.attach(spin_entry_w, 1, 0, 1, 1)
-        size_grid.attach(Gtk.Label(label="查詢結果視窗字型大小 (pt)：", xalign=0.0), 2, 0, 1, 1)
-        size_grid.attach(spin_res_fs, 3, 0, 1, 1)
         tab_appear.pack_start(size_grid, False, False, 0)
 
         # Font color & badge background
@@ -6145,7 +6176,45 @@ class DictCalcWidget(Gtk.EventBox):
         b_test_box.pack_start(btn_close_bubbles, False, False, 0)
         tab_bubble.pack_start(b_test_box, False, False, 0)
 
-        notebook.append_page(tab_bubble, Gtk.Label(label="💬 氣泡框設定"))
+        tab_bubble.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 4)
+
+        b_s4 = Gtk.Label(xalign=0.0)
+        b_s4.set_markup("<b>4. 無焦點結果視窗設定</b>")
+        tab_bubble.pack_start(b_s4, False, False, 0)
+
+        res_win_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        res_win_box.set_margin_start(12)
+        res_win_box.pack_start(Gtk.Label(label="無焦點視窗寬度 (px)：", xalign=0.0), False, False, 0)
+        spin_res_w = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(
+                value=float(self.config.get("result_window_width", 520)),
+                lower=300.0,
+                upper=1400.0,
+                step_increment=20.0,
+                page_increment=60.0,
+                page_size=0.0,
+            ),
+            climb_rate=1.0,
+            digits=0,
+        )
+        res_win_box.pack_start(spin_res_w, False, False, 0)
+        res_win_box.pack_start(Gtk.Label(label="無焦點視窗字型大小 (pt)：", xalign=0.0), False, False, 0)
+        spin_res_fs = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(
+                value=float(self.config.get("result_font_size", 15)),
+                lower=8.0,
+                upper=22.0,
+                step_increment=1.0,
+                page_increment=2.0,
+                page_size=0.0,
+            ),
+            climb_rate=1.0,
+            digits=0,
+        )
+        res_win_box.pack_start(spin_res_fs, False, False, 0)
+        tab_bubble.pack_start(res_win_box, False, False, 0)
+
+        notebook.append_page(tab_bubble, Gtk.Label(label="🪟 結果視窗設定"))
 
         # ---------------- Tab 3: Multi-Engine Translation Settings ----------------
         tab_tr = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -7277,6 +7346,12 @@ class DictCalcWidget(Gtk.EventBox):
             self.config["dbus_popup_timeout_sec"] = int(spin_dbus_sec.get_value_as_int())
             self.config["dbus_popup_font_size"] = int(spin_dbus_fs.get_value_as_int())
             self.config["dbus_popup_width"] = max(260, min(1200, int(spin_dbus_w.get_value_as_int())))
+            old_res_w = int(self.config.get("result_window_width", 520))
+            new_res_w = max(300, min(1400, int(spin_res_w.get_value_as_int())))
+            self.config["result_window_width"] = new_res_w
+            if new_res_w != old_res_w and self.popup_win is not None:
+                cur_h = self.popup_win.get_size()[1] or int(self.config.get("result_window_height", 420))
+                self.popup_win.resize(new_res_w, max(240, cur_h))
             self.config["dbus_popup_position"] = combo_bubble_pos.get_active_id() or "top_center"
             self.config["dbus_popup_x_offset"] = int(spin_dbus_xoff.get_value_as_int())
             self.config["dbus_popup_y_offset"] = int(spin_dbus_yoff.get_value_as_int())
@@ -7544,6 +7619,7 @@ class DictCalcWidget(Gtk.EventBox):
             spin_dbus_sec,
             spin_dbus_fs,
             spin_dbus_w,
+            spin_res_w,
             spin_dbus_xoff,
             spin_dbus_yoff,
             spin_entry_w,
@@ -7551,13 +7627,155 @@ class DictCalcWidget(Gtk.EventBox):
         ):
             sp_c.connect("value-changed", apply_tab1)
 
-        # Bottom Close Button
+        # Bottom Export/Import Config & Close Buttons
         btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        btn_open_q = Gtk.Button(label="🔎 開啟查詢/計算視窗")
-        btn_open_q.connect("clicked", lambda *_: self.open_popup_window(""))
+        btn_exp_cfg = Gtk.Button(label="📤 匯出設定...")
+        btn_imp_cfg = Gtk.Button(label="📥 匯入設定...")
+        lbl_cfg_io = Gtk.Label(xalign=0.0)
+        lbl_cfg_io.set_ellipsize(3)  # Pango.EllipsizeMode.END
         btn_close = Gtk.Button(label="關閉")
         btn_close.connect("clicked", lambda *_: win.destroy())
-        btn_row.pack_start(btn_open_q, False, False, 0)
+
+        def on_export_config(*_):
+            apply_tab1()
+            today_str = datetime.datetime.now().strftime("%Y%m%d")
+            dlg = Gtk.FileChooserDialog(
+                title="匯出 DictCalc Applet 設定檔",
+                parent=win,
+                action=Gtk.FileChooserAction.SAVE,
+            )
+            dlg.set_do_overwrite_confirmation(True)
+            dlg.add_buttons(
+                Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                Gtk.STOCK_SAVE, Gtk.ResponseType.OK,
+            )
+            flt = Gtk.FileFilter()
+            flt.set_name("JSON 設定檔 (*.json)")
+            flt.add_pattern("*.json")
+            dlg.add_filter(flt)
+            dlg.set_current_folder(os.path.expanduser("~"))
+            dlg.set_current_name(f"dict-calc-config-{today_str}.json")
+
+            chk_inc_keys = Gtk.CheckButton(
+                label="🔑 包含翻譯 API 金鑰（跨機自用時可勾選；分享給他人建議取消）"
+            )
+            chk_inc_keys.set_active(False)
+            dlg.set_extra_widget(chk_inc_keys)
+
+            resp = dlg.run()
+            out_path = dlg.get_filename() if resp == Gtk.ResponseType.OK else None
+            inc_keys = chk_inc_keys.get_active()
+            dlg.destroy()
+            if not out_path:
+                return
+            if not out_path.lower().endswith(".json"):
+                out_path += ".json"
+
+            cfg_out = dict(self.config)
+            if not inc_keys:
+                for k_secret in ("gemini_api_key", "openai_api_key", "deepl_api_key"):
+                    cfg_out[k_secret] = ""
+            bundle = {
+                "format": "matepanel-applet-plus.dict-calc.config",
+                "version": 1,
+                "exported_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "config": cfg_out,
+            }
+            try:
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(bundle, f, indent=2, ensure_ascii=False)
+                lbl_cfg_io.set_markup(
+                    f"<small><span foreground='#10b981'>✅ 已匯出設定至 {html.escape(os.path.basename(out_path))}</span></small>"
+                )
+            except Exception as exc:
+                lbl_cfg_io.set_markup(
+                    f"<small><span foreground='#f87171'>❌ 匯出失敗：{html.escape(str(exc))}</span></small>"
+                )
+
+        def on_import_config(*_):
+            dlg = Gtk.FileChooserDialog(
+                title="匯入 DictCalc Applet 設定檔",
+                parent=win,
+                action=Gtk.FileChooserAction.OPEN,
+            )
+            dlg.add_buttons(
+                Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                Gtk.STOCK_OPEN, Gtk.ResponseType.OK,
+            )
+            flt = Gtk.FileFilter()
+            flt.set_name("JSON 設定檔 (*.json)")
+            flt.add_pattern("*.json")
+            dlg.add_filter(flt)
+            dlg.set_current_folder(os.path.expanduser("~"))
+            resp = dlg.run()
+            in_path = dlg.get_filename() if resp == Gtk.ResponseType.OK else None
+            dlg.destroy()
+            if not in_path:
+                return
+
+            try:
+                with open(in_path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if not isinstance(raw, dict):
+                    raise ValueError("檔案格式無效（非 JSON 物件）")
+                if raw.get("format") == "matepanel-applet-plus.dict-calc.config" and isinstance(raw.get("config"), dict):
+                    imp_cfg = raw["config"]
+                else:
+                    # Also accept raw dict-calc.json directly
+                    imp_cfg = raw
+                valid_keys = set(DEFAULT_CONFIG.keys())
+                matched = {k: v for k, v in imp_cfg.items() if k in valid_keys}
+                if not matched:
+                    raise ValueError("找不到任何相容的 DictCalc 設定欄位")
+
+                old_root = self.config.get("dict_root_dir", "")
+                new_cfg = dict(DEFAULT_CONFIG)
+                new_cfg.update(self.config)
+                for k, v in matched.items():
+                    # Keep existing local API keys if imported config has blank keys
+                    if k in ("gemini_api_key", "openai_api_key", "deepl_api_key") and not v:
+                        continue
+                    new_cfg[k] = v
+
+                self.config = new_cfg
+                self._save_config()
+                if self.config.get("dict_root_dir", "") != old_root:
+                    self.dict_mgr.set_root_dir(self.config.get("dict_root_dir", ""))
+                self._sync_scan_poll_timer()
+                self.rebind_global_hotkeys()
+                self._apply_panel_layout()
+                self._update_tooltip()
+                if self.popup_win is not None:
+                    self.popup_win.sync_controls()
+                    w_new = max(300, min(1400, int(self.config.get("result_window_width", 520))))
+                    h_new = max(240, min(1000, int(self.config.get("result_window_height", 420))))
+                    self.popup_win.resize(w_new, h_new)
+
+                # Reopen Preferences cleanly so all tabs immediately reflect imported values
+                win.destroy()
+                self.show_preferences_dialog()
+                md = Gtk.MessageDialog(
+                    transient_for=None,
+                    flags=0,
+                    message_type=Gtk.MessageType.INFO,
+                    buttons=Gtk.ButtonsType.OK,
+                    text="✅ 已成功匯入設定",
+                )
+                md.format_secondary_text(
+                    f"已套用來自「{os.path.basename(in_path)}」的 {len(matched)} 項設定並重新載入偏好設定視窗。"
+                )
+                md.run()
+                md.destroy()
+            except Exception as exc:
+                lbl_cfg_io.set_markup(
+                    f"<small><span foreground='#f87171'>❌ 匯入失敗：{html.escape(str(exc))}</span></small>"
+                )
+
+        btn_exp_cfg.connect("clicked", on_export_config)
+        btn_imp_cfg.connect("clicked", on_import_config)
+        btn_row.pack_start(btn_exp_cfg, False, False, 0)
+        btn_row.pack_start(btn_imp_cfg, False, False, 0)
+        btn_row.pack_start(lbl_cfg_io, True, True, 0)
         btn_row.pack_end(btn_close, False, False, 0)
         outer.pack_end(btn_row, False, False, 0)
 

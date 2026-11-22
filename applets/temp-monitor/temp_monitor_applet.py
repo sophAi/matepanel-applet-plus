@@ -22,7 +22,9 @@ Features:
 """
 
 import ctypes
+from datetime import datetime
 import glob
+import html
 import json
 import math
 import os
@@ -2006,9 +2008,139 @@ class TempMonitorWidget(Gtk.EventBox):
         btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         btn_sensors = Gtk.Button(label="🌡 檢視所有感測器清單")
         btn_sensors.connect("clicked", lambda *_: self.popup_sensor_menu(None))
+        btn_exp_cfg = Gtk.Button(label="📤 匯出設定...")
+        btn_imp_cfg = Gtk.Button(label="📥 匯入設定...")
         btn_close = Gtk.Button(label="關閉")
         btn_close.connect("clicked", lambda *_: win.destroy())
+
+        def on_export_config(*_):
+            apply_changes()
+            today_str = datetime.now().strftime("%Y%m%d")
+            dlg = Gtk.FileChooserDialog(
+                title="匯出 CPU/GPU 溫度監控設定檔",
+                parent=win,
+                action=Gtk.FileChooserAction.SAVE,
+            )
+            dlg.set_do_overwrite_confirmation(True)
+            dlg.add_buttons(
+                Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                Gtk.STOCK_SAVE, Gtk.ResponseType.OK,
+            )
+            flt = Gtk.FileFilter()
+            flt.set_name("JSON 設定檔 (*.json)")
+            flt.add_pattern("*.json")
+            dlg.add_filter(flt)
+            dlg.set_current_folder(os.path.expanduser("~"))
+            dlg.set_current_name(f"temp-monitor-config-{today_str}.json")
+            resp = dlg.run()
+            out_path = dlg.get_filename() if resp == Gtk.ResponseType.OK else None
+            dlg.destroy()
+            if not out_path:
+                return
+            if not out_path.lower().endswith(".json"):
+                out_path += ".json"
+            bundle = {
+                "format": "matepanel-applet-plus.temp-monitor.config",
+                "version": 1,
+                "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "config": dict(self.config),
+            }
+            try:
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(bundle, f, indent=2, ensure_ascii=False)
+                md = Gtk.MessageDialog(
+                    transient_for=win,
+                    flags=0,
+                    message_type=Gtk.MessageType.INFO,
+                    buttons=Gtk.ButtonsType.OK,
+                    text="✅ 已成功匯出設定",
+                )
+                md.format_secondary_text(f"已儲存至：{out_path}")
+                md.run()
+                md.destroy()
+            except Exception as exc:
+                md = Gtk.MessageDialog(
+                    transient_for=win,
+                    flags=0,
+                    message_type=Gtk.MessageType.ERROR,
+                    buttons=Gtk.ButtonsType.OK,
+                    text="❌ 匯出設定失敗",
+                )
+                md.format_secondary_text(str(exc))
+                md.run()
+                md.destroy()
+
+        def on_import_config(*_):
+            dlg = Gtk.FileChooserDialog(
+                title="匯入 CPU/GPU 溫度監控設定檔",
+                parent=win,
+                action=Gtk.FileChooserAction.OPEN,
+            )
+            dlg.add_buttons(
+                Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                Gtk.STOCK_OPEN, Gtk.ResponseType.OK,
+            )
+            flt = Gtk.FileFilter()
+            flt.set_name("JSON 設定檔 (*.json)")
+            flt.add_pattern("*.json")
+            dlg.add_filter(flt)
+            dlg.set_current_folder(os.path.expanduser("~"))
+            resp = dlg.run()
+            in_path = dlg.get_filename() if resp == Gtk.ResponseType.OK else None
+            dlg.destroy()
+            if not in_path:
+                return
+            try:
+                with open(in_path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if not isinstance(raw, dict):
+                    raise ValueError("檔案格式無效（非 JSON 物件）")
+                if raw.get("format") == "matepanel-applet-plus.temp-monitor.config" and isinstance(raw.get("config"), dict):
+                    imp_cfg = raw["config"]
+                else:
+                    imp_cfg = raw
+                valid_keys = set(DEFAULT_CONFIG.keys())
+                matched = {k: v for k, v in imp_cfg.items() if k in valid_keys}
+                if not matched:
+                    raise ValueError("找不到任何相容的溫度監控設定欄位")
+                new_cfg = dict(DEFAULT_CONFIG)
+                new_cfg.update(self.config)
+                new_cfg.update(matched)
+                self.config = new_cfg
+                self._save_config()
+                self._sync_timer()
+                self.refresh_readings(force_poll=bool(self.config.get("enabled", True)))
+                win.destroy()
+                self.show_preferences_dialog()
+                md = Gtk.MessageDialog(
+                    transient_for=None,
+                    flags=0,
+                    message_type=Gtk.MessageType.INFO,
+                    buttons=Gtk.ButtonsType.OK,
+                    text="✅ 已成功匯入設定",
+                )
+                md.format_secondary_text(
+                    f"已套用來自「{os.path.basename(in_path)}」的 {len(matched)} 項設定並重新載入偏好設定視窗。"
+                )
+                md.run()
+                md.destroy()
+            except Exception as exc:
+                md = Gtk.MessageDialog(
+                    transient_for=win,
+                    flags=0,
+                    message_type=Gtk.MessageType.ERROR,
+                    buttons=Gtk.ButtonsType.OK,
+                    text="❌ 匯入設定失敗",
+                )
+                md.format_secondary_text(str(exc))
+                md.run()
+                md.destroy()
+
+        btn_exp_cfg.connect("clicked", on_export_config)
+        btn_imp_cfg.connect("clicked", on_import_config)
         btn_box.pack_start(btn_sensors, False, False, 0)
+        btn_box.pack_start(btn_exp_cfg, False, False, 0)
+        btn_box.pack_start(btn_imp_cfg, False, False, 0)
         btn_box.pack_end(btn_close, False, False, 0)
         outer.pack_end(btn_box, False, False, 0)
 
