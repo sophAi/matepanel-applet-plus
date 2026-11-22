@@ -277,22 +277,61 @@ EOF
 [Desktop Entry]
 Type=Application
 Name=MATE Panel Layout Restore
-Comment=Restore saved MATE Panel applet positions after startup
-Exec=sh -c 'sleep 4 && [ -f "${PANEL_LAYOUT_FILE}" ] && dconf load /org/mate/panel/objects/ < "${PANEL_LAYOUT_FILE}"'
+Comment=Restore saved MATE Panel applet positions after startup if drifted
+Exec=${REPO_DIR}/install.sh restore-panel-layout --if-drifted
 Terminal=false
 X-MATE-Autostart-enabled=true
-X-MATE-Autostart-Delay=2
+X-MATE-Autostart-Delay=8
 EOF
         echo "✅ 已儲存目前 MATE Panel 佈局快照至：${PANEL_LAYOUT_FILE}"
-        echo "✅ 已啟用開機延遲自動還原（${PANEL_LAYOUT_AUTOSTART}），重開機後將自動鎖定面板位置！"
+        echo "✅ 已啟用開機延遲自動還原（${PANEL_LAYOUT_AUTOSTART}，延遲 8 秒，偵測到跑位才自動還原並重載面板）"
+        echo "💡 建議：在右側各 Applet 右鍵勾選「鎖定於面板」後再執行一次 $0 save-panel-layout 效果最佳！"
         ;;
     restore-panel-layout)
-        if [[ ! -f "${PANEL_LAYOUT_FILE}" ]]; then
+        if [[ ! -f "${PANEL_LAYOUT_FILE}" || ! -s "${PANEL_LAYOUT_FILE}" ]]; then
             echo "❌ 找不到面板佈局快照：${PANEL_LAYOUT_FILE}，請先執行 $0 save-panel-layout"
             exit 1
         fi
+        if [[ "${TARGET}" == "--if-drifted" ]]; then
+            # Only reload mate-panel if any saved applet's position/edge/toplevel actually drifted
+            if /usr/bin/python3 - "${PANEL_LAYOUT_FILE}" <<'PYEOF'
+import configparser, subprocess, sys
+
+def parse_layout(text):
+    cp = configparser.ConfigParser(interpolation=None)
+    cp.read_string(text)
+    keys = ("position", "relative-to-edge", "toplevel-id", "panel-right-stick")
+    out = {}
+    for sec in cp.sections():
+        if "/" in sec:
+            continue
+        out[sec] = {k: cp.get(sec, k, fallback="") for k in keys}
+    return out
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    saved = parse_layout(f.read())
+live_raw = subprocess.check_output(["dconf", "dump", "/org/mate/panel/objects/"], text=True)
+live = parse_layout(live_raw)
+
+drifted = False
+for sec, skv in saved.items():
+    if sec not in live or live[sec] != skv:
+        drifted = True
+        break
+sys.exit(1 if drifted else 0)
+PYEOF
+            then
+                echo "ℹ️  MATE Panel 佈局與快照一致，無需重載"
+                exit 0
+            fi
+        fi
         dconf load /org/mate/panel/objects/ < "${PANEL_LAYOUT_FILE}"
-        echo "✅ 已從快照還原 MATE Panel 佈局（${PANEL_LAYOUT_FILE}）"
+        if command -v mate-panel >/dev/null 2>&1; then
+            nohup mate-panel --replace >/dev/null 2>&1 &
+            echo "✅ 已從快照還原 MATE Panel 佈局並重新載入面板（${PANEL_LAYOUT_FILE}）"
+        else
+            echo "✅ 已從快照還原 MATE Panel 佈局（${PANEL_LAYOUT_FILE}）"
+        fi
         ;;
     disable-panel-layout)
         rm -f "${PANEL_LAYOUT_AUTOSTART}"

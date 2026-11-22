@@ -134,8 +134,8 @@ Custom MATE Panel Applets collection and development repository for Linux deskto
 ./install.sh uninstall-desktop  # 移除開機自啟並停止桌面月曆
 
 # 5. 鎖定 MATE Panel 面板佈局（防止多螢幕或重開機時 Applet 跑位，免 sudo）
-./install.sh save-panel-layout     # 儲存目前面板佈局快照並啟用開機延遲自動還原
-./install.sh restore-panel-layout  # 立即從已儲存快照還原面板佈局
+./install.sh save-panel-layout     # 儲存面板佈局快照並啟用開機延遲 8 秒跑位偵測還原（偵測到跑位才載入並重載面板）
+./install.sh restore-panel-layout  # 立即從已儲存快照還原面板佈局並重載 mate-panel
 ./install.sh disable-panel-layout  # 停用開機自動還原面板佈局
 
 # 6. 檢查缺少的必要／建議套件（含 edge-tts / mpv / sdcv / task 等）
