@@ -125,8 +125,8 @@ DEFAULT_CONFIG = {
     "tts_auto_speak": True,              # 查詢單字命中時自動發聲
     "calc_auto_speak": True,             # 算式計算完成時自動以中文語音通報結果
     "word_tts_engines": [
-        {"id": "real_people", "enabled": True},
         {"id": "edge", "enabled": True},
+        {"id": "real_people", "enabled": True},
         {"id": "google", "enabled": True},
         {"id": "espeak", "enabled": True},
     ],
@@ -135,10 +135,10 @@ DEFAULT_CONFIG = {
         {"id": "google", "enabled": True},
     ],
     "tts_voice_gender": "female",        # "female" (女聲), "male" (男聲), "female_soft" (溫柔女聲)
-    "tts_speed": 1.0,                    # 語速倍率 (0.6..1.8)
+    "tts_speed": 0.7,                    # 語速倍率 (0.6..1.8)
     "tts_pitch": 0,                      # 音調偏移 (-6..+6 半音)
     "tts_real_people_dir": "/usr/share/WyabdcRealPeopleTTS",  # StarDict 真人語音庫目錄
-    "tts_volume": 80,                    # 單字與算式發聲音量 (0..100%)
+    "tts_volume": 87,                    # 單字與算式發聲音量 (0..100%)
     "google_translate_target": "zh-TW",  # 外文翻譯目標語言 ("zh-TW", "zh-CN", "ja", "en")
     "google_translate_reverse": "en",    # 中文反向翻譯目標語言 ("en", "ja")
     "translate_engine": "gemini",        # "google", "gemini", "openai_compat", "deepl"
