@@ -120,12 +120,13 @@ DEFAULT_CONFIG = {
     "task_font_size": 18,       # 6..28 任務膠囊全域預設字型大小
     "detail_font_size": 16,     # 9..24 詳細任務內容視窗字型大小
     "task_columns": 1,          # 1 = 全域預設單欄, 2 = 全域預設垂直分割成兩列
-    "date_cell_overrides": {},  # 單日獨立排版覆寫: {"YYYY-MM-DD": {"task_columns": 2, "task_font_size": 9}}
+    "date_cell_overrides": {},  # 單日獨立覆寫: {"YYYY-MM-DD": {"task_columns": 2, "task_font_size": 9, "bg_color": "#...", "border_color": "#...", "border_width": 2.0}}
     "retention_days": 180,      # 啟動時保留天數（0 = 不自動刪除；>0 時清理超過此天數的任務與單日設定）
     "auto_backup_enabled": True,   # 每日自動備份（保留最近 3 天）
     "auto_backup_keep_days": 3,    # 自動備份保留份數（預設最近 3 天）
     "auto_shrink_task_font": True,  # 當任務超過日期框大小時，自動縮小任務字型以完整顯示
     "show_completed": True,     # 在日期格子內顯示已完成任務
+    "show_cell_task_count": True,  # 顯示日期框右上角的任務數字
     "show_weather": True,       # 在日期列顯示 7 天天氣預報
     "due_soon_days": 3,
 }
@@ -680,6 +681,52 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
                     except (TypeError, ValueError):
                         pass
         return float(g_fs), g_cols, has_manual_fs
+
+    def _get_date_cell_style(self, d_str):
+        """Return (bg_color_hex_or_None, border_color_hex_or_None, border_width_float_or_None) for a date cell."""
+        overrides = self.config.get("date_cell_overrides")
+        if not isinstance(overrides, dict):
+            return None, None, None
+        ov = overrides.get(d_str)
+        if not isinstance(ov, dict):
+            return None, None, None
+        bg_c = ov.get("bg_color") if isinstance(ov.get("bg_color"), str) and ov.get("bg_color") else None
+        bd_c = ov.get("border_color") if isinstance(ov.get("border_color"), str) and ov.get("border_color") else None
+        bd_w = None
+        if "border_width" in ov and ov["border_width"] is not None:
+            try:
+                bd_w = max(0.5, min(8.0, float(ov["border_width"])))
+            except (TypeError, ValueError):
+                bd_w = None
+        return bg_c, bd_c, bd_w
+
+    def _set_date_cell_style(self, d_str, bg_color=None, border_color=None, border_width=None):
+        """Update per-date custom bg_color / border_color / border_width in date_cell_overrides."""
+        overrides = self.config.setdefault("date_cell_overrides", {})
+        if not isinstance(overrides, dict):
+            overrides = {}
+            self.config["date_cell_overrides"] = overrides
+        ov = overrides.get(d_str)
+        if not isinstance(ov, dict):
+            ov = {}
+        if bg_color:
+            ov["bg_color"] = str(bg_color)
+        else:
+            ov.pop("bg_color", None)
+        if border_color:
+            ov["border_color"] = str(border_color)
+        else:
+            ov.pop("border_color", None)
+        if border_width is not None:
+            ov["border_width"] = round(max(0.5, min(8.0, float(border_width))), 1)
+        else:
+            ov.pop("border_width", None)
+        if ov:
+            overrides[d_str] = ov
+        else:
+            overrides.pop(d_str, None)
+        self._save_config()
+        self._refresh_view()
 
     def _set_date_cell_override(self, d_str, key, val):
         """Set a per-date override; automatically prune if it matches global default."""
@@ -1693,9 +1740,13 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
             p_list = self._by_date_pending.get(d_str, [])
             c_list = self._by_date_completed.get(d_str, []) if show_comp else []
 
-            # Date cell background
+            # Date cell background (supports per-date custom bg_color / border_color / border_width)
+            ov_bg_hex, ov_bd_hex, ov_bd_w = self._get_date_cell_style(d_str)
             draw_rounded_rect(ctx, cx, cy, cw, ch, 6.0)
-            if is_today:
+            if ov_bg_hex:
+                c_rgb = hex_to_rgb(ov_bg_hex, cur_m_bg_rgb)
+                ctx.set_source_rgba(c_rgb[0], c_rgb[1], c_rgb[2], max(0.28, cell_a))
+            elif is_today:
                 ctx.set_source_rgba(today_bg_rgb[0], today_bg_rgb[1], today_bg_rgb[2], max(0.28, cell_a * 0.95))
             elif is_cur_m:
                 ctx.set_source_rgba(cur_m_bg_rgb[0], cur_m_bg_rgb[1], cur_m_bg_rgb[2], cell_a)
@@ -1703,7 +1754,16 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
                 ctx.set_source_rgba(other_m_bg_rgb[0], other_m_bg_rgb[1], other_m_bg_rgb[2], cell_a * 0.45)
             ctx.fill_preserve()
 
-            if is_today:
+            if ov_bd_hex or ov_bd_w is not None:
+                if ov_bd_hex:
+                    b_rgb = hex_to_rgb(ov_bd_hex, today_bd_rgb)
+                    ctx.set_source_rgba(b_rgb[0], b_rgb[1], b_rgb[2], 0.95)
+                elif is_today:
+                    ctx.set_source_rgba(today_bd_rgb[0], today_bd_rgb[1], today_bd_rgb[2], 0.95)
+                else:
+                    ctx.set_source_rgba(fg_rgb[0], fg_rgb[1], fg_rgb[2], 0.65)
+                ctx.set_line_width(ov_bd_w if ov_bd_w is not None else 1.8)
+            elif is_today:
                 ctx.set_source_rgba(today_bd_rgb[0], today_bd_rgb[1], today_bd_rgb[2], 0.95)
                 ctx.set_line_width(1.6)
             else:
@@ -1729,7 +1789,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
 
             right_limit = cx + cw - 4.0
             total_items = len(p_list) + len(c_list)
-            if total_items > 0:
+            if self.config.get("show_cell_task_count", True) and total_items > 0:
                 cnt_s = str(len(p_list)) if p_list else f"✓{len(c_list)}"
                 ctx.set_font_size(max(8.0, base_fs - 2.0))
                 cext = ctx.text_extents(cnt_s)
@@ -2224,35 +2284,34 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         dlg.show_all()
         e_desc.grab_focus()
         if dlg.run() == Gtk.ResponseType.OK:
-            desc = e_desc.get_text().strip()
+            desc = e_desc.get_text().strip() or "\u200b"
             chosen_hex = get_color_hex()
-            if desc:
-                before_uuids = {t.get("uuid", "") for t in self.pending_tasks if t.get("uuid")}
-                tags = [t.strip().lstrip("+") for t in e_tags.get_text().replace(",", " ").split() if t.strip()]
-                TaskwarriorBackend.add_task_structured(
-                    description=desc,
-                    project=e_proj.get_text().strip(),
-                    priority=c_pri.get_active_id() or "",
-                    tags=tags,
-                    due=e_due.get_text().strip(),
-                )
-                self.reload_tasks()
-                if chosen_hex:
-                    new_tasks = [t for t in self.pending_tasks if t.get("uuid") and t.get("uuid") not in before_uuids]
-                    target_uuid = ""
-                    if len(new_tasks) == 1:
-                        target_uuid = new_tasks[0].get("uuid", "")
-                    elif new_tasks:
-                        for nt in new_tasks:
-                            if str(nt.get("description", "")).strip() == desc:
-                                target_uuid = nt.get("uuid", "")
-                                break
-                        if not target_uuid:
-                            target_uuid = new_tasks[-1].get("uuid", "")
-                    if target_uuid:
-                        self.task_colors[target_uuid] = chosen_hex
-                        self._save_task_colors()
-                        self.cal_canvas.queue_draw()
+            before_uuids = {t.get("uuid", "") for t in self.pending_tasks if t.get("uuid")}
+            tags = [t.strip().lstrip("+") for t in e_tags.get_text().replace(",", " ").split() if t.strip()]
+            TaskwarriorBackend.add_task_structured(
+                description=desc,
+                project=e_proj.get_text().strip(),
+                priority=c_pri.get_active_id() or "",
+                tags=tags,
+                due=e_due.get_text().strip(),
+            )
+            self.reload_tasks()
+            if chosen_hex:
+                new_tasks = [t for t in self.pending_tasks if t.get("uuid") and t.get("uuid") not in before_uuids]
+                target_uuid = ""
+                if len(new_tasks) == 1:
+                    target_uuid = new_tasks[0].get("uuid", "")
+                elif new_tasks:
+                    for nt in new_tasks:
+                        if str(nt.get("description", "")).strip() == desc:
+                            target_uuid = nt.get("uuid", "")
+                            break
+                    if not target_uuid:
+                        target_uuid = new_tasks[-1].get("uuid", "")
+                if target_uuid:
+                    self.task_colors[target_uuid] = chosen_hex
+                    self._save_task_colors()
+                    self.cal_canvas.queue_draw()
         dlg.destroy()
 
     def _open_edit_dialog(self, task, is_completed=False):
@@ -2279,7 +2338,9 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         e_desc = Gtk.Entry()
         e_desc.set_hexpand(True)
         e_desc.set_width_chars(32)
-        e_desc.set_text(str(task.get("description", "")))
+        orig_desc = str(task.get("description", ""))
+        e_desc.set_text("" if orig_desc == "\u200b" else orig_desc)
+        e_desc.set_placeholder_text("留空將自動填入不可見佔位字元")
         e_desc.set_activates_default(True)
 
         e_proj = Gtk.Entry()
@@ -2316,7 +2377,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         dlg.show_all()
         resp = dlg.run()
         if resp == Gtk.ResponseType.OK:
-            desc = e_desc.get_text().strip()
+            desc = e_desc.get_text().strip() or "\u200b"
             chosen_hex = get_color_hex()
             if uuid_str:
                 if chosen_hex:
@@ -2324,16 +2385,15 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
                 else:
                     self.task_colors.pop(uuid_str, None)
                 self._save_task_colors()
-            if desc:
-                TaskwarriorBackend.modify_task_structured(
-                    uuid_str=uuid_str,
-                    description=desc,
-                    project=e_proj.get_text().strip(),
-                    priority=c_pri.get_active_id() or "",
-                    tags_str=e_tags.get_text().strip(),
-                    due=e_due.get_text().strip(),
-                    orig_tags=task.get("tags") or [],
-                )
+            TaskwarriorBackend.modify_task_structured(
+                uuid_str=uuid_str,
+                description=desc,
+                project=e_proj.get_text().strip(),
+                priority=c_pri.get_active_id() or "",
+                tags_str=e_tags.get_text().strip(),
+                due=e_due.get_text().strip(),
+                orig_tags=task.get("tags") or [],
+            )
             self.reload_tasks()
         elif resp == RESP_DONE:
             if is_completed:
@@ -2718,6 +2778,116 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
             self._save_task_colors()
         self.reload_tasks()
 
+    def _open_date_style_dialog(self, d_obj):
+        d_str = d_obj.strftime("%Y-%m-%d")
+        d_lbl = d_obj.strftime("%Y/%m/%d")
+        ov_bg, ov_bd, ov_bw = self._get_date_cell_style(d_str)
+
+        dlg = Gtk.Dialog(
+            title=f"🎨 自訂 {d_lbl} 日期框樣式",
+            transient_for=None,
+            flags=Gtk.DialogFlags.MODAL,
+        )
+        dlg.set_position(Gtk.WindowPosition.CENTER)
+        dlg.set_keep_above(True)
+        dlg.set_default_size(380, -1)
+
+        area = dlg.get_content_area()
+        area.set_spacing(10)
+        area.set_margin_top(12)
+        area.set_margin_bottom(12)
+        area.set_margin_start(16)
+        area.set_margin_end(16)
+
+        def _rgba_to_hex(rgba):
+            r = max(0, min(255, int(round(rgba.red * 255))))
+            g = max(0, min(255, int(round(rgba.green * 255))))
+            b = max(0, min(255, int(round(rgba.blue * 255))))
+            return f"#{r:02x}{g:02x}{b:02x}"
+
+        grid = Gtk.Grid(column_spacing=12, row_spacing=10)
+
+        chk_bg = Gtk.CheckButton(label="自訂背景顏色：")
+        chk_bg.set_active(bool(ov_bg))
+        btn_bg = Gtk.ColorButton()
+        r_bg = Gdk.RGBA()
+        r_bg.parse(ov_bg or self.config.get("cur_month_bg_color", "#393939"))
+        btn_bg.set_rgba(r_bg)
+        btn_bg.set_sensitive(bool(ov_bg))
+
+        chk_bd = Gtk.CheckButton(label="自訂框線顏色：")
+        chk_bd.set_active(bool(ov_bd))
+        btn_bd = Gtk.ColorButton()
+        r_bd = Gdk.RGBA()
+        r_bd.parse(ov_bd or self.config.get("today_border_color", "#38e0a6"))
+        btn_bd.set_rgba(r_bd)
+        btn_bd.set_sensitive(bool(ov_bd))
+
+        chk_bw = Gtk.CheckButton(label="自訂框線粗細 (px)：")
+        chk_bw.set_active(ov_bw is not None)
+        spin_bw = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(float(ov_bw if ov_bw is not None else 2.0), 0.5, 8.0, 0.5, 1.0, 0.0),
+            climb_rate=0.5,
+            digits=1,
+        )
+        spin_bw.set_sensitive(ov_bw is not None)
+
+        grid.attach(chk_bg, 0, 0, 1, 1)
+        grid.attach(btn_bg, 1, 0, 1, 1)
+        grid.attach(chk_bd, 0, 1, 1, 1)
+        grid.attach(btn_bd, 1, 1, 1, 1)
+        grid.attach(chk_bw, 0, 2, 1, 1)
+        grid.attach(spin_bw, 1, 2, 1, 1)
+        area.pack_start(grid, False, False, 0)
+
+        updating = [False]
+
+        def _apply_style(*_):
+            if updating[0]:
+                return
+            btn_bg.set_sensitive(chk_bg.get_active())
+            btn_bd.set_sensitive(chk_bd.get_active())
+            spin_bw.set_sensitive(chk_bw.get_active())
+            self._set_date_cell_style(
+                d_str,
+                bg_color=_rgba_to_hex(btn_bg.get_rgba()) if chk_bg.get_active() else None,
+                border_color=_rgba_to_hex(btn_bd.get_rgba()) if chk_bd.get_active() else None,
+                border_width=float(spin_bw.get_value()) if chk_bw.get_active() else None,
+            )
+
+        def _reset_style(*_):
+            updating[0] = True
+            try:
+                chk_bg.set_active(False)
+                chk_bd.set_active(False)
+                chk_bw.set_active(False)
+                btn_bg.set_sensitive(False)
+                btn_bd.set_sensitive(False)
+                spin_bw.set_sensitive(False)
+            finally:
+                updating[0] = False
+            self._set_date_cell_style(d_str, bg_color=None, border_color=None, border_width=None)
+
+        chk_bg.connect("toggled", _apply_style)
+        chk_bd.connect("toggled", _apply_style)
+        chk_bw.connect("toggled", _apply_style)
+        btn_bg.connect("color-set", lambda *_: (chk_bg.set_active(True), _apply_style()))
+        btn_bd.connect("color-set", lambda *_: (chk_bd.set_active(True), _apply_style()))
+        spin_bw.connect("value-changed", _apply_style)
+
+        btm = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_rst = Gtk.Button(label="↺ 清除此日顏色與框線")
+        btn_rst.connect("clicked", _reset_style)
+        btn_ok = Gtk.Button(label="關閉")
+        btn_ok.connect("clicked", lambda *_: dlg.destroy())
+        btm.pack_start(btn_rst, False, False, 0)
+        btm.pack_end(btn_ok, False, False, 0)
+        area.pack_start(btm, False, False, 4)
+
+        dlg.show_all()
+        dlg.run()
+        dlg.destroy()
+
     def _show_context_menu(self, event, clicked_date=None):
         menu = Gtk.Menu()
         add_date = clicked_date or date.today()
@@ -2731,6 +2901,10 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
             has_ov = isinstance(self.config.get("date_cell_overrides"), dict) and d_str in self.config["date_cell_overrides"]
             n_day_tasks = len(self._by_date_pending.get(d_str, [])) + len(self._by_date_completed.get(d_str, []))
             layout_items = [
+                (
+                    f"🎨 自訂 {d_lbl} 背景與框線...",
+                    lambda *_, dobj=clicked_date: self._open_date_style_dialog(dobj),
+                ),
                 (
                     f"✓ {d_lbl} 垂直分割成兩列（切回單欄）" if d_cols >= 2 else f"◫ {d_lbl} 任務垂直分割成兩列",
                     lambda *_, ds=d_str, nc=(1 if d_cols >= 2 else 2): self._set_date_cell_override(ds, "task_columns", nc),
@@ -2746,7 +2920,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
             ]
             if has_ov:
                 layout_items.append(
-                    (f"↺ 恢復 {d_lbl} 預設排版", lambda *_, ds=d_str: self._reset_date_cell_override(ds))
+                    (f"↺ 恢復 {d_lbl} 預設樣式與排版", lambda *_, ds=d_str: self._reset_date_cell_override(ds))
                 )
             items = [
                 (
@@ -2924,6 +3098,10 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         chk_comp.set_active(self.config.get("show_completed", True))
         tab_layout.pack_start(chk_comp, False, False, 0)
 
+        chk_cell_cnt = Gtk.CheckButton(label="顯示日期框右上角的任務數字")
+        chk_cell_cnt.set_active(self.config.get("show_cell_task_count", True))
+        tab_layout.pack_start(chk_cell_cnt, False, False, 0)
+
         chk_weather = Gtk.CheckButton(label="在日期列顯示 7 天天氣預報與今日 AQI 圓點（共用天氣小工具快取）")
         chk_weather.set_active(self.config.get("show_weather", True))
         tab_layout.pack_start(chk_weather, False, False, 0)
@@ -3021,6 +3199,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
             self.config["auto_backup_enabled"] = chk_auto_backup.get_active()
             self.config["text_shadow"] = chk_shadow.get_active()
             self.config["show_completed"] = chk_comp.get_active()
+            self.config["show_cell_task_count"] = chk_cell_cnt.get_active()
             self.config["show_weather"] = chk_weather.get_active()
             self.config["locked"] = chk_lock.get_active()
             self._save_config()
@@ -3039,7 +3218,7 @@ class TaskwarriorDesktopCalendar(Gtk.Window):
         spin_task_fs.connect("value-changed", apply_all)
         spin_detail_fs.connect("value-changed", apply_all)
         spin_ret.connect("value-changed", apply_all)
-        for c in (chk_shadow, chk_comp, chk_two_col, chk_auto_shrink, chk_weather, chk_lock, chk_auto_backup):
+        for c in (chk_shadow, chk_comp, chk_cell_cnt, chk_two_col, chk_auto_shrink, chk_weather, chk_lock, chk_auto_backup):
             c.connect("toggled", apply_all)
 
         btm_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)

@@ -70,6 +70,7 @@ DEFAULT_CONFIG = {
     "calendar_show_completed": True,     # 在月曆格子與右側清單中顯示歷史已完成任務 (依 end 完成日期對應)
     "calendar_font_size": 16,            # 月曆看板基準字型大小 (pt/px, 範圍 8..22)
     "max_title_chars": 22,               # badge_text 模式下顯示的最大字元數
+    "show_panel_task_count": True,       # 面板 TASK 方塊圖示是否顯示待辦任務總數
     "show_due_in_panel": True,           # badge_text 模式下是否在標題後附加上到期倒數
     "filter_project": "",                # 空字串代表顯示全部專案
     "filter_tag": "",                    # 空字串代表顯示全部標籤
@@ -1855,20 +1856,21 @@ class TaskwarriorWidget(Gtk.EventBox):
         ty = y + (hdr_h - ext.height) / 2.0 - ext.y_bearing
         self._draw_styled_text(ctx, tx, ty, title, title_rgb)
 
-        # Lower enlarged task count centered cleanly below split_y
-        bot_h = max(10.0, (y + bh) - split_y)
-        count_str = str(len(self.filtered_pending))
-        val_size = max(10.0, bot_h * 0.78)
-        ctx.set_font_size(val_size)
-        v_ext = ctx.text_extents(count_str)
-        max_w = max(8.0, bw - 5.0)
-        if v_ext.width > max_w and v_ext.width > 0:
-            val_size *= max_w / v_ext.width
+        # Lower enlarged task count centered cleanly below split_y (optional)
+        if self.config.get("show_panel_task_count", True):
+            bot_h = max(10.0, (y + bh) - split_y)
+            count_str = str(len(self.filtered_pending))
+            val_size = max(10.0, bot_h * 0.78)
             ctx.set_font_size(val_size)
             v_ext = ctx.text_extents(count_str)
-        vx = x + (bw - v_ext.width) / 2.0 - v_ext.x_bearing
-        vy = split_y + (bot_h - v_ext.height) / 2.0 - v_ext.y_bearing
-        self._draw_styled_text(ctx, vx, vy, count_str, val_rgb)
+            max_w = max(8.0, bw - 5.0)
+            if v_ext.width > max_w and v_ext.width > 0:
+                val_size *= max_w / v_ext.width
+                ctx.set_font_size(val_size)
+                v_ext = ctx.text_extents(count_str)
+            vx = x + (bw - v_ext.width) / 2.0 - v_ext.x_bearing
+            vy = split_y + (bot_h - v_ext.height) / 2.0 - v_ext.y_bearing
+            self._draw_styled_text(ctx, vx, vy, count_str, val_rgb)
 
     def _draw_pomo_badge(self, ctx, x, y, bw, bh):
         """
@@ -2600,12 +2602,13 @@ class TaskwarriorWidget(Gtk.EventBox):
 
         grid = Gtk.Grid(column_spacing=10, row_spacing=10)
 
-        lbl_desc = Gtk.Label(label="任務描述 (必填)：", xalign=0.0)
+        lbl_desc = Gtk.Label(label="任務描述 (留空則為無文字標記)：", xalign=0.0)
         entry_desc = Gtk.Entry()
         entry_desc.set_hexpand(True)
-        entry_desc.set_placeholder_text("例如：加強 mate-panel 功能")
+        entry_desc.set_placeholder_text("例如：加強 mate-panel 功能（留空將自動填入不可見佔位字元）")
         if is_edit:
-            entry_desc.set_text(task.get("description", ""))
+            orig_d = str(task.get("description", ""))
+            entry_desc.set_text("" if orig_d == "\u200b" else orig_d)
         grid.attach(lbl_desc, 0, 0, 1, 1)
         grid.attach(entry_desc, 1, 0, 2, 1)
 
@@ -2713,18 +2716,7 @@ class TaskwarriorWidget(Gtk.EventBox):
             resp = dlg.run()
             if resp != Gtk.ResponseType.OK:
                 break
-            desc_val = entry_desc.get_text().strip()
-            if not desc_val:
-                err = Gtk.MessageDialog(
-                    transient_for=dlg,
-                    flags=0,
-                    message_type=Gtk.MessageType.WARNING,
-                    buttons=Gtk.ButtonsType.OK,
-                    text="請輸入任務描述！",
-                )
-                err.run()
-                err.destroy()
-                continue
+            desc_val = entry_desc.get_text().strip() or "\u200b"
 
             proj_val = proj_entry.get_text().strip()
             pri_val = combo_pri.get_active_id() or ""
@@ -3038,6 +3030,11 @@ class TaskwarriorWidget(Gtk.EventBox):
         opt_grid.attach(spin_duesoon, 3, 0, 1, 1)
         tab_cal.pack_start(opt_grid, False, False, 0)
 
+        chk_panel_cnt = Gtk.CheckButton(label="在面板 TASK 圖示上顯示總待辦任務數目")
+        chk_panel_cnt.set_margin_start(14)
+        chk_panel_cnt.set_active(self.config.get("show_panel_task_count", True))
+        tab_cal.pack_start(chk_panel_cnt, False, False, 0)
+
         chk_due_panel = Gtk.CheckButton(label="在模式 B 面板標題後方附上到期倒數 (例如 剩 4 天)")
         chk_due_panel.set_margin_start(14)
         chk_due_panel.set_active(self.config.get("show_due_in_panel", True))
@@ -3237,6 +3234,7 @@ class TaskwarriorWidget(Gtk.EventBox):
             self.config["display_mode"] = "badge" if rb_badge.get_active() else "badge_text"
             self.config["max_title_chars"] = int(spin_maxc.get_value_as_int())
             self.config["due_soon_days"] = int(spin_duesoon.get_value_as_int())
+            self.config["show_panel_task_count"] = chk_panel_cnt.get_active()
             self.config["show_due_in_panel"] = chk_due_panel.get_active()
             self.config["font_color_mode"] = "dynamic" if rb_font_dyn.get_active() else "custom"
             self.config["custom_font_color"] = rgba_to_hex(color_norm_btn.get_rgba())
@@ -3329,6 +3327,7 @@ class TaskwarriorWidget(Gtk.EventBox):
             chk_pomo_sound,
             rb_badge,
             rb_text,
+            chk_panel_cnt,
             chk_due_panel,
             rb_font_dyn,
             rb_font_cus,
