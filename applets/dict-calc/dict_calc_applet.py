@@ -1534,6 +1534,130 @@ class DictHtmlFormatter:
         s = re.sub(r"(?i)\s+on[a-z]+\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)", "", s)
         return s.strip()
 
+    _SAFE_XHTML_TAGS = {
+        "div", "p", "span", "b", "i", "u", "strong", "em",
+        "sub", "sup", "small", "ul", "ol", "li", "table", "tr", "td", "th",
+    }
+    _SAFE_CSS_PROPS = {
+        "color", "background-color", "font-weight", "font-style", "font-size",
+        "font-family", "text-decoration", "text-transform", "letter-spacing",
+        "padding", "padding-left", "padding-right", "padding-top", "padding-bottom",
+        "margin", "margin-top", "margin-bottom", "margin-left", "margin-right",
+        "display", "float", "width", "text-align", "overflow", "white-space",
+        "border", "border-bottom", "border-radius", "line-height",
+    }
+
+    @classmethod
+    def html_to_xhtml(cls, raw_html):
+        """
+        Convert tolerant StarDict HTML (e.g. CALD4 with unclosed <br>, stray </font>,
+        legacy <font color>, sound:// links) into strictly well-formed EPUB 3.0 XHTML.
+        Named HTML entities are resolved to Unicode characters (XML-safe).
+        """
+        if not raw_html:
+            return ""
+        out = []
+        open_stack = []  # list of (orig_tag, emitted_tag)
+        skip_depth = 0
+
+        def _sanitize_style(css_dict):
+            parts = []
+            for k, v in css_dict.items():
+                if k not in cls._SAFE_CSS_PROPS:
+                    continue
+                vl = v.lower()
+                if "url(" in vl or "expression(" in vl or "javascript:" in vl:
+                    continue
+                parts.append(f"{k}:{v}")
+            return ";".join(parts)
+
+        class _XhtmlParser(HTMLParser):
+            def handle_starttag(self, tag, attrs):
+                nonlocal skip_depth
+                t = tag.lower()
+                if skip_depth > 0:
+                    if t not in ("br", "img", "hr", "input"):
+                        skip_depth += 1
+                    return
+
+                attr_map = {k.lower(): (v or "") for k, v in attrs}
+                if t in ("script", "style", "iframe", "object", "embed"):
+                    skip_depth = 1
+                    return
+                if t == "img":
+                    return
+                if t in ("br", "hr"):
+                    out.append(f"<{t}/>")
+                    return
+
+                if t == "a":
+                    href = attr_map.get("href", "").strip().lower()
+                    if href.startswith("sound://"):
+                        skip_depth = 1
+                        return
+                    out.append('<span class="bword">')
+                    open_stack.append((t, "span"))
+                    return
+
+                if t == "font":
+                    css = cls._parse_inline_style(attr_map.get("style", ""))
+                    if "color" in attr_map:
+                        c_hex = cls.parse_color_hex(attr_map["color"])
+                        if c_hex and "color" not in css:
+                            css["color"] = c_hex
+                    sz = attr_map.get("size", "").strip()
+                    if sz == "+1" and "font-size" not in css:
+                        css["font-size"] = "1.15em"
+                    elif sz in ("-1", "-2") and "font-size" not in css:
+                        css["font-size"] = "0.88em"
+                    st_str = _sanitize_style(css)
+                    if st_str:
+                        out.append(f'<span style="{html.escape(st_str, quote=True)}">')
+                    else:
+                        out.append("<span>")
+                    open_stack.append((t, "span"))
+                    return
+
+                if t in cls._SAFE_XHTML_TAGS:
+                    css = cls._parse_inline_style(attr_map.get("style", ""))
+                    st_str = _sanitize_style(css)
+                    if st_str:
+                        out.append(f'<{t} style="{html.escape(st_str, quote=True)}">')
+                    else:
+                        out.append(f"<{t}>")
+                    open_stack.append((t, t))
+
+            def handle_endtag(self, tag):
+                nonlocal skip_depth
+                t = tag.lower()
+                if skip_depth > 0:
+                    if t not in ("br", "img", "hr", "input"):
+                        skip_depth -= 1
+                    return
+                # Find matching tag on open_stack; ignore stray closing tags (like extra </font>)
+                for idx in range(len(open_stack) - 1, -1, -1):
+                    if open_stack[idx][0] == t:
+                        while len(open_stack) > idx:
+                            _orig, emitted = open_stack.pop()
+                            out.append(f"</{emitted}>")
+                        break
+
+            def handle_data(self, data):
+                if skip_depth > 0 or not data:
+                    return
+                txt = data.replace("\r\n", "\n").replace("\r", "\n")
+                # Collapse source newlines into spaces so XHTML renders like standard HTML
+                txt = re.sub(r"[ \t]*\n[ \t]*", " ", txt)
+                out.append(html.escape(txt, quote=False))
+
+        parser = _XhtmlParser(convert_charrefs=True)
+        parser.feed(raw_html)
+        parser.close()
+        while open_stack:
+            _orig, emitted = open_stack.pop()
+            out.append(f"</{emitted}>")
+        return "".join(out).strip()
+
 
 class StarDictManager:
     """Discovers StarDict .ifo dictionaries and queries them asynchronously via `/usr/bin/sdcv -n -j`."""
@@ -2484,7 +2608,7 @@ class VocabHistoryManager:
                 d_esc = html.escape(e["dict"])
                 ew_esc = html.escape(e["word"])
                 if e.get("raw_html"):
-                    def_html = DictHtmlFormatter.clean_html_for_flashcard(e["raw_html"])
+                    def_html = DictHtmlFormatter.html_to_xhtml(e["raw_html"])
                     def_cls = "dict-def dict-html"
                 else:
                     def_html = html.escape(e["definition"]).replace("\n", "<br>")
@@ -2593,13 +2717,14 @@ body.flip-mode .card:not(.revealed)::after {{
 .dict-name {{ font-weight: 700; font-size: 0.92rem; color: var(--accent); margin-bottom: 3px; }}
 .headword {{ color: var(--muted); font-weight: 500; }}
 .dict-def {{ font-size: 0.96rem; white-space: normal; word-break: break-word; }}
-.dict-def.dict-html {{ line-height: 1.55; }}
+.dict-def.dict-html {{ line-height: 1.55; overflow: hidden; }}
 .dict-def.dict-html .bword {{ color: var(--accent); text-decoration: underline dotted; }}
-body.dark .dict-def.dict-html font[color="blue"], body.dark .dict-def.dict-html font[color="mediumblue"], body.dark .dict-def.dict-html font[color="navy"] {{ color: #7dd3fc !important; }}
-body.dark .dict-def.dict-html font[color="indigo"] {{ color: #c4b5fd !important; }}
-body.dark .dict-def.dict-html font[color="darkred"], body.dark .dict-def.dict-html font[color="crimson"] {{ color: #fca5a5 !important; }}
-body.dark .dict-def.dict-html font[color="green"], body.dark .dict-def.dict-html font[color="olive"] {{ color: #86efac !important; }}
-body.dark .dict-def.dict-html font[color="gray"] {{ color: #cbd5e1 !important; }}
+body.dark .dict-def.dict-html span[style*="color:#0000ff"], body.dark .dict-def.dict-html span[style*="color:#0000cd"], body.dark .dict-def.dict-html span[style*="color:#000080"], body.dark .dict-def.dict-html span[style*="color:#00008b"] {{ color: #7dd3fc !important; }}
+body.dark .dict-def.dict-html span[style*="color:#4b0082"], body.dark .dict-def.dict-html span[style*="color:#800080"] {{ color: #c4b5fd !important; }}
+body.dark .dict-def.dict-html span[style*="color:#8b0000"], body.dark .dict-def.dict-html span[style*="color:#dc143c"], body.dark .dict-def.dict-html span[style*="color:#662c00" i], body.dark .dict-def.dict-html span[style*="color:darkred" i] {{ color: #fca5a5 !important; }}
+body.dark .dict-def.dict-html span[style*="color:#008000"], body.dark .dict-def.dict-html span[style*="color:#808000"], body.dark .dict-def.dict-html span[style*="color:#006400"] {{ color: #86efac !important; }}
+body.dark .dict-def.dict-html span[style*="color:#808080"], body.dark .dict-def.dict-html span[style*="color:gray" i] {{ color: #cbd5e1 !important; }}
+body.dark .dict-def.dict-html span[style*="color:#c71585"] {{ color: #f9a8d4 !important; }}
 .dict-empty {{ color: var(--muted); font-style: italic; }}
 .set-card h2 {{ margin: 0 0 10px; font-size: 1.05rem; color: var(--accent); }}
 .set-row {{ display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 10px; }}
@@ -3129,6 +3254,8 @@ h1.word-title {
 .dict-block { margin-bottom: 1em; }
 .dict-name { font-weight: bold; font-size: 1.02em; margin-bottom: 0.25em; }
 .dict-def { margin: 0; white-space: pre-wrap; }
+.dict-def-html { margin: 0; line-height: 1.55; overflow: hidden; }
+.dict-def-html .bword { color: #0369a1; text-decoration: underline; }
 .card-sep { border: 0; border-top: 1px dashed #999; margin: 1.2em 0; }
 """
 
@@ -3146,11 +3273,16 @@ h1.word-title {
                 for e in entries:
                     d_esc = html.escape(e["dict"])
                     ew_esc = html.escape(e["word"])
-                    def_esc = html.escape(e["definition"]).replace("\n", "<br/>")
+                    if e.get("raw_html"):
+                        def_xhtml = DictHtmlFormatter.html_to_xhtml(e["raw_html"])
+                        def_block = f'<div class="dict-def-html">{def_xhtml}</div>'
+                    else:
+                        def_esc = html.escape(e["definition"]).replace("\n", "<br/>")
+                        def_block = f'<p class="dict-def">{def_esc}</p>'
                     parts.append(
                         f'<div class="dict-block">'
                         f'<div class="dict-name">{d_esc}（{ew_esc}）</div>'
-                        f'<p class="dict-def">{def_esc}</p>'
+                        f'{def_block}'
                         f'</div>'
                     )
             return "\n".join(parts)
@@ -6389,48 +6521,154 @@ class DictCalcWidget(Gtk.EventBox):
             v_w_btns.pack_start(b_vw, False, False, 0)
         v_left.pack_start(v_w_btns, False, False, 0)
 
-        # Right pane: Traditional StarDict dictionaries selector for flashcards
+        # Right pane: Traditional StarDict dictionaries selector & priority ordering (same UX as Dict Manager)
         v_right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         v_right.set_margin_start(8)
         lbl_v_dicts = Gtk.Label(xalign=0.0)
         v_right.pack_start(lbl_v_dicts, False, False, 0)
 
-        v_dict_store = Gtk.ListStore(bool, str)
+        v_dict_store = Gtk.ListStore(bool, str, str)  # (enabled, rank_label, bookname)
         v_dict_tree = Gtk.TreeView(model=v_dict_store)
+        v_dict_tree.set_reorderable(True)
         vd_rend_chk = Gtk.CellRendererToggle()
+        v_rebuilding = [False]
+
+        def refresh_v_ranks():
+            rank = 1
+            for row in v_dict_store:
+                if row[0]:
+                    row[1] = f"#{rank}"
+                    rank += 1
+                else:
+                    row[1] = ""
+            n_sel = rank - 1
+            lbl_v_dicts.set_markup(
+                f"<b>單字卡來源詞典</b> <small>(已選 {n_sel} 套 · 依順位輸出，可拖曳或點按鈕排序)</small>"
+            )
 
         def save_vocab_dicts():
-            chosen = [row[1] for row in v_dict_store if row[0]]
+            if v_rebuilding[0]:
+                return
+            chosen = [row[2] for row in v_dict_store if row[0]]
             self.config["vocab_card_dicts"] = chosen
             self._save_config()
-            lbl_v_dicts.set_markup(f"<b>單字卡來源詞典</b> <small>(已選 {len(chosen)} 套)</small>")
+            refresh_v_ranks()
 
         def on_v_dict_toggled(_cell, path_str):
             v_dict_store[path_str][0] = not v_dict_store[path_str][0]
             save_vocab_dicts()
 
+        def on_v_dnd_deleted(*_):
+            if not v_rebuilding[0]:
+                GLib.idle_add(lambda: (save_vocab_dicts(), False)[-1])
+
         vd_rend_chk.connect("toggled", on_v_dict_toggled)
+        v_dict_store.connect("row-deleted", on_v_dnd_deleted)
         v_dict_tree.append_column(Gtk.TreeViewColumn("用", vd_rend_chk, active=0))
-        col_vd = Gtk.TreeViewColumn("傳統 Dict 詞典", Gtk.CellRendererText(), text=1)
+        v_dict_tree.append_column(Gtk.TreeViewColumn("順位", Gtk.CellRendererText(), text=1))
+        col_vd = Gtk.TreeViewColumn("傳統 Dict 詞典", Gtk.CellRendererText(), text=2)
         col_vd.set_expand(True)
         v_dict_tree.append_column(col_vd)
 
+        v_d_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         v_d_scroll = Gtk.ScrolledWindow()
         v_d_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         v_d_scroll.set_vexpand(True)
+        v_d_scroll.set_hexpand(True)
         v_d_scroll.add(v_dict_tree)
-        v_right.pack_start(v_d_scroll, True, True, 0)
+        v_d_hbox.pack_start(v_d_scroll, True, True, 0)
+
+        v_order_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        btn_vd_top = Gtk.Button(label="⏫ 置頂")
+        btn_vd_up = Gtk.Button(label="▲ 上移")
+        btn_vd_down = Gtk.Button(label="▼ 下移")
+        btn_vd_bottom = Gtk.Button(label="⏬ 置底")
+
+        def move_vocab_dict_row(direction):
+            sel = v_dict_tree.get_selection()
+            model, it = sel.get_selected()
+            if it is None:
+                return
+            idx = model.get_path(it).get_indices()[0]
+            total = len(model)
+            v_rebuilding[0] = True
+            try:
+                if direction == "up" and idx > 0:
+                    prev_it = model.get_iter(Gtk.TreePath.new_from_indices([idx - 1]))
+                    model.swap(it, prev_it)
+                    new_idx = idx - 1
+                elif direction == "down" and idx < total - 1:
+                    next_it = model.get_iter(Gtk.TreePath.new_from_indices([idx + 1]))
+                    model.swap(it, next_it)
+                    new_idx = idx + 1
+                elif direction == "top" and idx > 0:
+                    first_it = model.get_iter_first()
+                    model.move_before(it, first_it)
+                    new_idx = 0
+                elif direction == "bottom" and idx < total - 1:
+                    last_it = model.get_iter(Gtk.TreePath.new_from_indices([total - 1]))
+                    model.move_after(it, last_it)
+                    new_idx = total - 1
+                else:
+                    return
+            finally:
+                v_rebuilding[0] = False
+            new_path = Gtk.TreePath.new_from_indices([new_idx])
+            sel.select_path(new_path)
+            v_dict_tree.scroll_to_cell(new_path, None, False, 0.0, 0.0)
+            save_vocab_dicts()
+
+        btn_vd_top.connect("clicked", lambda *_: move_vocab_dict_row("top"))
+        btn_vd_up.connect("clicked", lambda *_: move_vocab_dict_row("up"))
+        btn_vd_down.connect("clicked", lambda *_: move_vocab_dict_row("down"))
+        btn_vd_bottom.connect("clicked", lambda *_: move_vocab_dict_row("bottom"))
+        for b_vo in (btn_vd_top, btn_vd_up, btn_vd_down, btn_vd_bottom):
+            v_order_vbox.pack_start(b_vo, False, False, 0)
+        v_d_hbox.pack_start(v_order_vbox, False, False, 0)
+        v_right.pack_start(v_d_hbox, True, True, 0)
+
+        def populate_vocab_dicts(chosen_list):
+            v_rebuilding[0] = True
+            try:
+                v_dict_store.clear()
+                all_names = [d["bookname"] for d in self.dict_mgr.all_dicts]
+                valid_chosen = [n for n in chosen_list if n in all_names]
+                chosen_set = set(valid_chosen)
+                ordered = valid_chosen + [n for n in all_names if n not in chosen_set]
+                for name in ordered:
+                    v_dict_store.append([name in chosen_set, "", name])
+            finally:
+                v_rebuilding[0] = False
+            refresh_v_ranks()
 
         def refresh_vocab_dict_list():
-            v_dict_store.clear()
             saved_vd = list(self.config.get("vocab_card_dicts", DEFAULT_PREFERRED_DICTS[:3]))
-            saved_set = set(saved_vd)
-            all_names = [d["bookname"] for d in self.dict_mgr.all_dicts]
-            ordered = [n for n in saved_vd if n in all_names] + [n for n in all_names if n not in saved_set]
-            for name in ordered:
-                v_dict_store.append([name in saved_set, name])
-            n_sel = sum(1 for row in v_dict_store if row[0])
-            lbl_v_dicts.set_markup(f"<b>單字卡來源詞典</b> <small>(已選 {n_sel} 套)</small>")
+            populate_vocab_dicts(saved_vd)
+
+        v_d_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        btn_vd_copy = Gtk.Button(label="套用查詢視窗詞典")
+        btn_vd_none = Gtk.Button(label="全部取消")
+        btn_vd_def = Gtk.Button(label="恢復推薦")
+        btn_vd_copy.connect(
+            "clicked",
+            lambda *_: (
+                populate_vocab_dicts(
+                    [
+                        n
+                        for n in self.config.get("enabled_dicts", DEFAULT_PREFERRED_DICTS)
+                        if n not in VIRTUAL_DICT_ENGINE_MAP
+                    ]
+                ),
+                save_vocab_dicts(),
+            ),
+        )
+        btn_vd_none.connect("clicked", lambda *_: (populate_vocab_dicts([]), save_vocab_dicts()))
+        btn_vd_def.connect(
+            "clicked", lambda *_: (populate_vocab_dicts(DEFAULT_PREFERRED_DICTS[:3]), save_vocab_dicts())
+        )
+        for b_vd in (btn_vd_copy, btn_vd_none, btn_vd_def):
+            v_d_btns.pack_start(b_vd, False, False, 0)
+        v_right.pack_start(v_d_btns, False, False, 0)
 
         refresh_vocab_dict_list()
         profile_refreshers.append(refresh_vocab_dict_list)
@@ -6509,7 +6747,7 @@ class DictCalcWidget(Gtk.EventBox):
             if not selected_rows:
                 v_prog_bar.set_text("⚠️ 請先勾選至少一個要匯出的單字")
                 return
-            dict_names = [row[1] for row in v_dict_store if row[0]]
+            dict_names = [row[2] for row in v_dict_store if row[0]]
             if not dict_names:
                 v_prog_bar.set_text("⚠️ 請先在右側勾選至少一套傳統詞典")
                 return
