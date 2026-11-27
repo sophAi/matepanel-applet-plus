@@ -2051,9 +2051,18 @@ class SpeechManager:
     def __init__(self):
         self._lock = threading.Lock()
         self._active_proc = None
+        self._speak_seq = 0
 
-    def stop(self):
+    def _is_current(self, seq):
+        if seq is None:
+            return True
         with self._lock:
+            return seq == self._speak_seq
+
+    def stop(self, bump_seq=True):
+        with self._lock:
+            if bump_seq:
+                self._speak_seq += 1
             proc = self._active_proc
             self._active_proc = None
         if proc is not None:
@@ -2067,8 +2076,12 @@ class SpeechManager:
             except Exception:
                 pass
 
-    def _run_player(self, cmd):
-        self.stop()
+    def _run_player(self, cmd, seq=None):
+        if not self._is_current(seq):
+            return True
+        self.stop(bump_seq=False)
+        if not self._is_current(seq):
+            return True
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -2076,14 +2089,31 @@ class SpeechManager:
                 stderr=subprocess.DEVNULL,
             )
             with self._lock:
-                self._active_proc = proc
+                if seq is not None and seq != self._speak_seq:
+                    aborted = True
+                else:
+                    aborted = False
+                    self._active_proc = proc
+            if aborted:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=0.3)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                return True
             proc.wait()
             with self._lock:
                 if self._active_proc is proc:
                     self._active_proc = None
+                cancelled = (seq is not None and seq != self._speak_seq)
+            if cancelled:
+                return True
             return proc.returncode == 0
         except Exception:
-            return False
+            return not self._is_current(seq)
 
     @classmethod
     def find_real_people_wav(cls, word, tts_dir):
@@ -2170,26 +2200,26 @@ class SpeechManager:
         cmd.append(media_arg)
         return cmd
 
-    def _play_wav(self, wav_path, vol_pct, speed=1.0, pitch=0):
+    def _play_wav(self, wav_path, vol_pct, speed=1.0, pitch=0, seq=None):
         # Force true stereo (L+R) upmix + optional speed/pitch via mpv
         if shutil.which("mpv"):
-            return self._run_player(self._build_mpv_cmd(wav_path, vol_pct, speed=speed, pitch=pitch, apply_sp=True))
+            return self._run_player(self._build_mpv_cmd(wav_path, vol_pct, speed=speed, pitch=pitch, apply_sp=True), seq=seq)
         if shutil.which("paplay"):
             pa_vol = int(round(65536 * (vol_pct / 100.0)))
-            return self._run_player(["paplay", "--channel-map=mono", f"--volume={pa_vol}", wav_path])
+            return self._run_player(["paplay", "--channel-map=mono", f"--volume={pa_vol}", wav_path], seq=seq)
         if shutil.which("pw-play"):
-            return self._run_player(["pw-play", "--volume", f"{vol_pct / 100.0:.2f}", wav_path])
+            return self._run_player(["pw-play", "--volume", f"{vol_pct / 100.0:.2f}", wav_path], seq=seq)
         if shutil.which("aplay"):
-            return self._run_player(["aplay", "-q", wav_path])
+            return self._run_player(["aplay", "-q", wav_path], seq=seq)
         return False
 
-    def _play_mp3(self, mp3_path, vol_pct, speed=1.0, pitch=0, apply_sp=True):
+    def _play_mp3(self, mp3_path, vol_pct, speed=1.0, pitch=0, apply_sp=True, seq=None):
         # Force true stereo (L+R) upmix + optional speed/pitch via mpv
         if shutil.which("mpv"):
-            return self._run_player(self._build_mpv_cmd(mp3_path, vol_pct, speed=speed, pitch=pitch, apply_sp=apply_sp))
+            return self._run_player(self._build_mpv_cmd(mp3_path, vol_pct, speed=speed, pitch=pitch, apply_sp=apply_sp), seq=seq)
         if shutil.which("mpg123"):
             scale = max(0, min(32768, int(round(32768 * (vol_pct / 100.0)))))
-            return self._run_player(["mpg123", "-q", "--stereo", "--scale", str(scale), mp3_path])
+            return self._run_player(["mpg123", "-q", "--stereo", "--scale", str(scale), mp3_path], seq=seq)
         if shutil.which("ffplay"):
             return self._run_player(
                 [
@@ -2201,18 +2231,23 @@ class SpeechManager:
                     "-af",
                     "pan=stereo|c0=c0|c1=c0",
                     mp3_path,
-                ]
+                ],
+                seq=seq,
             )
         return False
 
-    def _play_espeak(self, text, lang, vol_pct, speed=1.0, pitch=0):
+    def _play_espeak(self, text, lang, vol_pct, speed=1.0, pitch=0, seq=None):
         exe = shutil.which("espeak-ng") or shutil.which("espeak")
         if not exe:
             return False
         v_map = {"en": "en-us", "ja": "ja", "zh-TW": "cmn"}
         voice = v_map.get(lang, "en-us")
         if shutil.which("mpv"):
-            self.stop()
+            if not self._is_current(seq):
+                return True
+            self.stop(bump_seq=False)
+            if not self._is_current(seq):
+                return True
             try:
                 p_gen = subprocess.Popen(
                     [exe, "-v", voice, "--stdout", text],
@@ -2228,7 +2263,18 @@ class SpeechManager:
                 if p_gen.stdout is not None:
                     p_gen.stdout.close()
                 with self._lock:
-                    self._active_proc = p_play
+                    if seq is not None and seq != self._speak_seq:
+                        aborted = True
+                    else:
+                        aborted = False
+                        self._active_proc = p_play
+                if aborted:
+                    for p_kill in (p_play, p_gen):
+                        try:
+                            p_kill.terminate()
+                        except Exception:
+                            pass
+                    return True
                 p_play.wait()
                 try:
                     p_gen.wait(timeout=1.0)
@@ -2237,11 +2283,14 @@ class SpeechManager:
                 with self._lock:
                     if self._active_proc is p_play:
                         self._active_proc = None
+                    cancelled = (seq is not None and seq != self._speak_seq)
+                if cancelled:
+                    return True
                 return p_play.returncode == 0
             except Exception:
-                return False
+                return not self._is_current(seq)
         amp = max(1, min(200, int(round(200 * (vol_pct / 100.0)))))
-        return self._run_player([exe, "-a", str(amp), "-v", voice, text])
+        return self._run_player([exe, "-a", str(amp), "-v", voice, text], seq=seq)
 
     @classmethod
     def _prune_cache(cls):
@@ -2415,24 +2464,37 @@ class SpeechManager:
             return
         tts_dir = str(config.get("tts_real_people_dir", "/usr/share/WyabdcRealPeopleTTS") or "").strip()
 
+        # Bump sequence and stop any prior playback immediately so superseded threads never fall through
+        self.stop(bump_seq=True)
+        with self._lock:
+            my_seq = self._speak_seq
+
         def _worker():
             lang = force_lang or self._detect_lang(word)
             for eng in chain:
+                if not self._is_current(my_seq):
+                    return
                 if eng == "real_people":
                     if lang == "en" and tts_dir:
                         wav = self.find_real_people_wav(word, tts_dir)
-                        if wav and self._play_wav(wav, vol, speed=speed, pitch=pitch):
+                        if not self._is_current(my_seq):
+                            return
+                        if wav and self._play_wav(wav, vol, speed=speed, pitch=pitch, seq=my_seq):
                             return
                 elif eng == "edge":
                     mp3 = self._fetch_edge_tts_mp3(word, lang, gender=gender, speed=speed, pitch=pitch)
-                    if mp3 and self._play_mp3(mp3, vol, speed=1.0, pitch=0, apply_sp=False):
+                    if not self._is_current(my_seq):
+                        return
+                    if mp3 and self._play_mp3(mp3, vol, speed=1.0, pitch=0, apply_sp=False, seq=my_seq):
                         return
                 elif eng == "google":
                     mp3 = self._fetch_google_tts_mp3(word, lang)
-                    if mp3 and self._play_mp3(mp3, vol, speed=speed, pitch=pitch, apply_sp=True):
+                    if not self._is_current(my_seq):
+                        return
+                    if mp3 and self._play_mp3(mp3, vol, speed=speed, pitch=pitch, apply_sp=True, seq=my_seq):
                         return
                 elif eng == "espeak":
-                    if self._play_espeak(word, lang, vol, speed=speed, pitch=pitch):
+                    if self._play_espeak(word, lang, vol, speed=speed, pitch=pitch, seq=my_seq):
                         return
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -5225,14 +5287,19 @@ class DictCalcWidget(Gtk.EventBox):
             )
             return False
 
-        # Record & auto-speak when dictionary lookup hits a word / short phrase
+        # Record & auto-speak ONCE per query seq when dictionary lookup hits a word / short phrase
         if results and query_word and "\n" not in query_word and len(query_word) <= 45:
             speak_target = query_word.strip()
             if spelling_info and spelling_info[2]:
                 speak_target = str(spelling_info[2]).strip() or speak_target
             self._last_spoken_word = speak_target
             self._last_spoken_kind = "word"
-            if self.config.get("tts_enabled", True) and self.config.get("tts_auto_speak", True):
+            if (
+                seq != getattr(self, "_spoken_query_seq", -1)
+                and self.config.get("tts_enabled", True)
+                and self.config.get("tts_auto_speak", True)
+            ):
+                self._spoken_query_seq = seq
                 self.speech.speak_async(speak_target, self.config)
 
         if use_dbus_dict:
